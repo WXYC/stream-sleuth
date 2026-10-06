@@ -1,0 +1,285 @@
+"""The Olaf adapter: per-snapshot ``HOME``, ``store --with-ids``, and ``query --format json``.
+
+A fake ``olaf`` script stands in for the binary: it records its argv and ``HOME`` and
+prints whatever JSON the test gives it, so these tests need no Zig build.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import stat
+import sys
+import textwrap
+
+import pytest
+
+# The record the plan quotes from Olaf's README (plan §6): with query_offset 0.000
+# and query_start 1.936, the match begins 1.936 s into the clip.
+README_RECORD = {
+    "query_index": 1,
+    "total_queries": 1,
+    "query_path": "query.mp3",
+    "query_offset": 0.000,
+    "matches": [
+        {
+            "match_count": 41,
+            "query_start": 1.936,
+            "query_stop": 10.112,
+            "path": "chuquimamani-condori-call-your-name",
+            "match_identifier": 488372097,
+            "reference_start": 70.864,
+            "reference_stop": 79.040,
+        }
+    ],
+}
+
+
+def query_object(offset, *matches):
+    return {"query_offset": offset, "matches": [dict(m) for m in matches]}
+
+
+def match(path, count, query_start=0.0, reference_start=0.0):
+    return {
+        "match_count": count,
+        "query_start": query_start,
+        "path": path,
+        "reference_start": reference_start,
+    }
+
+
+@pytest.fixture
+def olaf(fresh_recognizer):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    return importlib.import_module("stream_sleuth.recognizers.olaf")
+
+
+@pytest.fixture
+def fake_olaf(tmp_path):
+    """Write an executable fake ``olaf``; returns (path, set_output, calls)."""
+    record = tmp_path / "calls.jsonl"
+    reply = tmp_path / "reply.json"
+    reply.write_text(json.dumps({"stdout": "", "code": 0}))
+    script = tmp_path / "olaf"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(f"""
+            import json, os, sys
+            with open({str(record)!r}, "a") as f:
+                f.write(json.dumps({{"argv": sys.argv[1:], "home": os.environ.get("HOME")}}) + "\\n")
+            reply = json.load(open({str(reply)!r}))
+            sys.stdout.write(reply["stdout"])
+            sys.stderr.write(reply.get("stderr", ""))
+            sys.exit(reply["code"])
+        """)
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    def set_output(stdout="", code=0, stderr=""):
+        reply.write_text(json.dumps({"stdout": stdout, "code": code, "stderr": stderr}))
+
+    def calls():
+        return (
+            [json.loads(line) for line in record.read_text().splitlines()]
+            if record.exists()
+            else []
+        )
+
+    return script, set_output, calls
+
+
+def test_the_readme_record_maps_to_the_evaluation_fields(olaf):
+    [m] = olaf.parse_matches(json.dumps(README_RECORD, indent=2))
+    assert m["query_offset_s"] == pytest.approx(1.936)
+    assert m["ref_start_s"] == pytest.approx(70.864)
+    assert m["ref_key"] == "chuquimamani-condori-call-your-name"
+    assert m["match_count"] == 41
+
+
+def test_concatenated_query_objects_add_each_fragment_offset(olaf):
+    # --fragmented and multi-file queries print one pretty-printed object per query.
+    out = "\n".join(
+        json.dumps(o, indent=2)
+        for o in (
+            query_object(0.0, match("a", 20, 1.0, 5.0)),
+            query_object(30.0, match("b", 30, 2.5, 7.0)),
+        )
+    )
+    assert [(m["ref_key"], m["query_offset_s"]) for m in olaf.parse_matches(out)] == [
+        ("a", 1.0),
+        ("b", 32.5),
+    ]
+
+
+@pytest.mark.parametrize("out", ["", "not json", '{"query_offset": 0.0}'])
+def test_output_without_a_query_object_is_an_error(olaf, out):
+    with pytest.raises(olaf.OlafError):
+        olaf.parse_matches(out)
+
+
+@pytest.mark.parametrize(
+    ("counts", "floor", "expected"),
+    [
+        ([("weak", 9), ("strong", 40), ("middle", 20)], 12, "strong"),
+        ([("weak", 9), ("noise", 6)], 12, None),  # Phase 1: stray matches sat at 6-10
+        ([("edge", 12)], 12, "edge"),  # the floor is inclusive
+        ([("weak", 9)], 0, "weak"),
+        ([], 12, None),
+    ],
+)
+def test_recognize_keeps_the_strongest_match_at_or_above_the_floor(
+    olaf, fake_olaf, tmp_path, counts, floor, expected
+):
+    script, set_output, _ = fake_olaf
+    set_output(json.dumps(query_object(0.0, *(match(p, c) for p, c in counts))))
+    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script), min_match_count=floor)
+    result = recognizer.recognize("clip.wav")
+    assert (result or {}).get("ref_key") == expected
+
+
+def test_the_default_floor_is_twelve(olaf, tmp_path):
+    assert olaf.DEFAULT_MIN_MATCH_COUNT == 12
+    assert olaf.OlafRecognizer(tmp_path / "snap").min_match_count == 12
+
+
+def test_recognize_runs_query_under_the_snapshot_home(olaf, fake_olaf, tmp_path):
+    script, set_output, calls = fake_olaf
+    set_output(json.dumps(README_RECORD))
+    home = tmp_path / "snap"
+    result = olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("/clips/clip.wav")
+    assert calls() == [
+        {"argv": ["query", "--format", "json", "/clips/clip.wav"], "home": str(home)}
+    ]
+    assert result == {
+        "artist": "",
+        "song": "chuquimamani-condori-call-your-name",
+        "album": "",
+        "label": "",
+        "source": "local",
+        "confidence": 41.0,
+        "query_offset_s": pytest.approx(1.936),
+        "ref_start_s": pytest.approx(70.864),
+        "ref_key": "chuquimamani-condori-call-your-name",
+    }
+
+
+def test_a_lookup_names_the_reference(olaf, fake_olaf, tmp_path):
+    script, set_output, _ = fake_olaf
+    set_output(json.dumps(README_RECORD))
+    tags = {
+        "chuquimamani-condori-call-your-name": {
+            "artist": "Chuquimamani-Condori",
+            "song": "Call Your Name",
+            "album": "Edits",
+            "label": "self-released",
+        }
+    }
+    result = olaf.OlafRecognizer(
+        tmp_path / "snap", olaf_bin=str(script), lookup=tags.get
+    ).recognize("clip.wav")
+    assert (result["artist"], result["song"], result["album"], result["label"]) == (
+        "Chuquimamani-Condori",
+        "Call Your Name",
+        "Edits",
+        "self-released",
+    )
+
+
+def test_the_snapshot_home_gets_its_own_olaf_config(olaf, fake_olaf, tmp_path):
+    # Without ~/.olaf/olaf_config.json, Olaf falls back to a config beside the binary,
+    # which could point db_folder anywhere; the adapter's own config prevents that.
+    script, set_output, _ = fake_olaf
+    set_output(json.dumps(query_object(0.0)))
+    home = tmp_path / "snap"
+    olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("clip.wav")
+    config = json.loads((home / ".olaf" / "olaf_config.json").read_text())
+    assert config["db_folder"] == "~/.olaf/db/"
+    assert config["cache_folder"] == "~/.olaf/cache/"
+
+
+def test_an_existing_snapshot_config_is_left_alone(olaf, fake_olaf, tmp_path):
+    script, set_output, _ = fake_olaf
+    set_output(json.dumps(query_object(0.0)))
+    config = tmp_path / "snap" / ".olaf" / "olaf_config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"db_folder": "~/.olaf/db/", "verbose": true}')
+    olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).recognize("clip.wav")
+    assert config.read_text() == '{"db_folder": "~/.olaf/db/", "verbose": true}'
+
+
+def test_store_passes_path_identifier_pairs_with_ids(olaf, fake_olaf, tmp_path):
+    script, _, calls = fake_olaf
+    home = tmp_path / "snap"
+    olaf.OlafRecognizer(home, olaf_bin=str(script)).store([("/a.mp3", "id-a"), ("/b.mp3", "id-b")])
+    assert calls() == [
+        {"argv": ["store", "--with-ids", "/a.mp3", "id-a", "/b.mp3", "id-b"], "home": str(home)}
+    ]
+
+
+def test_store_with_nothing_to_store_runs_nothing(olaf, fake_olaf, tmp_path):
+    script, _, calls = fake_olaf
+    olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).store([])
+    assert calls() == []
+
+
+@pytest.mark.parametrize("action", ["query", "store"])
+def test_a_failing_olaf_raises_with_its_stderr(olaf, fake_olaf, tmp_path, action):
+    script, set_output, _ = fake_olaf
+    set_output(code=1, stderr="error: FileNotFound")
+    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script))
+    with pytest.raises(olaf.OlafError, match="FileNotFound"):
+        if action == "query":
+            recognizer.recognize("missing.wav")
+        else:
+            recognizer.store([("missing.mp3", "id")])
+
+
+def test_the_binary_comes_from_the_setting(fresh_recognizer, tmp_path):
+    fresh_recognizer(
+        WXDU_SHAZAM_SECRET="not-a-real-secret", STREAM_SLEUTH_OLAF_BIN="/opt/olaf/bin/olaf"
+    )
+    olaf = importlib.import_module("stream_sleuth.recognizers.olaf")
+    assert olaf.OlafRecognizer(tmp_path / "snap").olaf_bin == "/opt/olaf/bin/olaf"
+
+
+def test_the_binary_defaults_to_olaf_on_path(olaf, tmp_path):
+    assert olaf.OlafRecognizer(tmp_path / "snap").olaf_bin == "olaf"
+
+
+def test_the_adapter_is_a_recognizer(olaf, tmp_path):
+    base = importlib.import_module("stream_sleuth.recognizers.base")
+    assert isinstance(olaf.OlafRecognizer(tmp_path / "snap"), base.Recognizer)
+
+
+def test_index_build_stores_the_pairs_under_the_snapshot_home(
+    fresh_recognizer, fake_olaf, tmp_path
+):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    script, _, calls = fake_olaf
+    home = tmp_path / "snap"
+    argv = [
+        "index",
+        "build",
+        "--home",
+        str(home),
+        "--olaf-bin",
+        str(script),
+        "/a.mp3",
+        "id-a",
+        "/b.mp3",
+        "id-b",
+    ]
+    assert cli.main(argv) == 0
+    assert calls() == [
+        {"argv": ["store", "--with-ids", "/a.mp3", "id-a", "/b.mp3", "id-b"], "home": str(home)}
+    ]
+
+
+def test_index_build_refuses_an_unpaired_path(fresh_recognizer, tmp_path, capsys):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["index", "build", "--home", str(tmp_path), "/a.mp3", "id-a", "/b.mp3"])
+    assert exit_info.value.code == 2
+    assert "pairs" in capsys.readouterr().err

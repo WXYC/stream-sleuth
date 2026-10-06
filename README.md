@@ -82,8 +82,28 @@ Every setting is `STREAM_SLEUTH_<NAME>`. WXDU's original `WXDU_<NAME>` spelling 
 | `STREAM_SLEUTH_CAPTURE_FAST` | `WXDU_CAPTURE_FAST` | `6` | Capture length while getting hits, seconds |
 | `STREAM_SLEUTH_CAPTURE_SLOW` | `WXDU_CAPTURE_SLOW` | `12` | Capture length after a miss, seconds |
 | `STREAM_SLEUTH_VERBOSE` | `WXDU_VERBOSE` | off | `1`, `true`, or `yes` logs every cycle |
+| `STREAM_SLEUTH_OLAF_BIN` | (none) | `olaf` on `PATH` | The Olaf binary for the local recognizer (below) |
 
 The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret (the message names the `WXDU_SHAZAM_SECRET` alias, as it always has), or `jsonl` without an absolute path outside the checkout that it can append to (it creates the file, not its directory). A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
+
+## Local recognizer (optional)
+
+`stream_sleuth/recognizers/olaf.py` matches audio against a station's own reference files with [Olaf](https://github.com/JorenSix/Olaf) (AGPL-3.0, compatible with this repo's GPL-3.0), run as a subprocess. It is not a pip dependency, and nothing uses it unless a station turns it on. Build the pinned commit with Zig 0.16.0:
+
+```bash
+git clone https://github.com/JorenSix/Olaf.git && cd Olaf
+git checkout a98d8c03cfd447011d402718ca2d10b2bb467eb0
+zig build -Doptimize=ReleaseFast          # Zig 0.16.0; also fetches Olaf's zigzag dependency
+export STREAM_SLEUTH_OLAF_BIN="$PWD/zig-out/bin/olaf"
+```
+
+Olaf decodes with `ffmpeg`. Each index is a *snapshot* directory that the adapter passes to Olaf as `HOME`, so snapshots never share a database and `~/.olaf` is never touched. Fill one with:
+
+```bash
+uv run python -m stream_sleuth.cli index build --home /path/to/snapshot track.mp3 some-identifier [more.mp3 another-id ...]
+```
+
+Matches below a `match_count` of 12 are ignored: in WXYC's first test, real songs scored 17 to 178 on a 12 s clip and stray matches 6 to 10.
 
 ## Development
 
@@ -94,6 +114,8 @@ uv sync --locked --extra dev --extra eval   # picks Python 3.12 from .python-ver
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
+uv run pytest -m "ffmpeg"    # needs ffmpeg on PATH
+uv run pytest -m "olaf"      # needs ffmpeg and STREAM_SLEUTH_OLAF_BIN (see Local recognizer)
 ```
 
 The package supports Python 3.10 through 3.12: `shazamio` pins `shazamio-core`, whose macOS wheels stop at 3.12, and its dependency `pydub` imports `audioop`, which Python 3.13 removed. See `CLAUDE.md` for the test and data conventions.
