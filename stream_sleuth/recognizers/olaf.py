@@ -23,6 +23,9 @@ from .base import EvalIdentification, Identification, Recognizer
 # a floor of 12 removed the noise and lost no identification.
 DEFAULT_MIN_MATCH_COUNT = 12
 
+# A query takes milliseconds; a hung one must not stall the live loop forever.
+DEFAULT_QUERY_TIMEOUT_S = 60.0
+
 # Written into each snapshot so Olaf never falls back to a config beside its binary.
 SNAPSHOT_CONFIG = {"db_folder": "~/.olaf/db/", "cache_folder": "~/.olaf/cache/"}
 
@@ -38,16 +41,20 @@ class OlafRecognizer(Recognizer):
         olaf_bin: str | None = None,
         min_match_count: int = DEFAULT_MIN_MATCH_COUNT,
         lookup: Callable[[str], Identification | None] | None = None,
+        query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S,
     ) -> None:
         self.home = Path(home)
         self.olaf_bin = olaf_bin or OLAF_BIN
         self.min_match_count = min_match_count
         self.lookup = lookup
+        self.query_timeout_s = query_timeout_s
 
     def recognize(self, wav_path: str) -> EvalIdentification | None:
         matches = [
             m
-            for m in parse_matches(self._run("query", "--format", "json", wav_path))
+            for m in parse_matches(
+                self._run("query", "--format", "json", wav_path, timeout=self.query_timeout_s)
+            )
             if m["match_count"] >= self.min_match_count
         ]
         if not matches:
@@ -77,17 +84,21 @@ class OlafRecognizer(Recognizer):
         if args:
             self._run("store", "--with-ids", *args)
 
-    def _run(self, *args: str) -> str:
+    def _run(self, *args: str, timeout: float | None = None) -> str:
         config = self.home / ".olaf" / "olaf_config.json"
         if not config.exists():
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
-        proc = subprocess.run(
-            [self.olaf_bin, *args],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HOME": str(self.home)},
-        )
+        try:
+            proc = subprocess.run(
+                [self.olaf_bin, *args],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(self.home)},
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OlafError(f"olaf {args[0]} timed out after {timeout} s") from exc
         if proc.returncode != 0:
             raise OlafError(
                 f"olaf {args[0]} exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
@@ -113,15 +124,18 @@ def parse_matches(output: str) -> list[dict]:
         if not isinstance(obj, dict) or "matches" not in obj:
             raise OlafError(f"not a query result: {output[:200]!r}")
         found = True
-        for m in obj["matches"]:
-            matches.append(
+        try:
+            matches += [
                 {
                     "match_count": m["match_count"],
                     "query_offset_s": obj.get("query_offset", 0.0) + m["query_start"],
                     "ref_start_s": m["reference_start"],
                     "ref_key": m["path"],
                 }
-            )
+                for m in obj["matches"]
+            ]
+        except (KeyError, TypeError) as exc:
+            raise OlafError(f"incomplete match in olaf output: {exc!r}") from exc
     if not found:
         raise OlafError("olaf printed no query result")
     return matches

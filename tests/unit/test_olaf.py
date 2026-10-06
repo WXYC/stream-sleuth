@@ -283,3 +283,19 @@ def test_index_build_refuses_an_unpaired_path(fresh_recognizer, tmp_path, capsys
         cli.main(["index", "build", "--home", str(tmp_path), "/a.mp3", "id-a", "/b.mp3"])
     assert exit_info.value.code == 2
     assert "pairs" in capsys.readouterr().err
+
+
+def test_a_match_missing_a_field_is_an_olaf_error(olaf):
+    with pytest.raises(olaf.OlafError):
+        olaf.parse_matches(json.dumps({"query_offset": 0.0, "matches": [{"match_count": 30}]}))
+
+
+def test_a_hung_query_times_out_instead_of_stalling_the_loop(olaf, fake_olaf, tmp_path):
+    script, set_output, _ = fake_olaf
+    script.write_text(
+        script.read_text().replace("sys.exit(reply", "import time; time.sleep(5); sys.exit(reply")
+    )
+    set_output(json.dumps(query_object(0.0)))
+    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script), query_timeout_s=0.5)
+    with pytest.raises(olaf.OlafError, match="timed out"):
+        recognizer.recognize("clip.wav")
