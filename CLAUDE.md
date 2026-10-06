@@ -12,6 +12,8 @@ The code lives in the `stream_sleuth` package; `recognizer.py` is a thin shim th
 | `stream_sleuth/sources.py` | `Source` protocol; `IcecastSource`; `capture()` (ffmpeg); `FileSource` (a local file at an injected `Clock`'s offset, for replay; never a URL, not selectable from env) |
 | `stream_sleuth/recognizers/base.py` | `Recognizer` protocol; `Identification` (exactly the four wire keys) and `EvalIdentification` (adds the harness's optional fields; two classes because `NotRequired` is 3.11+). `at` is seconds from the start of the hour file (the origin `plays.jsonl` uses); `ref_key` is the pool stage id (sha1 of the object key), not the object key; `source` is an `IdentificationSource`, `"shazam"` or `"local"`; `confidence` is recognizer-specific (Olaf `match_count`, absent for Shazam). `query_offset_s` and `ref_start_s` are set together, so `at + query_offset_s - ref_start_s` is the song's start; for Shazam the driver sets them to 0 and the response's `matches[0].offset`. Each field's contract is in its docstring. Nothing strips the extra fields: an `EvalIdentification` handed to an `Output` sends them too |
 | `stream_sleuth/recognizers/shazam.py` | `ShazamRecognizer`; `parse()` and the `Shazam()` call |
+| `stream_sleuth/recognizers/olaf.py` | `OlafRecognizer`: Olaf as a subprocess with the snapshot directory as `HOME` (and its own `.olaf/olaf_config.json`, so Olaf never falls back to a config beside its binary); `store()` via `olaf store --with-ids`; `parse_matches()` for `query --format json`; the strongest match at or above `min_match_count` (default 12, measured in Phase 1); an optional `lookup` maps an identifier to the wire keys |
+| `stream_sleuth/cli.py` | `python -m stream_sleuth.cli index build --home DIR PATH ID ...` |
 | `stream_sleuth/outputs.py` | `Output` protocol; `HttpPostOutput`; `post()`; `JsonlOutput` (appends one UTF-8 JSON line per emission plus `emitted_at`; never truncates); `select_output()` picks one from `STREAM_SLEUTH_OUTPUT` and owns the refusal to run when it is incomplete |
 | `stream_sleuth/loop.py` | the adaptive loop: `step()`, a pure `(state, result) -> (state, action)` function; `run()`, the driver that carries its decisions out against a `Source`, `Recognizer`, and `Output`; `identify_once()` and `main()` |
 
@@ -36,6 +38,7 @@ uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
 uv run pytest
 uv run pytest -m "ffmpeg"   # needs a real ffmpeg on PATH
+uv run pytest -m "olaf"     # needs ffmpeg and an Olaf build in STREAM_SLEUTH_OLAF_BIN
 ```
 
 These are exactly the CI jobs; run them before every push. Do not document or use `pip install -e`, which drifts from the lock. `--locked` fails instead of silently rewriting `uv.lock` when `pyproject.toml` has changed; run `uv lock` deliberately and commit the result. `requirements.txt` is WXDU's install and is the one file not driven by the lock. It is not pinned (`shazamio>=0.8`), so a WXDU venv rebuild can pick up a newer `shazamio` than the lock tests.
@@ -47,6 +50,7 @@ These are exactly the CI jobs; run them before every push. Do not document or us
 - **A marker lands in the PR that adds the first test using it, never earlier**: declared in `pyproject.toml`, excluded in `addopts` as `not <marker>`, and given a same-named CI job, all at once. pytest exits 5 when a job collects nothing, so an empty job is a red build.
 - CI quotes the expression, `pytest -m "<marker>"`; the marker-sync check only recognizes a quoted `-m` argument.
 - The default CI job runs plain `pytest` and never names a subdirectory, so every unmarked test runs.
+- `olaf` tests need ffmpeg too; they carry only the `olaf` marker, because the `olaf` job installs both and the `ffmpeg` job has no Olaf. Olaf is built from JorenSix/Olaf `a98d8c03cfd447011d402718ca2d10b2bb467eb0` with Zig 0.16.0 (`zig build -Doptimize=ReleaseFast`); the CI job caches the binary keyed on that commit. Change the commit in the CI job, `pyproject.toml`'s comment, and the README together. Olaf always runs with a snapshot directory as `HOME`, a `tmp_path` in tests, never `~/.olaf`. `fresh_recognizer` clears `STREAM_SLEUTH_OLAF_BIN`, so read it before calling the fixture.
 - `stream_sleuth/config.py` reads every setting as `STREAM_SLEUTH_<NAME>`, falling back to its `WXDU_<NAME>` alias (a supported contract, never deprecated), into a module constant at import, and `recognizer.py` re-exports them. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. The `fresh_recognizer` fixture in `tests/conftest.py` does all of this; use it.
 - Fixtures are synthetic. Example artists are ones a freeform college station actually plays (Juana Molina, Jessica Pratt, Chuquimamani-Condori, Hermanos Gutiérrez), never mainstream ones.
 

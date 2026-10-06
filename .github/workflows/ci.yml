@@ -85,6 +85,45 @@ jobs:
       - run: uv sync --locked --extra dev --extra eval
       - run: uv run --no-sync pytest -m "ffmpeg"
 
+  olaf:
+    name: Olaf Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.12"
+      # The pinned Olaf commit and Zig version (README, "Local recognizer").
+      OLAF_COMMIT: a98d8c03cfd447011d402718ca2d10b2bb467eb0
+      ZIG_VERSION: 0.16.0
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - id: olaf-cache
+        uses: actions/cache@v4
+        with:
+          path: .olaf-build/zig-out/bin/olaf
+          key: olaf-${{ runner.os }}-${{ env.OLAF_COMMIT }}-zig-${{ env.ZIG_VERSION }}
+      - if: steps.olaf-cache.outputs.cache-hit != 'true'
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # A dot-directory: Olaf ships Python files of its own, and the S3 import scan
+      # skips dot-directories.
+      - if: steps.olaf-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: JorenSix/Olaf
+          ref: ${{ env.OLAF_COMMIT }}
+          path: .olaf-build
+      - if: steps.olaf-cache.outputs.cache-hit != 'true'
+        working-directory: .olaf-build
+        run: zig build -Doptimize=ReleaseFast
+      - run: echo "STREAM_SLEUTH_OLAF_BIN=$GITHUB_WORKSPACE/.olaf-build/zig-out/bin/olaf" >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --extra dev --extra eval
+      - run: uv run --no-sync pytest -m "olaf"
+
   marker-sync:
     name: CI Marker Sync
     uses: WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1

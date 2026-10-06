@@ -26,3 +26,6 @@ VERBOSE = _env("VERBOSE", "").lower() in ("1", "true", "yes")
 # (append to OUTPUT_PATH). New settings, so they have no WXDU_ alias.
 OUTPUT = os.environ.get("STREAM_SLEUTH_OUTPUT") or "http"
 OUTPUT_PATH = os.environ.get("STREAM_SLEUTH_OUTPUT_PATH", "")
+# The Olaf binary the local recognizer runs (built from the pinned commit; see the
+# README's "Local recognizer" section). New, so it has no WXDU_ alias.
+OLAF_BIN = os.environ.get("STREAM_SLEUTH_OLAF_BIN") or "olaf"
