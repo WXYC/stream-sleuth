@@ -102,7 +102,8 @@ class Throttle:
 
     The state file records the UTC day, the requests sent that day, the time of
     the last one, and whether a 429 stopped the day, so a restarted process
-    honors all four.
+    honors all four. One process per state file: there is no lock, and the
+    budget is the account's, so every leg shares one file and runs in turn.
     """
 
     def __init__(
