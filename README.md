@@ -73,13 +73,39 @@ the DB stays a clean log of distinct songs rather than a duplicate every cycle.
 Contributors use [`uv`](https://docs.astral.sh/uv/) and the committed `uv.lock`; the deploy above is unchanged and still uses `requirements.txt`.
 
 ```bash
-uv sync --locked --extra dev   # picks Python 3.12 from .python-version
+uv sync --locked --extra dev --extra eval   # picks Python 3.12 from .python-version
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
 ```
 
 The package supports Python 3.10 through 3.12: `shazamio` pins `shazamio-core`, whose macOS wheels stop at 3.12, and its dependency `pydub` imports `audioop`, which Python 3.13 removed. See `CLAUDE.md` for the test and data conventions.
+
+## Evaluation harness
+
+`evaluation/` is the research harness for measuring recognition accuracy against a station's archived broadcasts. It is never installed and the live recognizer never imports it; its dependencies are the `eval` extra.
+
+Its data and settings live outside the checkout:
+
+- **`STREAM_SLEUTH_DATA_DIR`** (default `~/.local/share/stream-sleuth/`) holds audio, indexes, exports, and results. Nothing under it is ever committed.
+- **`$STREAM_SLEUTH_DATA_DIR/eval.env`** holds the harness's settings, including the reference pool's key pair. Keep it at mode `600`.
+
+Load `eval.env` into **one process at a time**, never into your interactive shell:
+
+```bash
+uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.<module> ...
+# or, in a subshell:
+( set -a; . "$STREAM_SLEUTH_DATA_DIR/eval.env"; set +a; uv run --extra eval python -m evaluation.<module> ... )
+```
+
+`run.sh` exports its own environment into the recognizer, so a `./run.sh` started from a shell that had sourced `eval.env` would carry the harness's credentials into the live process.
+
+Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which refuses any operation other than `ListObjectsV2`, `GetObject`, and `HeadObject`. It reads:
+
+| Variable | Meaning |
+|---|---|
+| `STREAM_SLEUTH_ARCHIVE_AWS_PROFILE` | Named AWS profile for the broadcast archive; unset means the default credential chain. Use a read-only profile where one exists. |
+| `STREAM_SLEUTH_POOL_ENDPOINT`, `_BUCKET`, `_KEY_ID`, `_SECRET` | The reference pool's S3-compatible store. Each one unset or empty falls back to the same suffix under `DIGITAL_ARCHIVE_STORE_AZURACAST_`, the names WXYC's Backend-Service uses. |
 
 ## Notes
 
