@@ -2,6 +2,21 @@
 
 Live-stream song recognition for college radio. `recognizer.py` captures a few seconds of a station's Icecast stream with `ffmpeg`, identifies it with the unofficial Shazam client `shazamio`, and POSTs song changes to the station's API so live DJs get one-click "now playing" suggestions. WXDU runs it in production on an iMac (`run.sh`, `com.wxdu.stream-sleuth.plist`); its behavior must not change unless a PR says so on purpose.
 
+## Layout
+
+The code lives in the `stream_sleuth` package; `recognizer.py` is a thin shim that re-exports `parse`, `capture`, `post`, `identify_once`, `main`, and the settings constants, so `python recognizer.py` and WXDU's launchd job keep working.
+
+| Module | Holds |
+|---|---|
+| `stream_sleuth/config.py` | The `WXDU_*` settings, read into module constants at import |
+| `stream_sleuth/sources.py` | `Source` protocol; `IcecastSource`; `capture()` (ffmpeg) |
+| `stream_sleuth/recognizers/base.py` | `Recognizer` protocol; `Identification` (exactly the four wire keys) and `EvalIdentification` (adds the harness's optional fields; two classes because `NotRequired` is 3.11+) |
+| `stream_sleuth/recognizers/shazam.py` | `ShazamRecognizer`; `parse()` and the `Shazam()` call |
+| `stream_sleuth/outputs.py` | `Output` protocol; `HttpPostOutput`; `post()` |
+| `stream_sleuth/loop.py` | `identify_once()` and `main()`, the adaptive loop |
+
+Sibling modules bind settings with `from .config import ...`, so a test that changes the environment must re-import the package; use `fresh_recognizer` (see Tests). The loop calls `time.sleep` through the `time` module so a patch of `time.sleep` is seen at call time.
+
 ## Interpreter
 
 `requires-python = ">=3.10,<3.13"`, and `.python-version` pins 3.12.
