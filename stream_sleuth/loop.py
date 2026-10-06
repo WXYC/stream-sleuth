@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from .config import (
-    API_SECRET,
-    API_URL,
     CAPTURE_FAST,
     CAPTURE_SLOW,
     INTERVAL,
@@ -22,7 +20,7 @@ from .config import (
     STREAM_URL,
     VERBOSE,
 )
-from .outputs import HttpPostOutput, Output
+from .outputs import Output, select_output
 from .recognizers.base import Identification, Recognizer
 from .recognizers.shazam import ShazamRecognizer
 from .sources import IcecastSource, Source
@@ -143,15 +141,13 @@ def run(
 
 
 def main():
-    if not API_SECRET:
-        print("WXDU_SHAZAM_SECRET is not set; refusing to run.", file=sys.stderr)
-        sys.exit(1)
+    output, destination = select_output()  # refuses to run when the output is incomplete
 
     print(
         f"stream-sleuth: sampling {STREAM_URL} "
         f"(hit: {CAPTURE_FAST}s cap / {INTERVAL}s pause, "
-        f"gap: {CAPTURE_SLOW}s cap / {INTERVAL_GAP}s pause) -> {API_URL}",
+        f"gap: {CAPTURE_SLOW}s cap / {INTERVAL_GAP}s pause) -> {destination}",
         flush=True,
     )
     cadence = Cadence(CAPTURE_FAST, CAPTURE_SLOW, INTERVAL, INTERVAL_GAP)
-    run(IcecastSource(), ShazamRecognizer(), HttpPostOutput(), cadence, verbose=VERBOSE)
+    run(IcecastSource(), ShazamRecognizer(), output, cadence, verbose=VERBOSE)

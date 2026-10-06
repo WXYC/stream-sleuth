@@ -1,13 +1,14 @@
 """Where identifications go: the ``Output`` protocol, the HTTP POST output, and JSONL."""
 
 import json
+import sys
 import urllib.request
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NoReturn, Protocol, runtime_checkable
 
-from .config import API_SECRET, API_URL
+from .config import API_SECRET, API_URL, OUTPUT, OUTPUT_PATH
 
 
 @runtime_checkable
@@ -47,6 +48,28 @@ class JsonlOutput(Output):
         with self.path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         return self.path
+
+
+def select_output() -> tuple[Output, str]:
+    """The output ``STREAM_SLEUTH_OUTPUT`` names, and where it delivers to, for the banner.
+
+    Refuses to run (stderr, exit 1) when the chosen output is incomplete: the HTTP
+    output needs the shared secret, with WXDU's original message; JSONL needs a path.
+    """
+    if OUTPUT == "http":
+        if not API_SECRET:
+            _refuse("WXDU_SHAZAM_SECRET is not set")
+        return HttpPostOutput(), API_URL
+    if OUTPUT == "jsonl":
+        if not OUTPUT_PATH:
+            _refuse("STREAM_SLEUTH_OUTPUT_PATH is not set")
+        return JsonlOutput(OUTPUT_PATH), OUTPUT_PATH
+    _refuse(f"STREAM_SLEUTH_OUTPUT must be http or jsonl, not {OUTPUT!r}")
+
+
+def _refuse(reason: str) -> NoReturn:
+    print(f"{reason}; refusing to run.", file=sys.stderr)
+    sys.exit(1)
 
 
 def post(track):

@@ -7,7 +7,10 @@ song changes -- POSTs it to the wxdu API, which stores it in
 plmanager.shazamplaying. Adrenalin's playlist entry page surfaces the 5 most
 recent as clickable buttons for live DJs.
 
-Config is via environment variables (see .env.example / the launchd plist):
+Config is via environment variables (see .env.example / the launchd plist).
+Each WXDU_<NAME> below is also readable as STREAM_SLEUTH_<NAME>, which wins
+when both are set; STREAM_SLEUTH_OUTPUT=jsonl writes to a local file instead
+of POSTing (see the README's Config section):
 
   WXDU_STREAM_URL    stream to sample      (default: 192 kbps stream)
   WXDU_SHAZAM_API    ingest endpoint URL   (default: https://api.wxdu.art/api/shazam)
