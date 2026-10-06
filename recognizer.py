@@ -37,27 +37,37 @@ import urllib.request
 
 from shazamio import Shazam
 
-STREAM_URL   = os.environ.get("WXDU_STREAM_URL", "https://stream.wxdu.art/wxdu192.mp3")
-API_URL      = os.environ.get("WXDU_SHAZAM_API", "https://api.wxdu.art/api/shazam")
-API_SECRET   = os.environ.get("WXDU_SHAZAM_SECRET", "")
-INTERVAL     = int(os.environ.get("WXDU_INTERVAL", "23"))
+STREAM_URL = os.environ.get("WXDU_STREAM_URL", "https://stream.wxdu.art/wxdu192.mp3")
+API_URL = os.environ.get("WXDU_SHAZAM_API", "https://api.wxdu.art/api/shazam")
+API_SECRET = os.environ.get("WXDU_SHAZAM_SECRET", "")
+INTERVAL = int(os.environ.get("WXDU_INTERVAL", "23"))
 INTERVAL_GAP = int(os.environ.get("WXDU_INTERVAL_GAP", "4"))
 CAPTURE_FAST = int(os.environ.get("WXDU_CAPTURE_FAST", "6"))
 CAPTURE_SLOW = int(os.environ.get("WXDU_CAPTURE_SLOW", "12"))
 # When set (1/true/yes), log every cycle -- including same-song hits and repeat
 # misses -- so you can watch it tick. Off by default to keep the log quiet.
-VERBOSE      = os.environ.get("WXDU_VERBOSE", "").lower() in ("1", "true", "yes")
+VERBOSE = os.environ.get("WXDU_VERBOSE", "").lower() in ("1", "true", "yes")
 
 
 def capture(path, seconds):
     """Grab `seconds` of the stream into a small mono 16kHz wav via ffmpeg."""
     subprocess.run(
         [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", STREAM_URL,
-            "-t", str(seconds),
-            "-ac", "1", "-ar", "16000",
-            "-f", "wav", path,
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            STREAM_URL,
+            "-t",
+            str(seconds),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            path,
         ],
         check=True,
         timeout=seconds + 25,
@@ -72,9 +82,9 @@ def parse(out):
         return None
     result = {
         "artist": track.get("subtitle", "") or "",
-        "song":   track.get("title", "") or "",
-        "album":  "",
-        "label":  "",
+        "song": track.get("title", "") or "",
+        "album": "",
+        "label": "",
     }
     for section in track.get("sections", []) or []:
         for md in section.get("metadata", []) or []:
@@ -125,11 +135,14 @@ def main():
         print("WXDU_SHAZAM_SECRET is not set; refusing to run.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"stream-sleuth: sampling {STREAM_URL} "
-          f"(hit: {CAPTURE_FAST}s cap / {INTERVAL}s pause, "
-          f"gap: {CAPTURE_SLOW}s cap / {INTERVAL_GAP}s pause) -> {API_URL}", flush=True)
+    print(
+        f"stream-sleuth: sampling {STREAM_URL} "
+        f"(hit: {CAPTURE_FAST}s cap / {INTERVAL}s pause, "
+        f"gap: {CAPTURE_SLOW}s cap / {INTERVAL_GAP}s pause) -> {API_URL}",
+        flush=True,
+    )
     last_key = None
-    window = CAPTURE_FAST   # start speedy
+    window = CAPTURE_FAST  # start speedy
 
     while True:
         try:
@@ -141,11 +154,17 @@ def main():
                     # of distinct tracks rather than a duplicate every cycle.
                     status = post(track)
                     last_key = key
-                    print(f"[{time.strftime('%H:%M:%S')}] posted ({status}): "
-                          f"{track['artist']} - {track['song']}", flush=True)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] posted ({status}): "
+                        f"{track['artist']} - {track['song']}",
+                        flush=True,
+                    )
                 elif VERBOSE:
-                    print(f"[{time.strftime('%H:%M:%S')}] still playing: "
-                          f"{track['artist']} - {track['song']}", flush=True)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] still playing: "
+                        f"{track['artist']} - {track['song']}",
+                        flush=True,
+                    )
                 # Any hit (new or the same track still playing) means we're
                 # confident about what's on air -- keep captures speedy.
                 window = CAPTURE_FAST
@@ -154,8 +173,11 @@ def main():
                 # we haven't caught yet). Lengthen the capture to improve the
                 # odds, and stay there until something hits.
                 if window != CAPTURE_SLOW:
-                    print(f"[{time.strftime('%H:%M:%S')}] no match, "
-                          f"extending capture to {CAPTURE_SLOW}s", flush=True)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] no match, "
+                        f"extending capture to {CAPTURE_SLOW}s",
+                        flush=True,
+                    )
                 elif VERBOSE:
                     print(f"[{time.strftime('%H:%M:%S')}] no match ({CAPTURE_SLOW}s)", flush=True)
                 window = CAPTURE_SLOW
