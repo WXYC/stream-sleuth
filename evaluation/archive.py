@@ -72,6 +72,7 @@ def fetch(key: str, *, archive_dir: Path, client: Any = None, bucket: str | None
     size = client.head_object(Bucket=bucket, Key=key)["ContentLength"]
     if dest.exists():
         if dest.stat().st_size == size:
+            log.info("have %s", key)
             return dest
         raise HourSizeMismatchError(f"{dest} has {dest.stat().st_size} bytes, the object {size}")
     dest.parent.mkdir(parents=True, exist_ok=True)
