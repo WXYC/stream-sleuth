@@ -29,8 +29,9 @@ python3 -m venv venv
 
 # 3. config
 cp .env.example .env
-#   - set WXDU_SHAZAM_SECRET to the SAME value as the API's SHAZAM_INGEST_SECRET
-#     (generate one with: openssl rand -hex 32)
+#   - set STREAM_SLEUTH_SHAZAM_SECRET to the SAME value as the API's SHAZAM_INGEST_SECRET
+#     (generate one with: openssl rand -hex 32); an existing WXDU_SHAZAM_SECRET still works
+#   - or, for WXYC: cp examples/wxyc.env .env (writes JSONL locally, no secret needed)
 
 # 4. test by hand
 ./run.sh
@@ -64,9 +65,24 @@ launchctl unload ~/Library/LaunchAgents/com.wxdu.stream-sleuth.plist
 
 ## Config
 
-All via environment (see `.env.example`): stream URL, API URL, shared secret,
-poll interval, capture length. The tool posts a track only when it *changes*, so
-the DB stays a clean log of distinct songs rather than a duplicate every cycle.
+All via environment; `.env.example` documents each setting with WXDU's values, and `examples/wxyc.env` is WXYC's. The tool emits a track only when it *changes*, so the output stays a clean log of distinct songs rather than a duplicate every cycle.
+
+Every setting is `STREAM_SLEUTH_<NAME>`. WXDU's original `WXDU_<NAME>` spelling is a supported alias, so an existing `.env` or launchd plist keeps working unchanged. When both are set, the `STREAM_SLEUTH_` name wins; an empty one counts as unset.
+
+| Setting | Alias | Default | Meaning |
+|---|---|---|---|
+| `STREAM_SLEUTH_STREAM_URL` | `WXDU_STREAM_URL` | WXDU's 192 kbps stream | Stream to sample |
+| `STREAM_SLEUTH_OUTPUT` | (none) | `http` | `http` posts each new song to the API; `jsonl` appends it to a local file |
+| `STREAM_SLEUTH_OUTPUT_PATH` | (none) | (none) | The JSONL file; required when the output is `jsonl` |
+| `STREAM_SLEUTH_SHAZAM_API` | `WXDU_SHAZAM_API` | `https://api.wxdu.art/api/shazam` | Ingest endpoint for the `http` output |
+| `STREAM_SLEUTH_SHAZAM_SECRET` | `WXDU_SHAZAM_SECRET` | (none) | Shared secret; required for the `http` output |
+| `STREAM_SLEUTH_INTERVAL` | `WXDU_INTERVAL` | `23` | Pause between tries while getting hits, seconds |
+| `STREAM_SLEUTH_INTERVAL_GAP` | `WXDU_INTERVAL_GAP` | `4` | Pause between tries during a miss, seconds |
+| `STREAM_SLEUTH_CAPTURE_FAST` | `WXDU_CAPTURE_FAST` | `6` | Capture length while getting hits, seconds |
+| `STREAM_SLEUTH_CAPTURE_SLOW` | `WXDU_CAPTURE_SLOW` | `12` | Capture length after a miss, seconds |
+| `STREAM_SLEUTH_VERBOSE` | `WXDU_VERBOSE` | off | `1`, `true`, or `yes` logs every cycle |
+
+The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret, or `jsonl` without a path. A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
 
 ## Development
 
