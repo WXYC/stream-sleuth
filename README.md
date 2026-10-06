@@ -93,19 +93,19 @@ Its data and settings live outside the checkout:
 Load `eval.env` into **one process at a time**, never into your interactive shell:
 
 ```bash
-uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.<module> ...
+uv run --extra eval --env-file "${STREAM_SLEUTH_DATA_DIR:-$HOME/.local/share/stream-sleuth}/eval.env" python -m evaluation.<module> ...
 # or, in a subshell:
-( set -a; . "$STREAM_SLEUTH_DATA_DIR/eval.env"; set +a; uv run --extra eval python -m evaluation.<module> ... )
+( set -a; . "${STREAM_SLEUTH_DATA_DIR:-$HOME/.local/share/stream-sleuth}/eval.env"; set +a; uv run --extra eval python -m evaluation.<module> ... )
 ```
 
 `run.sh` exports its own environment into the recognizer, so a `./run.sh` started from a shell that had sourced `eval.env` would carry the harness's credentials into the live process.
 
-Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which refuses any operation other than `ListObjectsV2`, `GetObject`, and `HeadObject`. It reads:
+Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which refuses any operation other than `ListObjectsV2`, `GetObject`, and `HeadObject`. That refusal guards against mistakes in the harness's own code; it is not a substitute for read-only credentials. It reads:
 
 | Variable | Meaning |
 |---|---|
 | `STREAM_SLEUTH_ARCHIVE_AWS_PROFILE` | Named AWS profile for the broadcast archive; unset means the default credential chain. Use a read-only profile where one exists. |
-| `STREAM_SLEUTH_POOL_ENDPOINT`, `_BUCKET`, `_KEY_ID`, `_SECRET` | The reference pool's S3-compatible store. Each one unset or empty falls back to the same suffix under `DIGITAL_ARCHIVE_STORE_AZURACAST_`, the names WXYC's Backend-Service uses. |
+| `STREAM_SLEUTH_POOL_ENDPOINT`, `_BUCKET`, `_KEY_ID`, `_SECRET` | The reference pool's S3-compatible store. Each one unset or empty falls back to the same suffix under `DIGITAL_ARCHIVE_STORE_AZURACAST_`, the names WXYC's Backend-Service uses. Prefer a read-only key scoped to the bucket: the fallback key can write. |
 
 ## Notes
 
