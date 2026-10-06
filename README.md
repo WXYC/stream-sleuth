@@ -104,6 +104,7 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 
 | Variable | Meaning |
 |---|---|
+| `STREAM_SLEUTH_ARCHIVE_BUCKET` | The broadcast archive's bucket. Read by `evaluation/archive.py`. |
 | `STREAM_SLEUTH_ARCHIVE_AWS_PROFILE` | Named AWS profile for the broadcast archive; unset means the default credential chain. Use a read-only profile where one exists. |
 | `STREAM_SLEUTH_POOL_ENDPOINT`, `_BUCKET`, `_KEY_ID`, `_SECRET` | The reference pool's S3-compatible store. Each one unset or empty falls back to the same suffix under `DIGITAL_ARCHIVE_STORE_AZURACAST_`, the names WXYC's Backend-Service uses. Prefer a read-only key scoped to the bucket: the fallback key can write. |
 | `STREAM_SLEUTH_POOL_PREFIXES` | Comma-separated key prefixes that make up the reference pool, e.g. `rotation/Heavy/,rotation/Medium/`. Read by `evaluation/pool.py`. |
@@ -111,6 +112,10 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 ### Reference pool
 
 `evaluation/pool.py` builds the reference pool without mirroring it. `inventory()` lists every object under the prefixes, and `summarize()` counts objects and bytes per prefix and format before anything is fetched. `stream()` then fetches one audio file at a time into the staging directory its caller passes, named by the SHA-1 of its key, reads its tags into the `pool.db` its caller opens, hands it to a consumer (the index build), and deletes it whether the consumer succeeds or fails. The module reads no data-directory setting, so callers pass paths under `$STREAM_SLEUTH_DATA_DIR`, e.g. `$STREAM_SLEUTH_DATA_DIR/pool-staging/` and `$STREAM_SLEUTH_DATA_DIR/pool.db`, never the checkout. A rerun skips files already indexed and retries only failed ones. Files without an artist or a title tag are indexed anyway and counted as `untagged` in the counts `stream()` returns and logs. Supported formats are mp3, aac, wav, flac, and m4a/mp4, each read with its own `mutagen` reader; anything else is counted and skipped.
+
+### Broadcast archive
+
+`evaluation/archive.py` is WXYC-specific. WXYC's archive holds one MP3 per hour, keyed `YYYY/MM/DD/YYYYMMDDHH00.mp3` by the hour's America/New_York local time, not UTC. `hour_key()` maps a timezone-aware instant to its key and returns `None` for the fall-back hour, which is recorded twice under one key with the later recording overwriting the earlier; `hour_start()` is its inverse. `fetch()` downloads an hour to `$STREAM_SLEUTH_DATA_DIR/archive/<key>` through a `.part` file, keeps an existing file of the right size, and never overwrites one of any other size.
 
 ## Notes
 
