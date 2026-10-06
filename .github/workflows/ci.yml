@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR branch cancels that branch's superseded run; runs on main
+# always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Lint & Format
@@ -26,6 +32,11 @@ jobs:
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
+    env:
+      # mypy checks against the interpreter it runs on, so the 3.10 floor catches
+      # stdlib names newer than 3.10. Setting mypy's python_version instead breaks
+      # on the 3.12 environment's numpy stubs, which use 3.12-only syntax.
+      UV_PYTHON: "3.10"
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v10.2.0
@@ -43,12 +54,16 @@ jobs:
         # 3.10 is the floor WXDU's deploy can run on; 3.12 is the pinned
         # interpreter in .python-version.
         python-version: ["3.10", "3.12"]
+    env:
+      # Overrides .python-version for every uv command in the job, so the 3.10
+      # leg cannot silently fall back to 3.12.
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
-      - run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+      - run: uv sync --locked --extra dev
       # Plain pytest: testpaths and addopts in pyproject.toml decide what runs.
       - run: uv run --no-sync pytest
 
