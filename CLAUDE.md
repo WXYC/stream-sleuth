@@ -78,4 +78,5 @@ This section applies to the `WXYC/stream-sleuth` fork and is dropped from anythi
 - Every PR is created with `gh pr create --repo WXYC/stream-sleuth --base <base>`, so a stacked PR can never default to the upstream repo. Merge with rebase only.
 - **`spike/` branches are local-only and are never pushed.** This fork is public.
 - The `marker-sync` CI job calls `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1`; read that repo's tag-stability policy before changing the call.
+- `evaluation/archive.py` is WXYC-specific: it encodes the WXYC archive's Eastern-time hour keys and DST rules. It and `evaluation/corpus.py` (PR 11) are the station side of the `plays.jsonl` boundary; everything else under `evaluation/` must stay station-neutral.
 - The viability-study plan lives in the private `wxyc-workspace` repo at `plans/stream-sleuth/plan.md`; the public summary is the epic, WXYC/stream-sleuth#1.
