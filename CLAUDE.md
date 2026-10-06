@@ -9,7 +9,7 @@ The code lives in the `stream_sleuth` package; `recognizer.py` is a thin shim th
 | Module | Holds |
 |---|---|
 | `stream_sleuth/config.py` | The `WXDU_*` settings, read into module constants at import |
-| `stream_sleuth/sources.py` | `Source` protocol; `IcecastSource`; `capture()` (ffmpeg) |
+| `stream_sleuth/sources.py` | `Source` protocol; `IcecastSource`; `capture()` (ffmpeg); `FileSource` (a local file at an injected `Clock`'s offset, for replay; never a URL, not selectable from env) |
 | `stream_sleuth/recognizers/base.py` | `Recognizer` protocol; `Identification` (exactly the four wire keys) and `EvalIdentification` (adds the harness's optional fields; two classes because `NotRequired` is 3.11+) |
 | `stream_sleuth/recognizers/shazam.py` | `ShazamRecognizer`; `parse()` and the `Shazam()` call |
 | `stream_sleuth/outputs.py` | `Output` protocol; `HttpPostOutput`; `post()` |
