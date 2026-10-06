@@ -77,6 +77,14 @@ class Stop(BaseException):
     pass
 
 
+class Exhausted(BaseException):
+    """The scripted parts ran out: the driver did not stop where the test expected.
+
+    A ``BaseException``, so ``run()``'s ``except Exception`` cannot swallow it and
+    loop forever.
+    """
+
+
 class Parts:
     """A source, recognizer, and output scripted cycle by cycle, recording what they did."""
 
@@ -90,6 +98,8 @@ class Parts:
         self.captures.append(seconds)
 
     def recognize(self, wav_path):
+        if not self.results:
+            raise Exhausted
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -124,6 +134,23 @@ def test_a_failed_emit_keeps_the_previous_state_so_the_next_cycle_retries():
     assert parts.emitted == [JUANA]
     assert parts.captures == [6, 6]
     assert pauses == [23, 23]
+
+
+def test_a_successful_emit_is_kept_even_if_logging_it_fails(monkeypatch):
+    # The old loop set last_key straight after post() returned, so a failing log
+    # write must not make the next cycle post the same song again.
+    from stream_sleuth import loop
+
+    def log(message, **kwargs):
+        if message.startswith("posted"):
+            raise OSError("stdout is gone")
+
+    monkeypatch.setattr(loop, "_log", log)
+    parts = Parts([JUANA, JUANA])
+
+    drive(parts, 2)
+
+    assert parts.emitted == [JUANA]
 
 
 def test_a_recognizer_error_keeps_the_current_capture_state():

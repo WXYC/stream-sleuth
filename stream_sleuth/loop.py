@@ -127,11 +127,15 @@ def run(
             next_state, action = step(state, _identify(source, recognizer, state.window), cadence)
             if action.emit is not None:
                 status = output.emit(action.emit)
+                # Posted: adopt the new key before logging, so a failed log
+                # write cannot make the next cycle post the same song again.
+                state = next_state
                 track = action.emit
                 _log(f"posted ({status}): {track['artist']} - {track['song']}")
-            elif action.message and (verbose or not action.verbose_only):
-                _log(action.message)
-            state = next_state
+            else:
+                if action.message and (verbose or not action.verbose_only):
+                    _log(action.message)
+                state = next_state
         except Exception as e:  # noqa: BLE001 - keep the loop alive through any error
             _log(f"error: {e}", file=sys.stderr)
 
