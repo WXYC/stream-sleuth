@@ -44,6 +44,16 @@ PADS = {"canonical": 180.0, "etl": 220.0}
 MIN_TRACKS = 8
 MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
 MAX_TALK_HOUR_TRACKS = 3
+# Time-of-day bands by the hour's America/New_York start, and the plan §5.2 corpus:
+# 12 high-share and 4 low-share canonical DJ hours per band quota, 4 contrast hours
+# from 2022-2024, 2 talk-heavy hours.
+BANDS = {"overnight": range(0, 6), "daytime": range(6, 18), "evening": range(18, 24)}
+HIGH_QUOTAS = {"daytime": 5, "evening": 4, "overnight": 3}
+LOW_QUOTAS = {"daytime": 2, "evening": 1, "overnight": 1}
+LOW_SHARE_MAX = 0.10
+CONTRAST_YEARS = (2022, 2023, 2024)
+CONTRAST_HOURS = 4
+TALK_HOURS = 2
 TALK_TYPES = {"talkset", "message"}
 
 _TIME = re.compile(r"(.{19})(?:\.(\d+))?([+-]\d{2})(?::?(\d{2}))?")
@@ -291,6 +301,94 @@ def select_talk_hours(stats: dict[str, HourStats], *, count: int) -> list[str]:
         if _eligible(h) and h.talk_rows and h.track_rows <= MAX_TALK_HOUR_TRACKS
     ]
     return [h.key for h in sorted(talk, key=lambda h: (-h.talk_rows, h.key))[:count]]
+
+
+def band(key: str) -> str:
+    """The time-of-day band of an hour key's Eastern start."""
+    hour = hour_start(key).astimezone(EASTERN).hour
+    return next(name for name, hours in BANDS.items() if hour in hours)
+
+
+@dataclass
+class Selection:
+    """Chosen hour keys -> ``(group, band)`` in selection order, and every shortfall.
+
+    A ``<group>/<band>`` shortfall was relaxed: filled from the group's other bands.
+    ``<group>/unfilled`` and ``contrast/<year>`` count hours that could not be found.
+    """
+
+    hours: dict[str, tuple[str, str]] = field(default_factory=dict)
+    shortfalls: dict[str, int] = field(default_factory=dict)
+
+    def take(self, hours: Iterable[HourStats], group: str) -> int:
+        taken = 0
+        for h in hours:
+            if h.key not in self.hours:
+                self.hours[h.key] = (group, band(h.key))
+                taken += 1
+        return taken
+
+    def short(self, name: str, missing: int) -> None:
+        if missing > 0:
+            self.shortfalls[name] = missing
+
+
+def _dj(h: HourStats) -> bool:
+    return _eligible(h) and h.track_rows >= MIN_TRACKS and h.median_gap_s >= MIN_MEDIAN_GAP_S
+
+
+def _share(h: HourStats) -> float:
+    return h.in_pool / h.track_rows
+
+
+def _by_share(h: HourStats) -> tuple[bool, float, int, str]:
+    return (h.reorder_flagged, -_share(h), -h.in_pool, h.key)
+
+
+def _fill(sel: Selection, candidates: list[HourStats], quotas: dict[str, int], group: str) -> None:
+    """Fill each band's quota in rank order, then relax shortfalls from the other bands."""
+    for name, quota in quotas.items():
+        got = sel.take(
+            [h for h in candidates if band(h.key) == name and h.key not in sel.hours][:quota], group
+        )
+        sel.short(f"{group}/{name}", quota - got)
+    missing = sum(quotas.values()) - sum(g == group for g, _ in sel.hours.values())
+    sel.short(
+        f"{group}/unfilled",
+        missing - sel.take([h for h in candidates if h.key not in sel.hours][:missing], group),
+    )
+
+
+def select_corpus(stats: dict[str, HourStats]) -> Selection:
+    """The plan §5.2 corpus: stratified canonical DJ hours, contrast hours, talk hours.
+
+    Canonical hours never come from the ``etl`` era, however thin a band is.
+    """
+    sel = Selection()
+    canonical = [h for h in stats.values() if h.era == "canonical" and _dj(h)]
+    high = sorted((h for h in canonical if _share(h) > LOW_SHARE_MAX), key=_by_share)
+    low = sorted((h for h in canonical if _share(h) <= LOW_SHARE_MAX),
+                 key=lambda h: (h.reorder_flagged, -h.track_rows, h.key))  # fmt: skip
+    _fill(sel, high, HIGH_QUOTAS, "canonical-high")
+    _fill(sel, low, LOW_QUOTAS, "canonical-low")
+    old = sorted((h for h in stats.values() if h.era == "etl" and _dj(h)
+                  and hour_start(h.key).astimezone(EASTERN).year in CONTRAST_YEARS), key=_by_share)  # fmt: skip
+    for year in CONTRAST_YEARS:
+        sel.short(
+            f"contrast/{year}",
+            1 - sel.take([h for h in old if h.key.startswith(str(year))][:1], "contrast"),
+        )
+    chosen = sum(g == "contrast" for g, _ in sel.hours.values())
+    chosen += sel.take(
+        [h for h in old if h.key not in sel.hours][: CONTRAST_HOURS - chosen], "contrast"
+    )
+    sel.short("contrast/unfilled", CONTRAST_HOURS - chosen)
+    talk = select_talk_hours(stats, count=TALK_HOURS)
+    sel.short("talk/unfilled", TALK_HOURS - sel.take([stats[k] for k in talk], "talk"))
+    for name, missing in sel.shortfalls.items():
+        log.warning("selection shortfall %s: %d", name, missing)
+    log.info("selected %d hours", len(sel.hours))
+    return sel
 
 
 def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
