@@ -601,3 +601,129 @@ def test_select_hours_deprioritizes_reorder_flagged_shows(tmp_path: Path, pool_d
     assert stats["2026/08/12/202608121600.mp3"].reorder_flagged
     assert not stats["2026/08/12/202608121700.mp3"].reorder_flagged
     assert corpus.select_hours(stats, era="canonical", target=5) == ["2026/08/12/202608121700.mp3"]
+
+
+def stat(
+    key: str, *, era: str = "canonical", tracks: int = 10, in_pool: int = 5, **kw: Any
+) -> corpus.HourStats:
+    return corpus.HourStats(
+        key, era, tracks, kw.get("talk", 0), in_pool, kw.get("gap", 200.0), kw.get("flagged", False)
+    )
+
+
+def keys_in(day: int, hours: range, month: int = 9, year: int = 2026) -> list[str]:
+    return [f"{year}/{month:02d}/{day:02d}/{year}{month:02d}{day:02d}{h:02d}00.mp3" for h in hours]
+
+
+@pytest.mark.parametrize(
+    ("key", "band"),
+    [
+        ("2026/08/12/202608120000.mp3", "overnight"),
+        ("2026/08/12/202608120500.mp3", "overnight"),
+        ("2026/08/12/202608120600.mp3", "daytime"),
+        ("2026/08/12/202608121700.mp3", "daytime"),
+        ("2026/08/12/202608121800.mp3", "evening"),
+        ("2026/08/12/202608122300.mp3", "evening"),
+        ("2026/12/02/202612020500.mp3", "overnight"),  # EST
+        ("2026/12/02/202612020600.mp3", "daytime"),
+        ("2026/12/02/202612021800.mp3", "evening"),
+    ],
+)
+def test_band_uses_the_eastern_hour(key: str, band: str) -> None:
+    assert corpus.band(key) == band
+
+
+def plenty() -> dict[str, corpus.HourStats]:
+    """Twelve high-share and three low-share canonical hours in every hour of the day."""
+    stats = {
+        k: stat(k, in_pool=5 + (k[-8:-6] == "05"))
+        for d in range(1, 13)
+        for k in keys_in(d, range(24))
+    }
+    stats |= {
+        k: stat(k, in_pool=0, tracks=9 + d) for d in range(13, 16) for k in keys_in(d, range(24))
+    }
+    return stats
+
+
+def test_select_corpus_fills_band_quotas_exactly() -> None:
+    sel = corpus.select_corpus(plenty())
+    counts: dict[tuple[str, str], int] = {}
+    for group, band in sel.hours.values():
+        counts[group, band] = counts.get((group, band), 0) + 1
+    expected = {("canonical-high", b): q for b, q in corpus.HIGH_QUOTAS.items()}
+    expected |= {("canonical-low", b): q for b, q in corpus.LOW_QUOTAS.items()}
+    assert counts == expected
+    assert sel.shortfalls["contrast/unfilled"] == 4 and sel.shortfalls["talk/unfilled"] == 2
+    assert {k: v for k, v in sel.shortfalls.items() if k.startswith("canonical")} == {}
+
+
+def test_select_corpus_ranks_high_by_share_and_low_by_track_rows() -> None:
+    sel = corpus.select_corpus(plenty())
+    high = [k for k, (g, _) in sel.hours.items() if g == "canonical-high"]
+    low = [k for k, (g, _) in sel.hours.items() if g == "canonical-low"]
+    assert all(
+        k.endswith("0500.mp3") for k in high if corpus.band(k) == "overnight"
+    )  # the 6/10 share hours
+    assert {k[8:10] for k in low} == {"15"}  # the day with the most track rows
+
+
+def test_select_corpus_relaxes_a_thin_band_from_canonical_only() -> None:
+    stats = {k: stat(k) for d in range(1, 4) for k in keys_in(d, range(6, 24))}
+    stats |= {k: stat(k) for k in keys_in(4, range(0, 1))}  # one overnight hour
+    stats |= {
+        k: stat(k, era="etl", in_pool=10) for k in keys_in(5, range(0, 6), month=7)
+    }  # etl overnight
+    sel = corpus.select_corpus(stats)
+    high = {k: b for k, (g, b) in sel.hours.items() if g == "canonical-high"}
+    assert len(high) == 12 and list(high.values()).count("overnight") == 1
+    assert sel.shortfalls["canonical-high/overnight"] == 2
+    assert "canonical-high/unfilled" not in sel.shortfalls
+    assert all(
+        stats[k].era == "canonical" for k, (g, _) in sel.hours.items() if g.startswith("canonical")
+    )
+
+
+def test_select_corpus_ranks_reorder_flagged_hours_last() -> None:
+    stats = {k: stat(k) for k in keys_in(1, range(6, 18))}
+    flagged = keys_in(2, range(6, 7))[0]
+    stats[flagged] = stat(flagged, in_pool=10, flagged=True)  # best share, but flagged
+    sel = corpus.select_corpus(stats)
+    assert flagged not in sel.hours
+
+
+def test_select_corpus_skips_ineligible_hours() -> None:
+    stats = {
+        k: stat(k, tracks=7) if i == 0 else stat(k, gap=30.0) if i == 1 else stat(k)
+        for i, k in enumerate(keys_in(1, range(6, 9)))
+    }
+    stats |= {k: stat(k) for k in keys_in(10, range(6, 8), month=8)}  # 2026-08-10: gap-import day
+    sel = corpus.select_corpus(stats)
+    assert list(sel.hours) == ["2026/09/01/202609010800.mp3"]
+
+
+def test_select_corpus_contrast_one_per_year_then_best_remaining() -> None:
+    stats = {k: stat(k, era="etl", in_pool=3) for k in keys_in(5, range(10, 14), year=2022)}
+    stats |= {
+        k: stat(k, era="etl", in_pool=8 - i)
+        for i, k in enumerate(keys_in(5, range(10, 13), year=2024))
+    }
+    stats |= {
+        k: stat(k, era="etl", in_pool=10) for k in keys_in(5, range(10, 12), year=2025)
+    }  # out of range
+    sel = corpus.select_corpus(stats)
+    contrast = [k for k, (g, _) in sel.hours.items() if g == "contrast"]
+    assert [k[:4] for k in contrast] == ["2022", "2024", "2024", "2024"]
+    assert contrast[1:] == keys_in(5, range(10, 13), year=2024)
+    assert sel.shortfalls["contrast/2023"] == 1
+
+
+def test_select_corpus_talk_hours_and_no_duplicates() -> None:
+    stats = plenty()
+    stats |= {
+        k: stat(k, tracks=2, talk=6 - i, in_pool=0)
+        for i, k in enumerate(keys_in(20, range(10, 13)))
+    }
+    sel = corpus.select_corpus(stats)
+    assert [k for k, (g, _) in sel.hours.items() if g == "talk"] == keys_in(20, range(10, 12))
+    assert len(sel.hours) == 16 + 2
