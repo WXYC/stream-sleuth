@@ -96,6 +96,11 @@ Known gap on the `title` tier: it joins only when the play's title key equals th
 - Guard tests use moto's `mock_aws`, never `botocore.stub.Stubber`, which answers before the guard runs and would make the tests pass without it. A test against a custom endpoint sets `MOTO_S3_CUSTOM_ENDPOINTS`, or moto lets botocore reach the real host.
 - The harness reads `os.environ` only. Its settings live in `$STREAM_SLEUTH_DATA_DIR/eval.env`, outside the checkout, and are loaded into one process with `uv run --extra eval --env-file …` or a subshell, **never `source`d into an interactive shell**: `run.sh` exports its whole environment into the recognizer.
 
+## Shazam
+
+- **No test or manual check ever contacts Shazam.** `evaluation.shazam_eval.CountingClient` takes a required `base_url`; tests pass a localhost server's URL, and only the CLI passes `None` (the real host). Signatures are computed offline from synthetic audio, so tests run `Shazam.recognize` up to the HTTP request.
+- Every request goes through `Throttle.acquire()` inside the client, so anything `shazamio` sends is counted. Never construct `shazamio`'s default `HTTPClient` in the harness: it retries 429s up to 20 times.
+
 ## WXYC fork
 
 This section applies to the `WXYC/stream-sleuth` fork and is dropped from anything offered upstream to `landmarco/stream-sleuth`.

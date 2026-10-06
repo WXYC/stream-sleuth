@@ -183,6 +183,18 @@ The grid is every 15 s from 0, keeping exactly the offsets whose clip ends at or
 
 `cut()` is a context manager. It refuses a work directory that is relative or inside the checkout (`DataPathError`, before creating anything), and refuses with `ClipError` any address whose clip would run past the hour file's decoded end, rather than yield a short or empty clip. Otherwise it cuts the clip in its own temporary directory under the work directory, re-encodes it to constant-bitrate MP3 at the profile's rate (`128k`, the live mount, or `320k`), optionally decodes that to the mono 16 kHz WAV the live capture produces, and deletes it on exit, including when the caller raises or ffmpeg fails. Clips are never kept: an address is a recipe over a retained hour file.
 
+### Shazam
+
+`evaluation/shazam_eval.py` is station-neutral. It queries Shazam once per clip address and appends each answer to a JSONL store that is never cleared or rewritten. Shazam is unofficial and rate-limits, so every request is throttled before it is sent: at most `STREAM_SLEUTH_SHAZAM_RATE_PER_DAY` per UTC day (default 500), at least `STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S` apart (default 20). The count, the last request time, and any stop are kept in a state file, so a restart cannot exceed the day's budget. A 429 stops the run for the rest of the UTC day. Each answer is stored as `matched` or `no_match` (scoring outcomes, never queried again), or `rate_limited`, `server_error`, or `decode_error` (queried again by a later run). Each record carries the four wire fields, Shazam's match offset (`offset_s`), the HTTP status, and the recognizer identity `shazam@<shazamio version>, segment=<capture length>`; the whole clip is fingerprinted.
+
+```sh
+uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.shazam_eval \
+  --hours hours.txt --archive-dir "$STREAM_SLEUTH_DATA_DIR/archive" --work-dir "$STREAM_SLEUTH_DATA_DIR/clips" \
+  --store "$STREAM_SLEUTH_DATA_DIR/shazam/shazam-12s.jsonl" --state "$STREAM_SLEUTH_DATA_DIR/shazam/throttle.json"
+```
+
+Rerun the same command on later days; it skips every address with a scoring outcome.
+
 ## Notes
 
 - Only ASCII/UTF-8 metadata is sent; the API stores it in a `utf8mb4` table.
