@@ -6,57 +6,55 @@ import importlib
 
 import pytest
 
-# (name suffix, constant, value under the new name, value under the alias, expected values)
+# (name suffix, constant, raw new value, raw alias value, parsed new value, parsed alias value)
 SETTINGS = [
     (
         "STREAM_URL",
         "STREAM_URL",
         "https://audio-mp3.ibiblio.org/wxyc.mp3",
         "https://alias.example/a.mp3",
-        None,
+        "https://audio-mp3.ibiblio.org/wxyc.mp3",
+        "https://alias.example/a.mp3",
     ),
-    ("SHAZAM_API", "API_URL", "https://ingest.example/new", "https://ingest.example/alias", None),
-    ("SHAZAM_SECRET", "API_SECRET", "new-secret", "alias-secret", None),
-    ("INTERVAL", "INTERVAL", "30", "31", (30, 31)),
-    ("INTERVAL_GAP", "INTERVAL_GAP", "5", "6", (5, 6)),
-    ("CAPTURE_FAST", "CAPTURE_FAST", "7", "8", (7, 8)),
-    ("CAPTURE_SLOW", "CAPTURE_SLOW", "14", "15", (14, 15)),
-    ("VERBOSE", "VERBOSE", "1", "0", (True, False)),
+    (
+        "SHAZAM_API",
+        "API_URL",
+        "https://ingest.example/new",
+        "https://ingest.example/alias",
+        "https://ingest.example/new",
+        "https://ingest.example/alias",
+    ),
+    ("SHAZAM_SECRET", "API_SECRET", "new-secret", "alias-secret", "new-secret", "alias-secret"),
+    ("INTERVAL", "INTERVAL", "30", "31", 30, 31),
+    ("INTERVAL_GAP", "INTERVAL_GAP", "5", "6", 5, 6),
+    ("CAPTURE_FAST", "CAPTURE_FAST", "7", "8", 7, 8),
+    ("CAPTURE_SLOW", "CAPTURE_SLOW", "14", "15", 14, 15),
+    ("VERBOSE", "VERBOSE", "1", "0", True, False),
 ]
 
 
-def _expected(new, alias, parsed):
-    return parsed if parsed else (new, alias)
-
-
-@pytest.mark.parametrize(("name", "constant", "new", "alias", "parsed"), SETTINGS)
-def test_new_name_alone(fresh_recognizer, name, constant, new, alias, parsed):
-    recognizer = fresh_recognizer(**{f"STREAM_SLEUTH_{name}": new})
-
-    assert getattr(recognizer, constant) == _expected(new, alias, parsed)[0]
-
-
-@pytest.mark.parametrize(("name", "constant", "new", "alias", "parsed"), SETTINGS)
-def test_wxdu_alias_alone(fresh_recognizer, name, constant, new, alias, parsed):
-    recognizer = fresh_recognizer(**{f"WXDU_{name}": alias})
-
-    assert getattr(recognizer, constant) == _expected(new, alias, parsed)[1]
-
-
-@pytest.mark.parametrize(("name", "constant", "new", "alias", "parsed"), SETTINGS)
-def test_new_name_wins_when_both_are_set(fresh_recognizer, name, constant, new, alias, parsed):
-    recognizer = fresh_recognizer(**{f"STREAM_SLEUTH_{name}": new, f"WXDU_{name}": alias})
-
-    assert getattr(recognizer, constant) == _expected(new, alias, parsed)[0]
-
-
-@pytest.mark.parametrize(("name", "constant", "new", "alias", "parsed"), SETTINGS)
-def test_an_empty_new_name_falls_back_to_the_alias(
-    fresh_recognizer, name, constant, new, alias, parsed
+@pytest.mark.parametrize(
+    ("env", "expect"),
+    [
+        (lambda n, new, alias: {f"STREAM_SLEUTH_{n}": new}, "new"),
+        (lambda n, new, alias: {f"WXDU_{n}": alias}, "alias"),
+        (lambda n, new, alias: {f"STREAM_SLEUTH_{n}": new, f"WXDU_{n}": alias}, "new"),
+        (lambda n, new, alias: {f"STREAM_SLEUTH_{n}": "", f"WXDU_{n}": alias}, "alias"),
+    ],
+    ids=[
+        "new-name-alone",
+        "wxdu-alias-alone",
+        "new-name-wins-over-alias",
+        "empty-new-name-falls-back",
+    ],
+)
+@pytest.mark.parametrize(("name", "constant", "new", "alias", "new_value", "alias_value"), SETTINGS)
+def test_each_setting_reads_the_new_name_then_the_wxdu_alias(
+    fresh_recognizer, env, expect, name, constant, new, alias, new_value, alias_value
 ):
-    recognizer = fresh_recognizer(**{f"STREAM_SLEUTH_{name}": "", f"WXDU_{name}": alias})
+    recognizer = fresh_recognizer(**env(name, new, alias))
 
-    assert getattr(recognizer, constant) == _expected(new, alias, parsed)[1]
+    assert getattr(recognizer, constant) == (new_value if expect == "new" else alias_value)
 
 
 class LoopStarted(BaseException):
