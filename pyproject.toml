@@ -1,0 +1,66 @@
+[project]
+name = "stream-sleuth"
+version = "0.1.0"
+description = "Live-stream song recognition for college radio: capture, identify, and post now-playing suggestions"
+readme = "README.md"
+license = "GPL-3.0-only"
+# The floor is what shazamio enforces. The cap is what shazamio-core's macOS
+# wheels (cp39-cp312) and pydub's `audioop` import (removed in 3.13) allow.
+# WXDU's deploy runs `venv/bin/python recognizer.py` from requirements.txt and
+# never pip-installs this package, so the cap cannot affect it.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "shazamio>=0.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    # ruff and mypy are pinned so a release with new rules cannot fail CI on an
+    # unrelated PR; bump them in their own PR (library-metadata-lookup#244, #249).
+    "ruff==0.15.6",
+    "mypy==1.19.1",
+]
+
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Contents are listed explicitly: automatic flat-layout discovery would drop
+# the top-level `recognizer` module, and would refuse to build at all once a
+# second top-level directory such as `evaluation/` exists. Listing either key
+# turns automatic discovery off.
+[tool.setuptools]
+py-modules = ["recognizer"]
+
+[tool.setuptools.packages.find]
+include = ["stream_sleuth*"]
+
+[tool.ruff]
+line-length = 100
+# py310, not py311: UP017 would otherwise rewrite `timezone.utc` to `datetime.UTC`,
+# which does not exist on the 3.10 floor.
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "C4"]
+ignore = ["E501", "B008", "C901"]
+
+[tool.ruff.format]
+# recognizer.py is formatted in its own commit once characterization tests pin
+# its behavior; until then it is excluded from `ruff format --check`.
+exclude = ["recognizer.py"]
+
+[tool.mypy]
+# Build output carries a second copy of recognizer.py.
+exclude = ["^build/", "^dist/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+console_output_style = "progress"
+filterwarnings = [
+    # pydub (a shazamio dependency) imports audioop, deprecated in 3.12 and
+    # removed in 3.13; it is the reason for the <3.13 cap above.
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
