@@ -22,8 +22,7 @@ recognizer.py  ──HTTPS POST /api/shazam (X-Ingest-Secret)──▶  wxdu API
 # 1. ffmpeg (used to capture the stream)
 brew install ffmpeg
 
-# 2. python deps in a venv (Python 3.10–3.12; shazamio does not install on 3.13+,
-#    so on a newer default python3 use e.g. python3.12 -m venv venv)
+# 2. python deps in a venv (Python 3.10–3.12; shazamio does not install on 3.13+, so on a newer default python3 use e.g. python3.12 -m venv venv)
 python3 -m venv venv
 ./venv/bin/pip install --upgrade pip
 ./venv/bin/pip install -r requirements.txt
@@ -74,7 +73,7 @@ the DB stays a clean log of distinct songs rather than a duplicate every cycle.
 Contributors use [`uv`](https://docs.astral.sh/uv/) and the committed `uv.lock`; the deploy above is unchanged and still uses `requirements.txt`.
 
 ```bash
-uv sync --extra dev        # picks Python 3.12 from .python-version
+uv sync --locked --extra dev   # picks Python 3.12 from .python-version
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
