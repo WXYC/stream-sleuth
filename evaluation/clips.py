@@ -74,7 +74,8 @@ def _ffmpeg(*args: str) -> None:
             ["ffmpeg", "-v", "error", "-y", *args], check=True, capture_output=True, timeout=120
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise ClipError(f"ffmpeg {' '.join(args)}: {getattr(exc, 'stderr', b'') or exc}") from exc
+        detail = (exc.stderr or b"").decode(errors="replace").strip() or str(exc)
+        raise ClipError(f"ffmpeg {' '.join(args)}: {detail}") from exc
 
 
 @contextmanager

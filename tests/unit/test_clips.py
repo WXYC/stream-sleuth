@@ -122,6 +122,11 @@ def test_cut_raises_and_cleans_up_when_ffmpeg_fails(stub, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     stub.fail(1)
-    with pytest.raises(clips.ClipError), clips.cut(clips.ClipAddress(HOUR, 0, 12), hour, work):
+    with (
+        pytest.raises(clips.ClipError) as raised,
+        clips.cut(clips.ClipAddress(HOUR, 0, 12), hour, work),
+    ):
         pass
+    assert "simulated failure" in str(raised.value)
+    assert "b'" not in str(raised.value)
     assert list(work.iterdir()) == []
