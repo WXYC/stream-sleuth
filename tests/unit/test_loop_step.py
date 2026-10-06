@@ -153,6 +153,25 @@ def test_a_successful_emit_is_kept_even_if_logging_it_fails(monkeypatch):
     assert parts.emitted == [JUANA]
 
 
+def test_a_failed_post_log_keeps_the_capture_window_as_the_old_loop_did(monkeypatch):
+    # The old loop set last_key, then logged, then reset the window to speedy; a
+    # raising log write left the window where it was, here the slow gap capture.
+    from stream_sleuth import loop
+
+    def log(message, **kwargs):
+        if message.startswith("posted"):
+            raise OSError("stdout is gone")
+
+    monkeypatch.setattr(loop, "_log", log)
+    parts = Parts([None, JUANA, JUANA])
+
+    pauses = drive(parts, 3)
+
+    assert parts.emitted == [JUANA]
+    assert parts.captures == [6, 12, 12]
+    assert pauses == [4, 4, 23]
+
+
 def test_a_recognizer_error_keeps_the_current_capture_state():
     parts = Parts([None, RuntimeError("shazam broke"), JUANA])
 
