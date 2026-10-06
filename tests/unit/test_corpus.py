@@ -531,3 +531,73 @@ def test_etl_stop_without_a_flowsheet_etl_row_says_so(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="no flowsheet-etl row"):
         corpus.etl_stop(export)
+
+
+def hour_rows(
+    start_id: int, hour: int, n: int, gap_s: float, day: int = 12, **kw: Any
+) -> list[dict[str, object]]:
+    return [row(start_id + i, ts(hour, second=60 + i * gap_s, day=day), **kw) for i in range(n)]
+
+
+def test_hour_stats_counts_and_median_gap(tmp_path: Path, pool_db: Path) -> None:
+    rows = hour_rows(1, 20, 4, 200.0, artist="Juana Molina", album="DOGA")
+    rows += hour_rows(10, 20, 4, 200.0)  # out of pool, interleaved in time below
+    rows[4:] = [row(10 + i, ts(20, second=160 + i * 200.0)) for i in range(4)]
+    rows.append(row(50, ts(20, 50), "talkset"))
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    flowsheet = corpus.Flowsheet.load(export)
+    stats = corpus.hour_stats(flowsheet, corpus.PoolIndex.load(pool_db))
+    h = stats["2026/08/12/202608121600.mp3"]
+    assert (h.era, h.track_rows, h.talk_rows, h.in_pool, h.median_gap_s) == (
+        "canonical",
+        8,
+        1,
+        4,
+        100.0,
+    )
+
+
+def test_select_hours_ranks_by_in_pool_and_applies_rules(tmp_path: Path, pool_db: Path) -> None:
+    pooled: dict[str, Any] = {"artist": "Juana Molina", "album": "DOGA"}
+    rows = []
+    rows += hour_rows(100, 20, 9, 200.0, **pooled)  # 9 in pool: picked first
+    rows += hour_rows(200, 21, 8, 200.0, **pooled)  # 8 in pool
+    rows += hour_rows(300, 22, 7, 200.0, **pooled)  # too few tracks
+    rows += hour_rows(400, 23, 9, 30.0, **pooled)  # batch-logged: median gap 30 s
+    rows += hour_rows(500, 20, 12, 200.0, day=10, **pooled)  # excluded day (Eastern 2026-08-10)
+    rows += hour_rows(600, 14, 8, 200.0, day=13)  # nothing in pool
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    assert corpus.select_hours(stats, era="canonical", target=10) == [
+        "2026/08/12/202608121600.mp3",
+        "2026/08/12/202608121700.mp3",
+    ]
+    assert corpus.select_hours(stats, era="canonical", target=5) == ["2026/08/12/202608121600.mp3"]
+    assert corpus.select_hours(stats, era="etl", target=5) == []
+
+
+def test_select_talk_hours(tmp_path: Path, pool_db: Path) -> None:
+    rows = [row(1, ts(20, 5), "talkset"), row(2, ts(20, 10), "talkset"), row(3, ts(20, 20))]
+    rows += [row(10 + i, ts(21, 5 + i), "talkset") for i in range(3)]
+    rows += [row(20 + i, ts(22, 1 + i), "show_start") for i in range(9)]  # markers are not talk
+    rows += [row(40 + i, ts(23, i * 5)) for i in range(4)] + [
+        row(50 + i, ts(23, 30 + i), "talkset") for i in range(5)
+    ]
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    assert corpus.select_talk_hours(stats, count=2) == [
+        "2026/08/12/202608121700.mp3",
+        "2026/08/12/202608121600.mp3",
+    ]
+
+
+def test_select_hours_deprioritizes_reorder_flagged_shows(tmp_path: Path, pool_db: Path) -> None:
+    pooled: dict[str, Any] = {"artist": "Juana Molina", "album": "DOGA"}
+    flagged = hour_rows(100, 20, 8, 200.0, show_id=1, **pooled)
+    flagged[0]["play_order"], flagged[1]["play_order"] = 101, 100  # a moved late-logged track
+    clean = hour_rows(200, 21, 8, 200.0, show_id=2, **pooled)
+    export = write_export(tmp_path, flagged + clean, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    assert stats["2026/08/12/202608121600.mp3"].reorder_flagged
+    assert not stats["2026/08/12/202608121700.mp3"].reorder_flagged
+    assert corpus.select_hours(stats, era="canonical", target=5) == ["2026/08/12/202608121700.mp3"]
