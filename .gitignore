@@ -2,3 +2,17 @@
 venv/
 __pycache__/
 *.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Research data and credentials live outside the checkout, in
+# $STREAM_SLEUTH_DATA_DIR. These entries are a second guard only.
+data/
+eval.env
+.env.eval
+.DS_Store
