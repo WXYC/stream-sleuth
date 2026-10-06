@@ -16,7 +16,8 @@ tests in ``tests/`` forbid the presign names and require ``awscrt`` be absent.
 Settings come from ``os.environ`` only (see the README's evaluation section):
 
 - :func:`archive_client` uses the named AWS profile in
-  ``STREAM_SLEUTH_ARCHIVE_AWS_PROFILE``, or the default credential chain if unset.
+  ``STREAM_SLEUTH_ARCHIVE_AWS_PROFILE``, or the default credential chain if unset;
+  :func:`archive_bucket` reads ``STREAM_SLEUTH_ARCHIVE_BUCKET``.
 - :func:`pool_client` and :func:`pool_bucket` use ``STREAM_SLEUTH_POOL_ENDPOINT``,
   ``_BUCKET``, ``_KEY_ID``, and ``_SECRET``. Each one that is unset or empty falls
   back to the same suffix under ``DIGITAL_ARCHIVE_STORE_AZURACAST_``, the names
@@ -64,6 +65,14 @@ def archive_client() -> Any:
     """Return a read-only S3 client for the broadcast archive."""
     profile = os.environ.get("STREAM_SLEUTH_ARCHIVE_AWS_PROFILE") or None
     return _guarded_client({"profile_name": profile})
+
+
+def archive_bucket() -> str:
+    """Return the broadcast archive's bucket, from ``STREAM_SLEUTH_ARCHIVE_BUCKET``."""
+    bucket = os.environ.get("STREAM_SLEUTH_ARCHIVE_BUCKET")
+    if not bucket:
+        raise MissingSettingError("set STREAM_SLEUTH_ARCHIVE_BUCKET")
+    return bucket
 
 
 def _pool_setting(suffix: str) -> str:
