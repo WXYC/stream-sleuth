@@ -28,7 +28,7 @@ from .sources import IcecastSource, Source
 
 @dataclass(frozen=True)
 class Cadence:
-    """Capture lengths and pauses, in seconds (``WXDU_CAPTURE_*``, ``WXDU_INTERVAL*``)."""
+    """Capture lengths and pauses, in seconds (``STREAM_SLEUTH_CAPTURE_*``, ``STREAM_SLEUTH_INTERVAL*``)."""
 
     fast: int
     slow: int

@@ -22,7 +22,7 @@ class Output(Protocol):
 
 
 class HttpPostOutput(Output):
-    """POSTs each identification to the ingest API (``WXDU_SHAZAM_API``)."""
+    """POSTs each identification to the ingest API (``STREAM_SLEUTH_SHAZAM_API``)."""
 
     def emit(self, track: Mapping[str, object]) -> object:
         return post(track)
