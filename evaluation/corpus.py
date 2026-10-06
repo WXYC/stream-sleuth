@@ -22,22 +22,28 @@ import json
 import logging
 import re
 import sqlite3
+import statistics
 import sys
 import unicodedata
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from evaluation.archive import hour_key, hour_start
+from evaluation.archive import EASTERN, hour_key, hour_start
 
 log = logging.getLogger(__name__)
 
 # Never earlier than the commit that stopped the ETL, 2026-08-08 21:30 PDT.
 ETL_STOP_FLOOR = datetime(2026, 8, 9, 4, 30, tzinfo=timezone.utc)
+# Eastern days whose rows came from a gap import, never selected (plan §10.11).
+EXCLUDED_DAYS = {date(2026, 8, 9), date(2026, 8, 10), date(2026, 8, 11)}
 PADS = {"canonical": 180.0, "etl": 220.0}
+MIN_TRACKS = 8
+MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
+MAX_TALK_HOUR_TRACKS = 3
 TALK_TYPES = {"talkset", "message"}
 
 _TIME = re.compile(r"(.{19})(?:\.(\d+))?([+-]\d{2})(?::?(\d{2}))?")
@@ -223,6 +229,68 @@ class Flowsheet:
     def era(self, t: datetime) -> str:
         """``canonical`` at or after ``ETL_STOP``, else ``etl``."""
         return "canonical" if t >= self.stop else "etl"
+
+
+@dataclass(frozen=True)
+class HourStats:
+    key: str
+    era: str
+    track_rows: int
+    talk_rows: int
+    in_pool: int
+    median_gap_s: float
+    reorder_flagged: bool
+
+
+def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
+    """Per-hour counts and median inter-track gap; the era is the hour start's."""
+    stats = {}
+    for key, rows in sheet.by_hour.items():
+        tracks = [r for r in rows if r.entry_type == "track"]
+        times = [r.add_time.timestamp() for r in tracks]
+        gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+        stats[key] = HourStats(
+            key, sheet.era(hour_start(key)), len(tracks), sum(r.entry_type in TALK_TYPES for r in rows),
+            sum(pool.tier(r.artist, r.album, r.title) is not None for r in tracks),
+            statistics.median(gaps) if gaps else 0.0,
+            any(sheet.order_status[r.show_id][1] for r in tracks if sheet.era(r.add_time) == "canonical"),
+        )  # fmt: skip
+    return stats
+
+
+def _eligible(h: HourStats) -> bool:
+    return hour_start(h.key).astimezone(EASTERN).date() not in EXCLUDED_DAYS
+
+
+def select_hours(stats: dict[str, HourStats], *, era: str, target: int) -> list[str]:
+    """DJ hours in descending in-pool order until their in-pool plays reach ``target``.
+
+    Hours holding a reorder-flagged show rank after every unflagged hour (plan §4).
+    To restrict the date window, filter ``stats`` before calling.
+    """
+    candidates = sorted(
+        (h for h in stats.values() if h.era == era and _eligible(h) and h.in_pool
+         and h.track_rows >= MIN_TRACKS and h.median_gap_s >= MIN_MEDIAN_GAP_S),
+        key=lambda h: (h.reorder_flagged, -h.in_pool, h.key),
+    )  # fmt: skip
+    chosen, total = [], 0
+    for h in candidates:
+        if total >= target:
+            break
+        chosen.append(h.key)
+        total += h.in_pool
+    log.info("%s: %d hours, %d expected in-pool plays (target %d)", era, len(chosen), total, target)
+    return chosen
+
+
+def select_talk_hours(stats: dict[str, HourStats], *, count: int) -> list[str]:
+    """Hours with the most talkset/message rows and at most three track rows."""
+    talk = [
+        h
+        for h in stats.values()
+        if _eligible(h) and h.talk_rows and h.track_rows <= MAX_TALK_HOUR_TRACKS
+    ]
+    return [h.key for h in sorted(talk, key=lambda h: (-h.talk_rows, h.key))[:count]]
 
 
 def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
