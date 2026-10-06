@@ -12,7 +12,7 @@ class Source(Protocol):
         """Write ``seconds`` of audio to ``path`` as a mono 16 kHz wav."""
 
 
-class IcecastSource:
+class IcecastSource(Source):
     """The station's live stream (``WXDU_STREAM_URL``), captured with ``ffmpeg``."""
 
     def capture(self, path: str, seconds: int) -> None:

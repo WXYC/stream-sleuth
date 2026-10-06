@@ -4,10 +4,10 @@ import asyncio
 
 from shazamio import Shazam
 
-from .base import Identification
+from .base import Identification, Recognizer
 
 
-class ShazamRecognizer:
+class ShazamRecognizer(Recognizer):
     def recognize(self, wav_path: str) -> Identification | None:
         return parse(asyncio.run(_recognize(wav_path)))
 
