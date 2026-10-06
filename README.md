@@ -106,6 +106,11 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 |---|---|
 | `STREAM_SLEUTH_ARCHIVE_AWS_PROFILE` | Named AWS profile for the broadcast archive; unset means the default credential chain. Use a read-only profile where one exists. |
 | `STREAM_SLEUTH_POOL_ENDPOINT`, `_BUCKET`, `_KEY_ID`, `_SECRET` | The reference pool's S3-compatible store. Each one unset or empty falls back to the same suffix under `DIGITAL_ARCHIVE_STORE_AZURACAST_`, the names WXYC's Backend-Service uses. Prefer a read-only key scoped to the bucket: the fallback key can write. |
+| `STREAM_SLEUTH_POOL_PREFIXES` | Comma-separated key prefixes that make up the reference pool, e.g. `rotation/Heavy/,rotation/Medium/`. Read by `evaluation/pool.py`. |
+
+### Reference pool
+
+`evaluation/pool.py` builds the reference pool without mirroring it. `inventory()` lists every object under the prefixes, and `summarize()` counts objects and bytes per prefix and format before anything is fetched. `stream()` then fetches one audio file at a time into `$STREAM_SLEUTH_DATA_DIR/pool-staging/`, named by the SHA-1 of its key, reads its tags into `pool.db`, hands it to a consumer (the index build), and deletes it whether the consumer succeeds or fails. A rerun skips files already indexed and retries only failed ones. Supported formats are mp3, aac, wav, flac, and m4a/mp4, each read with its own `mutagen` reader; anything else is counted and skipped.
 
 ## Notes
 
