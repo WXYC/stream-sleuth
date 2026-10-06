@@ -28,6 +28,8 @@ dev = [
 # The research harness under evaluation/. Never needed by the live recognizer.
 eval = [
     "boto3>=1.34.0",
+    # Per-format tag and stream-info readers for the reference pool (evaluation/pool.py).
+    "mutagen>=1.47",
 ]
 
 [build-system]

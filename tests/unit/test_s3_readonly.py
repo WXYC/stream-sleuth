@@ -66,6 +66,18 @@ def _pool(monkeypatch):
 CONSTRUCTORS = pytest.mark.parametrize("build", [_archive, _pool], ids=["archive", "pool"])
 
 
+def seed_objects(endpoint_url: str | None, bucket: str, objects: dict[str, bytes]) -> None:
+    """Create ``bucket`` in moto's store holding ``objects``, for other test modules.
+
+    Seeding moto takes write calls, which the scans allow only in this module, so
+    every test module that needs a populated bucket seeds it through here.
+    """
+    raw = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
+    raw.create_bucket(Bucket=bucket)
+    for key, body in objects.items():
+        raw.put_object(Bucket=bucket, Key=key, Body=body)
+
+
 def _seed(client):
     """Create the bucket and one object with an unguarded client on ``client``'s endpoint."""
     raw = boto3.client("s3", region_name="us-east-1", endpoint_url=client.meta.endpoint_url)
