@@ -13,6 +13,11 @@ Four seams, all outside ``recognizer.py`` itself:
    ``time.sleep``. After the requested number of loop pauses the patch raises
    :class:`StopLoop`, which subclasses ``BaseException`` so no
    ``except Exception`` in the loop can swallow it.
+
+Anything the script did not provide for (a Shazam call past the scripted
+responses, or a pause of a second or more that is not a sentinel) raises
+:class:`HarnessError`, also a ``BaseException``, so a broken pin fails at once
+rather than being logged as a recognition error or sleeping for real.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Any
 import pytest
 import shazamio
 
-from tests.ffmpeg_stub import ffmpeg_calls, install_ffmpeg_stub
+from tests.ffmpeg_stub import FfmpegStub
 
 # Distinctive pause lengths, so a recorded sleep can only be the loop's own.
 INTERVAL = 1001
@@ -44,6 +49,10 @@ SECRET = "characterization-secret"
 
 class StopLoop(BaseException):
     """Raised by the patched sleep to end ``main()``'s infinite loop between cycles."""
+
+
+class HarnessError(BaseException):
+    """The recognizer did something the scripted run does not provide for."""
 
 
 @dataclass
@@ -67,7 +76,7 @@ class IngestServer:
 
 
 @pytest.fixture
-def ingest_server() -> Iterator[IngestServer]:
+def ingest_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[IngestServer]:
     server_state = IngestServer(url="")
 
     class Handler(BaseHTTPRequestHandler):
@@ -84,9 +93,16 @@ def ingest_server() -> Iterator[IngestServer]:
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             pass
 
+    # Reach the server directly whatever proxy the developer exports. A non-empty
+    # proxy environment also stops urllib on macOS from falling back to the
+    # system proxy settings, whose default bypass list omits 127.0.0.1.
+    monkeypatch.setenv("no_proxy", "*")
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server_state.url = f"http://127.0.0.1:{httpd.server_address[1]}/api/shazam"
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    # A short poll interval keeps shutdown() from waiting out the 0.5 s default.
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
     try:
         yield server_state
@@ -108,6 +124,8 @@ def fake_shazam(monkeypatch: pytest.MonkeyPatch) -> FakeShazam:
     fake = FakeShazam()
 
     async def recognize(self: shazamio.Shazam, data: Any, *args: Any, **kwargs: Any) -> Any:
+        if not fake.responses:
+            raise HarnessError("Shazam.recognize called more times than responses were scripted")
         fake.paths.append(str(data))
         response = fake.responses.pop(0)
         if isinstance(response, BaseException):
@@ -137,6 +155,10 @@ def loop_sleeps(monkeypatch: pytest.MonkeyPatch) -> LoopSleeps:
             if len(recorder.pauses) >= recorder.stop_after:
                 raise StopLoop
             return
+        if seconds >= 1:
+            raise HarnessError(
+                f"unexpected {seconds} s sleep: only the sentinel pauses are patched"
+            )
         real_sleep(seconds)
 
     monkeypatch.setattr(time, "sleep", sleep)
@@ -150,17 +172,28 @@ class LoopRun:
     stdout: list[str]
     stderr: list[str]
     pauses: list[float]
-    capture_seconds: list[int]
     ffmpeg_argv: list[list[str]]
     posts: list[IngestRequest]
+
+    @property
+    def capture_seconds(self) -> list[int]:
+        """The ``-t`` value of each ``ffmpeg`` call, in order."""
+        return [int(argv[argv.index("-t") + 1]) for argv in self.ffmpeg_argv]
+
+
+@pytest.fixture
+def ffmpeg_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FfmpegStub:
+    """The recording fake ``ffmpeg``, installed first on ``PATH``."""
+    stub = FfmpegStub(tmp_path).install()
+    monkeypatch.setenv("PATH", f"{stub.bin_dir}{os.pathsep}{os.environ['PATH']}")
+    return stub
 
 
 @pytest.fixture
 def run_main(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     fresh_recognizer: Callable[..., ModuleType],
+    ffmpeg_stub: FfmpegStub,
     ingest_server: IngestServer,
     fake_shazam: FakeShazam,
     loop_sleeps: LoopSleeps,
@@ -169,14 +202,13 @@ def run_main(
 
     Keyword arguments become extra ``WXDU_*`` environment variables (for example
     ``WXDU_VERBOSE="1"``). ``post_statuses`` scripts the ingest API's answers.
+    Call it once per test: the recorders accumulate across calls.
     """
-    monkeypatch.setenv("PATH", f"{install_ffmpeg_stub(tmp_path)}{os.pathsep}{os.environ['PATH']}")
-    for proxy in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy"):
-        monkeypatch.delenv(proxy, raising=False)
 
     def _run(
         responses: list[Any], *, post_statuses: list[int] | None = None, **env: str
     ) -> LoopRun:
+        assert not loop_sleeps.pauses, "run_main runs main() once per test"
         recognizer = fresh_recognizer(
             WXDU_STREAM_URL=STREAM_URL,
             WXDU_SHAZAM_API=ingest_server.url,
@@ -191,13 +223,11 @@ def run_main(
         with pytest.raises(StopLoop):
             recognizer.main()
         out = capsys.readouterr()
-        argv = ffmpeg_calls(tmp_path)
         return LoopRun(
             stdout=out.out.splitlines(),
             stderr=out.err.splitlines(),
             pauses=list(loop_sleeps.pauses),
-            capture_seconds=[int(a[a.index("-t") + 1]) for a in argv],
-            ffmpeg_argv=argv,
+            ffmpeg_argv=ffmpeg_stub.calls(),
             posts=list(ingest_server.requests),
         )
 

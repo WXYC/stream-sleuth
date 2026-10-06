@@ -25,9 +25,11 @@ def test_verbose_accepts_one_true_or_yes(fresh_recognizer, value, verbose):
     assert recognizer.VERBOSE is verbose
 
 
-def test_refuses_to_run_without_a_secret(fresh_recognizer, capsys, ingest_server, tmp_path):
-    from tests.ffmpeg_stub import ffmpeg_calls
-
+def test_refuses_to_run_without_a_secret(
+    fresh_recognizer, capsys, ingest_server, ffmpeg_stub, fake_shazam
+):
+    # fake_shazam has no scripted responses, so a regression that reaches
+    # recognition fails with HarnessError rather than running the real loop.
     recognizer = fresh_recognizer(WXDU_SHAZAM_API=ingest_server.url)
 
     with pytest.raises(SystemExit) as exit_info:
@@ -38,4 +40,5 @@ def test_refuses_to_run_without_a_secret(fresh_recognizer, capsys, ingest_server
     assert out.err == "WXDU_SHAZAM_SECRET is not set; refusing to run.\n"
     assert out.out == ""
     assert ingest_server.requests == []
-    assert ffmpeg_calls(tmp_path) == []
+    assert ffmpeg_stub.calls() == []
+    assert fake_shazam.paths == []

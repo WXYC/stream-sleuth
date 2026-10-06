@@ -129,10 +129,8 @@ def test_an_error_keeps_the_current_capture_state(run_main, responses, captures,
     assert stripped(run.stderr) == ["error: shazam broke"]
 
 
-def test_a_failed_capture_is_logged_and_the_loop_continues(run_main, tmp_path):
-    from tests.ffmpeg_stub import fail_ffmpeg_calls
-
-    fail_ffmpeg_calls(tmp_path, 1)
+def test_a_failed_capture_is_logged_and_the_loop_continues(run_main, ffmpeg_stub):
+    ffmpeg_stub.fail(1)
     # The failed capture never reaches Shazam, so only one response is consumed;
     # the extra entry is never read but sets the run to two cycles.
     run = run_main([r.JUANA_MOLINA, r.JUANA_MOLINA])

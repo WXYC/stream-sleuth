@@ -16,6 +16,7 @@ Lives at ``tests/`` root because it is a helper module, not a suite.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 _STUB = """\
@@ -42,37 +43,45 @@ with wave.open(sys.argv[-1], "wb") as out:
 """
 
 
-def install_ffmpeg_stub(tmp_path: Path) -> Path:
-    """Write a fake ``ffmpeg`` into ``tmp_path/bin`` and return that directory.
+@dataclass(frozen=True)
+class FfmpegStub:
+    """A fake ``ffmpeg`` kept under ``root``: the executable, its call records, its failure list.
 
-    Put the returned directory first on ``PATH``. Call *n* writes
-    ``tmp_path/ffmpeg_calls/<n>.argv``, one argument per line. To make call *n*
-    exit 1 after recording (as a failed capture would), list *n* in
-    ``tmp_path/ffmpeg_fail`` with :func:`fail_ffmpeg_calls`.
+    Call :meth:`install`, then put :attr:`bin_dir` first on ``PATH``. Call *n*
+    writes ``root/ffmpeg_calls/<n>.argv``, one argument per line.
     """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    stub = bin_dir / "ffmpeg"
-    stub.write_text(
-        _STUB.format(
-            python=sys.executable,
-            calls=str(tmp_path / "ffmpeg_calls"),
-            fail=str(tmp_path / "ffmpeg_fail"),
+
+    root: Path
+
+    @property
+    def bin_dir(self) -> Path:
+        return self.root / "bin"
+
+    @property
+    def _calls_dir(self) -> Path:
+        return self.root / "ffmpeg_calls"
+
+    @property
+    def _fail_file(self) -> Path:
+        return self.root / "ffmpeg_fail"
+
+    def install(self) -> FfmpegStub:
+        """Write the executable into :attr:`bin_dir` and return ``self``."""
+        self.bin_dir.mkdir(exist_ok=True)
+        stub = self.bin_dir / "ffmpeg"
+        stub.write_text(
+            _STUB.format(
+                python=sys.executable, calls=str(self._calls_dir), fail=str(self._fail_file)
+            )
         )
-    )
-    stub.chmod(0o755)
-    return bin_dir
+        stub.chmod(0o755)
+        return self
 
+    def fail(self, *call_numbers: int) -> None:
+        """Make the listed 1-based calls exit 1 after recording their argv, as a failed capture would."""
+        self._fail_file.write_text(" ".join(str(n) for n in call_numbers))
 
-def fail_ffmpeg_calls(tmp_path: Path, *call_numbers: int) -> None:
-    """Make the listed 1-based stub calls exit 1 after recording their argv."""
-    (tmp_path / "ffmpeg_fail").write_text(" ".join(str(n) for n in call_numbers))
-
-
-def ffmpeg_calls(tmp_path: Path) -> list[list[str]]:
-    """Read back the stub's argv records, in call order."""
-    calls_dir = tmp_path / "ffmpeg_calls"
-    if not calls_dir.is_dir():
-        return []
-    files = sorted(calls_dir.glob("*.argv"), key=lambda p: int(p.stem))
-    return [f.read_text().splitlines() for f in files]
+    def calls(self) -> list[list[str]]:
+        """Read back the argv records, in call order."""
+        files = sorted(self._calls_dir.glob("*.argv"), key=lambda p: int(p.stem))
+        return [f.read_text().splitlines() for f in files]
