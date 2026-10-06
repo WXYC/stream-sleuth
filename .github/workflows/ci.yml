@@ -67,6 +67,18 @@ jobs:
       # Plain pytest: testpaths and addopts in pyproject.toml decide what runs.
       - run: uv run --no-sync pytest
 
+  ffmpeg:
+    name: ffmpeg Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      - run: uv run --no-sync pytest -m "ffmpeg"
+
   marker-sync:
     name: CI Marker Sync
     uses: WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1
