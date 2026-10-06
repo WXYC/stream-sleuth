@@ -76,15 +76,13 @@ def test_reads_the_clock_on_every_capture(sources, ffmpeg, hour, tmp_path):
     assert [argv[argv.index("-ss") + 1] for argv in ffmpeg.calls()] == ["0.000", "30.000"]
 
 
-@pytest.mark.parametrize("url", ["https://audio-mp3.ibiblio.org/wxyc.mp3", "s3://bucket/key.mp3"])
-def test_refuses_anything_but_a_local_file(sources, url):
-    with pytest.raises(ValueError, match="local file"):
-        sources.FileSource(url, FixedClock(0.0))
-
-
-def test_refuses_a_missing_file(sources, tmp_path):
+@pytest.mark.parametrize(
+    "path", ["https://audio-mp3.ibiblio.org/wxyc.mp3", "s3://bucket/key.mp3", "absent.mp3"]
+)
+def test_refuses_anything_but_an_existing_local_file(sources, tmp_path, monkeypatch, path):
+    monkeypatch.chdir(tmp_path)
     with pytest.raises(FileNotFoundError):
-        sources.FileSource(tmp_path / "absent.mp3", FixedClock(0.0))
+        sources.FileSource(path, FixedClock(0.0))
 
 
 def test_refuses_a_negative_offset(sources, ffmpeg, hour, tmp_path):
