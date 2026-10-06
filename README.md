@@ -158,6 +158,16 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 
 `evaluation/archive.py` is WXYC-specific. WXYC's archive holds one MP3 per hour, keyed `YYYY/MM/DD/YYYYMMDDHH00.mp3` by the hour's America/New_York local time, not UTC. `hour_key()` maps a timezone-aware instant to its key and returns `None` for the fall-back hour, which is recorded twice under one key with the later recording overwriting the earlier; `hour_start()` is its inverse. `fetch()` downloads an hour to `<archive_dir>/<key>` through a `.part` file, keeps an existing file of the right size, and never overwrites one of any other size; callers pass `$STREAM_SLEUTH_DATA_DIR/archive` as `archive_dir`, never a path inside the checkout. `fetch_all()` skips and reports per-hour failures and stops on anything that would fail every hour, such as expired credentials.
 
+### Plays
+
+`evaluation/corpus.py` is WXYC-specific. It reads the two CSVs that `evaluation/sql/flowsheet-export.sql` writes (run in a read-only `psql` session into a dated export directory, never over an earlier one) and the reference pool's `pool.db`. `Flowsheet.load()` orders rows by `(add_time, id)`, computes `ETL_STOP`, and labels each show's `play_order` as single-writer (with a reorder flag) or unreliable. `hour_stats()`, `select_hours()`, and `select_talk_hours()` choose archive hours by expected in-pool play count, skipping batch-logged hours and the August 2026 gap-import days. `write_plays()` writes `plays.jsonl` for a list of hour keys and refuses to overwrite an existing file:
+
+```sh
+uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.corpus \
+    --export "$STREAM_SLEUTH_DATA_DIR/exports/<date>" --pool-db "$STREAM_SLEUTH_DATA_DIR/pool/pool.db" \
+    --hours "$STREAM_SLEUTH_DATA_DIR/hours.txt" --out "$STREAM_SLEUTH_DATA_DIR/plays.jsonl"
+```
+
 ## Notes
 
 - Only ASCII/UTF-8 metadata is sent; the API stores it in a `utf8mb4` table.
