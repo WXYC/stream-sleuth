@@ -70,6 +70,10 @@ Rules for every PR that restructures the recognizer:
 
 Audio, reference-pool listings and object keys, playlist exports, credentials, and result stores never enter the repo. Research data lives under `$STREAM_SLEUTH_DATA_DIR` (default `~/.local/share/stream-sleuth/`), outside the checkout. `data/`, `eval.env`, and `.env.eval` are in `.gitignore` as a second guard only; nothing relies on them.
 
+## The `plays.jsonl` boundary
+
+The harness splits at two artifacts: a directory of hour-long audio files named by hour key, and `plays.jsonl`, one JSON record per logged play with `hour_key, play_id, t_offset_s, window_start_s, window_end_s, artist, title, album, era, pad_s, in_pool, pool_match_tier, rotation, reorder_flag, play_order_status, carryover, track_rows, talk_rows`. Offsets are seconds from the start of the hour file. `carryover: true` marks the previous hour's last track, written into each hour as an attribution candidate only: it never counts in a recall denominator. `in_pool` is `null` when the play has no artist to join on. A station producer writes these two artifacts; modules downstream of them read nothing else, never a flowsheet, a database, or station-specific config.
+
 ## S3 and credentials
 
 - **Every S3 client comes from `evaluation.s3_readonly`** (`archive_client()`, `pool_client()`), whose `before-call.s3` handler refuses any operation but `ListObjectsV2`, `GetObject`, and `HeadObject`. `tests/import_scan.py` enforces it over all first-party code: an AST scan forbids importing `boto3`, `botocore`, or `s3transfer` anywhere else, and a textual scan forbids S3 write and presign method names, touching a client's `meta.events` (which could remove the guard), and dynamic imports. Both scans walk every `*.py` in the repo except dot-directories and build output. The only exemptions are the factory and `tests/unit/test_s3_readonly.py`; do not add more. A test that needs a populated moto bucket seeds it with `seed_objects()` from that module, so every write call stays inside the exemption. Never add `awscrt` (`boto3[crt]`): its transfer client sends without botocore's events, so the guard would not see `upload_file` or `copy`; a test fails if it is installed.
@@ -83,5 +87,5 @@ This section applies to the `WXYC/stream-sleuth` fork and is dropped from anythi
 - Every PR is created with `gh pr create --repo WXYC/stream-sleuth --base <base>`, so a stacked PR can never default to the upstream repo. Merge with rebase only.
 - **`spike/` branches are local-only and are never pushed.** This fork is public.
 - The `marker-sync` CI job calls `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1`; read that repo's tag-stability policy before changing the call.
-- `evaluation/archive.py` is WXYC-specific: it encodes the WXYC archive's Eastern-time hour keys and DST rules. It and `evaluation/corpus.py` (PR 11) are the station side of the `plays.jsonl` boundary; everything else under `evaluation/` must stay station-neutral.
+- `evaluation/archive.py` and `evaluation/corpus.py` are WXYC-specific: the first encodes the archive's Eastern-time hour keys and DST rules, the second the flowsheet's history (`ETL_STOP`, the August gap-import days, two-writer shows, the entry-type vocabulary, the per-era pads Phase 1 measured). They are the station side of the `plays.jsonl` boundary; everything else under `evaluation/` must stay station-neutral.
 - The viability-study plan lives in the private `wxyc-workspace` repo at `plans/stream-sleuth/plan.md`; the public summary is the epic, WXYC/stream-sleuth#1.
