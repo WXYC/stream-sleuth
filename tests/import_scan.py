@@ -2,13 +2,15 @@
 
 Every S3 client in this repo must come from ``evaluation.s3_readonly``, whose
 guard refuses any operation but the three reads. These scanners enforce that
-over all first-party code: ``recognizer.py``, ``stream_sleuth/``, ``evaluation/``,
-and ``tests/``.
+over all first-party code: every ``*.py`` under the repo root (today
+``recognizer.py``, ``stream_sleuth/``, ``evaluation/``, and ``tests/``), skipping
+dot-directories such as ``.venv`` and the ``build``/``dist`` output.
 
 - :func:`scan_for_s3_imports` parses each file with ``ast`` and reports every
   ``import`` or ``from ... import`` of ``boto3``, ``botocore``, or ``s3transfer``.
 - :func:`scan_for_s3_write_names` is the textual backstop for what an import walk
-  misses: S3 write and presign method names, and dynamic imports of those packages.
+  misses: S3 write and presign method names, tampering with a client's event
+  handlers (which would remove the guard), and dynamic imports of those packages.
 
 Both return ``["<relative path>:<line>", ...]``; an empty list means clean.
 """
@@ -30,20 +32,26 @@ IMPORT_EXEMPT = frozenset({"evaluation/s3_readonly.py", "tests/unit/test_s3_read
 # its tests, and this scanner and its synthetic snippets.
 WRITE_NAME_EXEMPT = IMPORT_EXEMPT | {"tests/import_scan.py", "tests/unit/test_import_scan.py"}
 
+# Substring matches: put_object also covers put_object_acl/_tagging/_retention,
+# delete_object covers delete_objects, upload_file covers upload_fileobj.
 _WRITE_NAMES = re.compile(
-    r"put_object|upload_file|upload_fileobj|\.copy_object\(|delete_object|delete_objects"
-    r"|create_multipart_upload|\.delete\(|generate_presigned_url|generate_presigned_post"
+    r"put_object|put_bucket|upload_file|upload_part|copy_object|\.copy_from\("
+    r"|delete_object|delete_bucket|\.delete\(|restore_object"
+    r"|(?:create|complete|abort)_multipart_upload|generate_presigned_(?:url|post)"
+    r"|meta\.events|_refuse_non_reads"
     r"|(?:import_module|__import__)\(\s*['\"](?:boto3|botocore|s3transfer)"
 )
 
+_SKIPPED_DIRECTORIES = frozenset({"build", "dist", "venv", "node_modules", "__pycache__"})
+
 
 def _first_party_files(root: Path) -> Iterator[tuple[str, Path]]:
-    candidates = [root / "recognizer.py"]
-    for directory in ("stream_sleuth", "evaluation", "tests"):
-        candidates.extend(sorted((root / directory).rglob("*.py")))
-    for path in candidates:
+    for path in sorted(root.rglob("*.py")):
+        parts = path.relative_to(root).parts
+        if any(p.startswith(".") or p in _SKIPPED_DIRECTORIES for p in parts[:-1]):
+            continue
         if path.is_file():
-            yield path.relative_to(root).as_posix(), path
+            yield "/".join(parts), path
 
 
 def _imported_packages(node: ast.Import | ast.ImportFrom) -> list[str]:

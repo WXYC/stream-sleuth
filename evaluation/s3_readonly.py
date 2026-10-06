@@ -7,9 +7,11 @@ here and carries a botocore ``before-call.s3`` handler that allows exactly
 ``ListObjectsV2``, ``GetObject``, and ``HeadObject`` and raises
 :class:`S3WriteRefused` for any other operation before a request is signed.
 
-The handler sees API operations only. Presigning (``generate_presigned_url``,
-``generate_presigned_post``) makes no API call and so is not guarded here; the
-textual scan in ``tests/import_scan.py`` forbids those names instead.
+This is a guard against accidents, not a security boundary: a caller holding a
+client could unregister the handler. Pair it with read-only credentials. The
+handler sees botocore API operations only. Presigning makes no API call, and
+the CRT transfer client (``awscrt``) sends without botocore's events, so the
+tests in ``tests/`` forbid the presign names and require ``awscrt`` be absent.
 
 Settings come from ``os.environ`` only (see the README's evaluation section):
 
@@ -25,8 +27,6 @@ from __future__ import annotations
 
 import os
 from typing import Any
-
-import boto3
 
 ALLOWED_OPERATIONS = frozenset({"ListObjectsV2", "GetObject", "HeadObject"})
 
@@ -50,7 +50,12 @@ def _refuse_non_reads(model: Any, **_: Any) -> None:
         )
 
 
-def _guarded(client: Any) -> Any:
+def _guarded_client(session_kwargs: dict[str, Any], **client_kwargs: Any) -> Any:
+    # Imported here so this module exposes no ``boto3`` attribute through which
+    # other code could build an unguarded client without importing boto3 itself.
+    import boto3
+
+    client = boto3.Session(**session_kwargs).client("s3", **client_kwargs)
     client.meta.events.register("before-call.s3", _refuse_non_reads)
     return client
 
@@ -58,7 +63,7 @@ def _guarded(client: Any) -> Any:
 def archive_client() -> Any:
     """Return a read-only S3 client for the broadcast archive."""
     profile = os.environ.get("STREAM_SLEUTH_ARCHIVE_AWS_PROFILE") or None
-    return _guarded(boto3.Session(profile_name=profile).client("s3"))
+    return _guarded_client({"profile_name": profile})
 
 
 def _pool_setting(suffix: str) -> str:
@@ -76,11 +81,10 @@ def pool_bucket() -> str:
 
 def pool_client() -> Any:
     """Return a read-only S3 client for the reference pool's S3-compatible store."""
-    client = boto3.session.Session().client(
-        "s3",
+    return _guarded_client(
+        {},
         endpoint_url=_pool_setting("ENDPOINT"),
         aws_access_key_id=_pool_setting("KEY_ID"),
         aws_secret_access_key=_pool_setting("SECRET"),
         region_name="us-east-1",
     )
-    return _guarded(client)

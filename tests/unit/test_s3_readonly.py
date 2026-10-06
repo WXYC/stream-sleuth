@@ -8,12 +8,13 @@ moto answers at ``before-send``, after every ``before-call`` handler, so the gua
 fires first and removing it makes the write tests fail.
 
 This module is the one named exemption from the import scan in
-``tests/import_scan.py``: it has to build unguarded clients, to create buckets
-and to prove that the guard, not moto, is what refuses a write.
+``tests/import_scan.py``: it has to build unguarded clients to seed moto's store.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import io
 import os
 
 import boto3
@@ -32,7 +33,7 @@ POOL_ENDPOINT = "https://pool.example.test"
 def isolated_aws(monkeypatch, tmp_path):
     """No test may see real AWS configuration, real credentials, or real settings."""
     for name in list(os.environ):
-        if name.startswith(("AWS_", "STREAM_SLEUTH_", "DIGITAL_ARCHIVE_STORE_")):
+        if name.startswith(("AWS_", "WXDU_", "STREAM_SLEUTH_", "DIGITAL_ARCHIVE_STORE_")):
             monkeypatch.delenv(name)
     config = tmp_path / "config"
     config.write_text("[profile synthetic-archive]\nregion = us-east-1\n")
@@ -51,7 +52,7 @@ def isolated_aws(monkeypatch, tmp_path):
 
 def _archive(monkeypatch):
     monkeypatch.setenv("STREAM_SLEUTH_ARCHIVE_AWS_PROFILE", "synthetic-archive")
-    return s3_readonly.archive_client(), {}
+    return s3_readonly.archive_client()
 
 
 def _pool(monkeypatch):
@@ -59,15 +60,15 @@ def _pool(monkeypatch):
     monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", BUCKET)
     monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
     monkeypatch.setenv("STREAM_SLEUTH_POOL_SECRET", "testing")
-    return s3_readonly.pool_client(), {"endpoint_url": POOL_ENDPOINT}
+    return s3_readonly.pool_client()
 
 
 CONSTRUCTORS = pytest.mark.parametrize("build", [_archive, _pool], ids=["archive", "pool"])
 
 
-def _seed(**client_kwargs):
-    """Create the bucket and one object with an unguarded client, as moto's store."""
-    raw = boto3.client("s3", region_name="us-east-1", **client_kwargs)
+def _seed(client):
+    """Create the bucket and one object with an unguarded client on ``client``'s endpoint."""
+    raw = boto3.client("s3", region_name="us-east-1", endpoint_url=client.meta.endpoint_url)
     raw.create_bucket(Bucket=BUCKET)
     raw.put_object(Bucket=BUCKET, Key=KEY, Body=b"synthetic audio")
     return raw
@@ -75,35 +76,63 @@ def _seed(**client_kwargs):
 
 @CONSTRUCTORS
 @mock_aws
-def test_reads_succeed(monkeypatch, build):
-    client, kwargs = build(monkeypatch)
-    _seed(**kwargs)
+def test_reads_succeed(monkeypatch, tmp_path, build):
+    client = build(monkeypatch)
+    _seed(client)
 
     listed = client.list_objects_v2(Bucket=BUCKET)
     assert [o["Key"] for o in listed["Contents"]] == [KEY]
     assert client.head_object(Bucket=BUCKET, Key=KEY)["ContentLength"] == 15
     assert client.get_object(Bucket=BUCKET, Key=KEY)["Body"].read() == b"synthetic audio"
+    # The harness's own read paths: s3transfer's managed download and the paginator.
+    client.download_file(BUCKET, KEY, str(tmp_path / "out.mp3"))
+    assert (tmp_path / "out.mp3").read_bytes() == b"synthetic audio"
+    pages = client.get_paginator("list_objects_v2").paginate(Bucket=BUCKET)
+    assert [o["Key"] for page in pages for o in page["Contents"]] == [KEY]
 
 
+COPY_SOURCE = {"Bucket": BUCKET, "Key": KEY}
+
+# (operation the guard must name, call). The managed transfers run through
+# s3transfer, which reaches the same client operations from worker threads.
 WRITES = {
-    "PutObject": lambda c: c.put_object(Bucket=BUCKET, Key="new.mp3", Body=b"x"),
-    "DeleteObject": lambda c: c.delete_object(Bucket=BUCKET, Key=KEY),
-    "CopyObject": lambda c: c.copy_object(
-        Bucket=BUCKET, Key="copy.mp3", CopySource={"Bucket": BUCKET, "Key": KEY}
+    "put_object": ("PutObject", lambda c: c.put_object(Bucket=BUCKET, Key="new.mp3", Body=b"x")),
+    "delete_object": ("DeleteObject", lambda c: c.delete_object(Bucket=BUCKET, Key=KEY)),
+    "delete_objects": (
+        "DeleteObjects",
+        lambda c: c.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": KEY}]}),
     ),
-    "CreateMultipartUpload": lambda c: c.create_multipart_upload(Bucket=BUCKET, Key="big.mp3"),
+    "copy_object": (
+        "CopyObject",
+        lambda c: c.copy_object(Bucket=BUCKET, Key="copy.mp3", CopySource=COPY_SOURCE),
+    ),
+    "create_multipart_upload": (
+        "CreateMultipartUpload",
+        lambda c: c.create_multipart_upload(Bucket=BUCKET, Key="big.mp3"),
+    ),
+    "upload_part": (
+        "UploadPart",
+        lambda c: c.upload_part(
+            Bucket=BUCKET, Key="big.mp3", PartNumber=1, UploadId="synthetic", Body=b"x"
+        ),
+    ),
+    "managed upload_fileobj": (
+        "PutObject",
+        lambda c: c.upload_fileobj(io.BytesIO(b"x"), BUCKET, "new.mp3"),
+    ),
+    "managed copy": ("CopyObject", lambda c: c.copy(COPY_SOURCE, BUCKET, "copy.mp3")),
 }
 
 
 @CONSTRUCTORS
-@pytest.mark.parametrize("operation", sorted(WRITES))
+@pytest.mark.parametrize("operation, call", WRITES.values(), ids=list(WRITES))
 @mock_aws
-def test_writes_are_refused_and_never_reach_the_store(monkeypatch, build, operation):
-    client, kwargs = build(monkeypatch)
-    raw = _seed(**kwargs)
+def test_writes_are_refused_and_never_reach_the_store(monkeypatch, build, operation, call):
+    client = build(monkeypatch)
+    raw = _seed(client)
 
     with pytest.raises(S3WriteRefused, match=operation):
-        WRITES[operation](client)
+        call(client)
 
     # The store is exactly as seeded: the refused call never reached moto.
     assert [o["Key"] for o in raw.list_objects_v2(Bucket=BUCKET)["Contents"]] == [KEY]
@@ -111,15 +140,27 @@ def test_writes_are_refused_and_never_reach_the_store(monkeypatch, build, operat
 
 @CONSTRUCTORS
 @mock_aws
-def test_an_unguarded_client_can_write_so_the_guard_is_what_refuses(monkeypatch, build):
-    # The tamper check: with the guard's handler removed, moto accepts the write
-    # that test_writes_are_refused_and_never_reach_the_store expects to be refused.
-    _, kwargs = build(monkeypatch)
-    raw = _seed(**kwargs)
+def test_without_its_handler_the_factory_client_writes_so_the_guard_is_what_refuses(
+    monkeypatch, build
+):
+    # The tamper check: take a client from the factory and remove only the guard's
+    # handler, by the event name it is registered under. moto then accepts the write
+    # that test_writes_are_refused_and_never_reach_the_store expects to be refused,
+    # so it is the guard, not moto or the client's setup, that refuses.
+    client = build(monkeypatch)
+    _seed(client)
+    client.meta.events.unregister("before-call.s3", s3_readonly._refuse_non_reads)
 
-    raw.put_object(Bucket=BUCKET, Key="new.mp3", Body=b"x")
+    client.put_object(Bucket=BUCKET, Key="new.mp3", Body=b"x")
 
-    assert raw.head_object(Bucket=BUCKET, Key="new.mp3")["ContentLength"] == 1
+    assert client.head_object(Bucket=BUCKET, Key="new.mp3")["ContentLength"] == 1
+
+
+def test_the_crt_transfer_client_is_not_installed():
+    # With awscrt installed, boto3 may hand upload_file/copy to the CRT transfer
+    # manager, which signs and sends without botocore's events, so the guard
+    # would never see them. Keep boto3[crt] out of every extra.
+    assert importlib.util.find_spec("awscrt") is None
 
 
 def test_pool_settings_fall_back_to_the_backend_service_names(monkeypatch):
