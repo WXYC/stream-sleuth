@@ -58,12 +58,25 @@ def _probe(path):
     return info["format"], info["streams"][0]
 
 
+def _decoded_duration(path, tmp_path):
+    # Older ffprobe builds count the encoder's priming and frame padding in an
+    # MP3's container duration; decoding honors the gapless header, and decoded
+    # audio is what a recognizer hears.
+    wav = tmp_path / "decoded.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), str(wav)], check=True)
+    fmt, _ = _probe(wav)
+    return float(fmt["duration"])
+
+
 @pytest.mark.parametrize(("length_s", "profile"), [(6, "128k"), (12, "128k"), (20, "320k")])
 def test_cut_has_the_length_and_constant_bitrate(tone_hour, tmp_path, length_s, profile):
     address = clips.ClipAddress("tone.mp3", 30, length_s, profile)
-    with clips.cut(address, tone_hour, tmp_path) as clip:
-        fmt, stream = _probe(clip)
-    assert abs(float(fmt["duration"]) - length_s) <= MP3_FRAME_S
+    work = tmp_path / "work"
+    work.mkdir()
+    with clips.cut(address, tone_hour, work) as clip:
+        _, stream = _probe(clip)
+        duration = _decoded_duration(clip, tmp_path)
+    assert abs(duration - length_s) <= MP3_FRAME_S
     assert int(stream["bit_rate"]) == int(profile.removesuffix("k")) * 1000
 
 
