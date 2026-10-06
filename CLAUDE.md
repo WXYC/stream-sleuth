@@ -15,14 +15,14 @@ Live-stream song recognition for college radio. `recognizer.py` captures a few s
 `uv.lock` is committed, and every install goes through it:
 
 ```sh
-uv sync --extra dev
+uv sync --locked --extra dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
 uv run pytest
 ```
 
-These are exactly the CI jobs; run them before every push. Do not document or use `pip install -e`, which drifts from the lock. `requirements.txt` is WXDU's pinned install and is the one file not driven by the lock.
+These are exactly the CI jobs; run them before every push. Do not document or use `pip install -e`, which drifts from the lock. `--locked` fails instead of silently rewriting `uv.lock` when `pyproject.toml` has changed; run `uv lock` deliberately and commit the result. `requirements.txt` is WXDU's install and is the one file not driven by the lock. It is not pinned (`shazamio>=0.8`), so a WXDU venv rebuild can pick up a newer `shazamio` than the lock tests.
 
 ## Tests
 
