@@ -9,7 +9,7 @@ import pytest
 from moto import mock_aws
 
 from evaluation import archive
-from evaluation.s3_readonly import MissingSettingError, archive_client
+from evaluation.s3_readonly import MissingSettingError, archive_bucket, archive_client
 from tests.unit.test_s3_readonly import seed_objects
 
 BUCKET = "synthetic-archive"
@@ -70,7 +70,7 @@ def test_hour_start_inverts_hour_key(key, start):
 def test_archive_bucket_requires_the_setting(monkeypatch):
     monkeypatch.delenv("STREAM_SLEUTH_ARCHIVE_BUCKET", raising=False)
     with pytest.raises(MissingSettingError):
-        archive.archive_bucket()
+        archive_bucket()
 
 
 @pytest.fixture
@@ -107,24 +107,21 @@ def test_existing_file_of_the_wrong_size_is_left_untouched(tmp_path):
     assert dest.read_bytes() == b"older recording"
 
 
-class _ShortHead:
-    """The guarded client, but HeadObject reports more bytes than GetObject returns."""
+class _ShortBody:
+    """The guarded client, but GetObject claims more bytes than its body holds."""
 
     def __init__(self, client):
         self._client = client
 
-    def head_object(self, **kwargs):
-        head = self._client.head_object(**kwargs)
-        return {**head, "ContentLength": head["ContentLength"] + 8}
-
     def get_object(self, **kwargs):
-        return self._client.get_object(**kwargs)
+        response = self._client.get_object(**kwargs)
+        return {**response, "ContentLength": response["ContentLength"] + 8}
 
 
 @pytest.mark.usefixtures("synthetic_archive")
 def test_short_read_leaves_only_a_part_file(tmp_path):
-    with pytest.raises(OSError, match="short read"):
-        archive.fetch(SUMMER_KEY, archive_dir=tmp_path, client=_ShortHead(archive_client()))
+    with pytest.raises(archive.ShortReadError):
+        archive.fetch(SUMMER_KEY, archive_dir=tmp_path, client=_ShortBody(archive_client()))
     assert not (tmp_path / SUMMER_KEY).exists()
     assert (tmp_path / (SUMMER_KEY + ".part")).exists()
 
@@ -134,10 +131,11 @@ def test_fetch_all_reports_failures_and_keeps_going(tmp_path):
     (tmp_path / SUMMER_KEY).parent.mkdir(parents=True)
     (tmp_path / SUMMER_KEY).write_bytes(b"older recording")
     missing = "2026/02/01/202602010000.mp3"
+    fall_back = "2026/11/01/202611010100.mp3"
 
-    failed = archive.fetch_all([SUMMER_KEY, missing, WINTER_KEY], archive_dir=tmp_path)
+    failed = archive.fetch_all([SUMMER_KEY, missing, fall_back, WINTER_KEY], archive_dir=tmp_path)
 
-    assert failed == [SUMMER_KEY, missing]
+    assert failed == [SUMMER_KEY, missing, fall_back]
     assert (tmp_path / WINTER_KEY).read_bytes() == HOURS[WINTER_KEY]
 
 
@@ -152,3 +150,20 @@ def test_fetch_all_reports_failures_and_keeps_going(tmp_path):
 def test_hour_start_rejects_keys_without_a_single_start(key):
     with pytest.raises(ValueError):
         archive.hour_start(key)
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+@pytest.mark.parametrize(
+    "key",
+    ["2026/11/01/202611010100.mp3", "../../2026/08/12/202608121600.mp3", "/tmp/202608121600.mp3"],
+)
+def test_fetch_rejects_keys_that_are_not_attributable_hours(tmp_path, key):
+    with pytest.raises(ValueError):
+        archive.fetch(key, archive_dir=tmp_path)
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+def test_fetch_all_stops_on_an_error_that_would_fail_every_hour(tmp_path):
+    with pytest.raises(Exception, match="NoSuchBucket"):
+        archive.fetch_all([SUMMER_KEY, WINTER_KEY], archive_dir=tmp_path, bucket="no-such-bucket")
