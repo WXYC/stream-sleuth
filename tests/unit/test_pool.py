@@ -141,11 +141,24 @@ def test_a_consumer_that_raises_marks_that_file_failed_and_the_run_continues(tmp
 def test_stale_stages_from_a_crashed_run_are_cleared_before_starting(tmp_path, db):
     staging = tmp_path / "pool-staging"
     staging.mkdir()
-    (staging / "0123abcd.mp3").write_bytes(b"left behind")
+    (staging / (pool.stage_id("rotation/Heavy/left-behind.mp3") + ".mp3")).write_bytes(b"x")
 
     pool.stream([], lambda path, stage: None, db=db, staging_dir=staging)
 
     assert list(staging.iterdir()) == []
+
+
+def test_stale_stage_cleanup_removes_only_stage_named_files(tmp_path, db):
+    # A misconfigured staging_dir must never cost anything but stage files.
+    staging = tmp_path / "pool-staging"
+    (staging / "nested").mkdir(parents=True)
+    keep = {staging / "pool.db", staging / "notes.txt", staging / "nested"}
+    for path in keep - {staging / "nested"}:
+        path.write_bytes(b"keep")
+
+    pool.stream([], lambda path, stage: None, db=db, staging_dir=staging)
+
+    assert set(staging.iterdir()) == keep
 
 
 def test_a_rerun_skips_indexed_files_and_retries_only_failed_ones(tmp_path, db):
@@ -183,3 +196,9 @@ def test_configured_prefixes_split_the_setting_and_drop_blanks(monkeypatch):
 def test_configured_prefixes_require_the_setting(monkeypatch):
     with pytest.raises(pool.MissingSettingError, match="STREAM_SLEUTH_POOL_PREFIXES"):
         pool.configured_prefixes()
+
+
+def test_overlapping_prefixes_list_each_object_once():
+    objects = pool.inventory(["rotation/", "rotation/Heavy/"])
+
+    assert sorted(o.key for o in objects) == sorted(OBJECTS)
