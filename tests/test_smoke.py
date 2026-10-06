@@ -1,36 +1,10 @@
 """Smoke test: the recognizer module imports and reads its configuration.
 
-This is the one test PR 0 ships so the default CI job collects something from
-the start (pytest exits 5 when a job collects nothing). The characterization
-suite that pins WXDU's runtime behavior arrives in its own PR.
+The fastest signal that the module still imports and still exposes what
+``tests/characterization/`` and WXDU's launchd job rely on.
 """
 
-import importlib
-import os
-import sys
-
 import pytest
-
-
-@pytest.fixture
-def fresh_recognizer(monkeypatch):
-    """Import ``recognizer`` afresh from a clean ``WXDU_*`` environment.
-
-    ``recognizer.py`` reads every ``WXDU_*`` variable into a module constant at
-    import time, so a test that sets the environment needs a fresh import.
-    """
-
-    def _import(**env):
-        for name in list(sys.modules):
-            if name == "recognizer" or name.startswith("stream_sleuth"):
-                monkeypatch.delitem(sys.modules, name)
-        for name in [n for n in os.environ if n.startswith(("WXDU_", "STREAM_SLEUTH_"))]:
-            monkeypatch.delenv(name)
-        for name, value in env.items():
-            monkeypatch.setenv(name, value)
-        return importlib.import_module("recognizer")
-
-    return _import
 
 
 def test_reads_configuration_from_the_environment(fresh_recognizer):

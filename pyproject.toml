@@ -68,6 +68,10 @@ module = ["boto3", "boto3.*", "botocore", "botocore.*", "moto", "moto.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+markers = [
+    "ffmpeg: needs a real ffmpeg binary on PATH",
+]
+addopts = "-m 'not ffmpeg'"
 testpaths = ["tests"]
 pythonpath = ["."]
 console_output_style = "progress"

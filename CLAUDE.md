@@ -34,6 +34,18 @@ These are exactly the CI jobs; run them before every push. Do not document or us
 - `recognizer.py` reads every `WXDU_*` variable into a module constant at import. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. See `tests/test_smoke.py`.
 - Fixtures are synthetic. Example artists are ones a freeform college station actually plays (Juana Molina, Jessica Pratt, Chuquimamani-Condori, Hermanos Gutiérrez), never mainstream ones.
 
+## Characterization tests: what the refactor owes them
+
+`tests/characterization/` pins WXDU's behavior against the unmodified `recognizer.py`, at four seams the refactor does not move: `shazamio.Shazam.recognize` patched on the class, a recording fake `ffmpeg` first on `PATH` (`tests/ffmpeg_stub.py`), a localhost ingest server as `WXDU_SHAZAM_API`, and `time.sleep` patched only for sentinel pause lengths (`WXDU_INTERVAL=1001`, `WXDU_INTERVAL_GAP=1003`), so `Popen.wait`'s own polling sleeps pass through. See `tests/characterization/conftest.py`.
+
+Rules for every PR that restructures the recognizer:
+
+- **No edits under `tests/characterization/`** in the refactor and station-neutral PRs. If a pin has to change, the behavior changed, and that is a separate PR that says so.
+- `recognizer.py` keeps exporting `parse`, `capture`, `post`, `identify_once`, and `main` as module attributes.
+- `parse()` keeps returning a plain `dict` with exactly `artist, song, album, label`, and `post()` keeps serializing whatever dict it is handed, unfiltered, with `json.dumps`' default ASCII escaping. No dataclass, no key filter.
+- An injected sleep resolves `time.sleep` at call time; never bind it as a default argument at import, or the sentinel patch stops seeing the loop's pauses.
+- Tests that set the environment use the `fresh_recognizer` fixture in `tests/conftest.py`.
+
 ## Data
 
 Audio, reference-pool listings and object keys, playlist exports, credentials, and result stores never enter the repo. Research data lives under `$STREAM_SLEUTH_DATA_DIR` (default `~/.local/share/stream-sleuth/`), outside the checkout. `data/`, `eval.env`, and `.env.eval` are in `.gitignore` as a second guard only; nothing relies on them.
@@ -43,10 +55,6 @@ Audio, reference-pool listings and object keys, playlist exports, credentials, a
 - **Every S3 client comes from `evaluation.s3_readonly`** (`archive_client()`, `pool_client()`), whose `before-call.s3` handler refuses any operation but `ListObjectsV2`, `GetObject`, and `HeadObject`. `tests/import_scan.py` enforces it over all first-party code: an AST scan forbids importing `boto3`, `botocore`, or `s3transfer` anywhere else, and a textual scan forbids S3 write and presign method names, touching a client's `meta.events` (which could remove the guard), and dynamic imports. Both scans walk every `*.py` in the repo except dot-directories and build output. The only exemptions are the factory and `tests/unit/test_s3_readonly.py`; do not add more. Never add `awscrt` (`boto3[crt]`): its transfer client sends without botocore's events, so the guard would not see `upload_file` or `copy`; a test fails if it is installed.
 - Guard tests use moto's `mock_aws`, never `botocore.stub.Stubber`, which answers before the guard runs and would make the tests pass without it. A test against a custom endpoint sets `MOTO_S3_CUSTOM_ENDPOINTS`, or moto lets botocore reach the real host.
 - The harness reads `os.environ` only. Its settings live in `$STREAM_SLEUTH_DATA_DIR/eval.env`, outside the checkout, and are loaded into one process with `uv run --extra eval --env-file …` or a subshell, **never `source`d into an interactive shell**: `run.sh` exports its whole environment into the recognizer.
-
-## Formatting
-
-`recognizer.py` is excluded from `ruff format --check` until characterization tests pin its behavior; the reformat then lands as its own commit that passes the same tests. `ruff check` already covers it.
 
 ## WXYC fork
 
