@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -73,6 +74,11 @@ CREATE TABLE IF NOT EXISTS files (
 
 Consumer = Callable[[Path, str], None]
 
+# A staged file's name: its stage id plus the object's extension. Stale-stage
+# cleanup removes only names of this shape, so a misconfigured staging_dir can
+# never cost anything else.
+_STAGE_NAME = re.compile(r"[0-9a-f]{40}\.[0-9a-z]+")
+
 
 @dataclass(frozen=True)
 class PoolObject:
@@ -102,13 +108,20 @@ def stage_id(key: str) -> str:
 def inventory(
     prefixes: Iterable[str], *, client: Any = None, bucket: str | None = None
 ) -> list[PoolObject]:
-    """List every object under ``prefixes`` with its size and format, fetching nothing."""
+    """List every object under ``prefixes`` with its size and format, fetching nothing.
+
+    A key under two overlapping prefixes is listed once, under the first.
+    """
     client = client or pool_client()
     bucket = bucket or pool_bucket()
     objects = []
+    seen: set[str] = set()
     for prefix in prefixes:
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
             for item in page.get("Contents", []):
+                if item["Key"] in seen:
+                    continue
+                seen.add(item["Key"])
                 fmt = FORMATS.get(PurePosixPath(item["Key"]).suffix.lower())
                 objects.append(PoolObject(item["Key"], prefix, item["Size"], fmt))
     return objects
@@ -194,14 +207,15 @@ def stream(
     """Fetch, tag, and hand each audio object to ``consumer(staged_path, stage_id)``.
 
     One file is staged at a time and deleted when the consumer returns or raises.
-    Files left in ``staging_dir`` by a crashed run are removed first. Returns
+    Stage files left in ``staging_dir`` by a crashed run are removed first; nothing else there is touched. Returns
     counts of ``indexed``, ``failed``, ``already_indexed``, and ``skipped_format``.
     """
     client = client or pool_client()
     bucket = bucket or pool_bucket()
     staging_dir.mkdir(parents=True, exist_ok=True)
     for stale in staging_dir.iterdir():
-        stale.unlink()
+        if stale.is_file() and _STAGE_NAME.fullmatch(stale.name):
+            stale.unlink()
     done = {key for (key,) in db.execute("SELECT key FROM files WHERE status = 'indexed'")}
     counts: Counter[str] = Counter()
     for obj in objects:
@@ -214,7 +228,12 @@ def stream(
         path = staging_dir / (stage_id(obj.key) + PurePosixPath(obj.key).suffix.lower())
         tags: dict[str, Any] = {}
         try:
-            client.download_file(bucket, obj.key, str(path))
+            # get_object, not download_file: no s3transfer threads between the
+            # call and the read-only guard.
+            body = client.get_object(Bucket=bucket, Key=obj.key)["Body"]
+            with open(path, "wb") as f:
+                for chunk in body.iter_chunks(1 << 20):
+                    f.write(chunk)
             tags = read_tags(path, obj.format)
             consumer(path, stage_id(obj.key))
         except Exception as exc:  # recorded per file; the run continues
