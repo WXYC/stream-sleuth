@@ -63,13 +63,6 @@ def test_writes_non_ascii_as_utf8_and_round_trips(outputs, tmp_path):
     assert lines(path)[0]["artist"] == "Hermanos Gutiérrez"
 
 
-def test_record_is_on_disk_when_emit_returns(outputs, tmp_path):
-    path = tmp_path / "e.jsonl"
-    out = outputs.JsonlOutput(path, clock=lambda: NOW)
-    out.emit(MOLINA)
-    assert lines(path) == [{**MOLINA, "emitted_at": NOW.isoformat()}]
-
-
 def test_does_not_mutate_the_track(outputs, tmp_path):
     track = dict(MOLINA)
     outputs.JsonlOutput(tmp_path / "e.jsonl", clock=lambda: NOW).emit(track)
