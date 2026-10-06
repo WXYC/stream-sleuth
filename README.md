@@ -160,7 +160,7 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 
 ### Plays
 
-`evaluation/corpus.py` is WXYC-specific. It reads the two CSVs that `evaluation/sql/flowsheet-export.sql` writes (run in a read-only `psql` session into a dated export directory, never over an earlier one) and the reference pool's `pool.db`. `Flowsheet.load()` orders rows by `(add_time, id)`, computes `ETL_STOP`, and labels each show's `play_order` as single-writer (with a reorder flag) or unreliable. `hour_stats()`, `select_hours()`, and `select_talk_hours()` choose archive hours by expected in-pool play count, skipping batch-logged hours and the August 2026 gap-import days. `write_plays()` writes `plays.jsonl` for a list of hour keys and refuses to overwrite an existing file:
+`evaluation/corpus.py` is WXYC-specific. It reads the two CSVs that `evaluation/sql/flowsheet-export.sql` writes (run in a read-only `psql` session into a dated export directory, never over an earlier one) and the reference pool's `pool.db`. `Flowsheet.load()` orders rows by `(add_time, id)`, computes `ETL_STOP`, and labels each show's `play_order` as single-writer (with a reorder flag) or unreliable. `write_plays()` writes `plays.jsonl` for a list of hour keys and refuses to overwrite an existing file:
 
 ```sh
 uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.corpus \
