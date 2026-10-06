@@ -20,6 +20,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy . --ignore-missing-imports
 uv run pytest
+uv run pytest -m "ffmpeg"   # needs a real ffmpeg on PATH
 ```
 
 These are exactly the CI jobs; run them before every push. Do not document or use `pip install -e`, which drifts from the lock. `--locked` fails instead of silently rewriting `uv.lock` when `pyproject.toml` has changed; run `uv lock` deliberately and commit the result. `requirements.txt` is WXDU's install and is the one file not driven by the lock. It is not pinned (`shazamio>=0.8`), so a WXDU venv rebuild can pick up a newer `shazamio` than the lock tests.
@@ -31,7 +32,7 @@ These are exactly the CI jobs; run them before every push. Do not document or us
 - **A marker lands in the PR that adds the first test using it, never earlier**: declared in `pyproject.toml`, excluded in `addopts` as `not <marker>`, and given a same-named CI job, all at once. pytest exits 5 when a job collects nothing, so an empty job is a red build.
 - CI quotes the expression, `pytest -m "<marker>"`; the marker-sync check only recognizes a quoted `-m` argument.
 - The default CI job runs plain `pytest` and never names a subdirectory, so every unmarked test runs.
-- `recognizer.py` reads every `WXDU_*` variable into a module constant at import. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. See `tests/test_smoke.py`.
+- `recognizer.py` reads every `WXDU_*` variable into a module constant at import. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. The `fresh_recognizer` fixture in `tests/conftest.py` does all of this; use it.
 - Fixtures are synthetic. Example artists are ones a freeform college station actually plays (Juana Molina, Jessica Pratt, Chuquimamani-Condori, Hermanos Gutiérrez), never mainstream ones.
 
 ## Characterization tests: what the refactor owes them
@@ -44,7 +45,6 @@ Rules for every PR that restructures the recognizer:
 - `recognizer.py` keeps exporting `parse`, `capture`, `post`, `identify_once`, and `main` as module attributes.
 - `parse()` keeps returning a plain `dict` with exactly `artist, song, album, label`, and `post()` keeps serializing whatever dict it is handed, unfiltered, with `json.dumps`' default ASCII escaping. No dataclass, no key filter.
 - An injected sleep resolves `time.sleep` at call time; never bind it as a default argument at import, or the sentinel patch stops seeing the loop's pauses.
-- Tests that set the environment use the `fresh_recognizer` fixture in `tests/conftest.py`.
 
 ## Data
 
