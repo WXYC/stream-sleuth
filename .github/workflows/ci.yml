@@ -48,6 +48,8 @@ jobs:
   test:
     name: Default Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite takes seconds; a loop pin that stops stopping should not run for hours.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -70,9 +72,13 @@ jobs:
   ffmpeg:
     name: ffmpeg Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The pinned interpreter, stated like the test job's so it cannot drift.
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
