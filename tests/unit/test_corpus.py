@@ -377,3 +377,31 @@ def test_export_sql_is_read_only() -> None:
     statements = [line for line in sql.splitlines() if line.startswith("\\copy")]
     assert len(statements) == 2
     assert all("SELECT" in s and "INSERT" not in s and "UPDATE" not in s for s in statements)
+
+
+def test_select_hours_deprioritizes_reorder_flagged_shows(tmp_path: Path, pool_db: Path) -> None:
+    pooled: dict[str, Any] = {"artist": "Juana Molina", "album": "DOGA"}
+    flagged = hour_rows(100, 20, 8, 200.0, show_id=1, **pooled)
+    flagged[0]["play_order"], flagged[1]["play_order"] = 101, 100  # a moved late-logged track
+    clean = hour_rows(200, 21, 8, 200.0, show_id=2, **pooled)
+    export = write_export(tmp_path, flagged + clean, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    assert stats["2026/08/12/202608121600.mp3"].reorder_flagged
+    assert not stats["2026/08/12/202608121700.mp3"].reorder_flagged
+    assert corpus.select_hours(stats, era="canonical", target=5) == ["2026/08/12/202608121700.mp3"]
+
+
+def test_write_plays_leaves_no_partial_file_on_a_bad_key(tmp_path: Path, pool_db: Path) -> None:
+    export = write_export(tmp_path, [row(1, ts(20, 10))], "2026-08-09 05:00:43+00")
+    out = tmp_path / "plays.jsonl"
+    with pytest.raises(ValueError):
+        corpus.write_plays(
+            out,
+            [
+                "2026/08/12/202608121600.mp3",
+                "2026/11/01/202611010100.mp3",
+            ],  # the second is the fall-back hour
+            corpus.Flowsheet.load(export),
+            corpus.PoolIndex.load(pool_db),
+        )
+    assert not out.exists()

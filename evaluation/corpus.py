@@ -190,6 +190,7 @@ class HourStats:
     talk_rows: int
     in_pool: int
     median_gap_s: float
+    reorder_flagged: bool
 
 
 def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
@@ -203,6 +204,7 @@ def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
             key, sheet.era(hour_start(key)), len(tracks), sum(r.entry_type in TALK_TYPES for r in rows),
             sum(pool.tier(r.artist, r.album, r.title) is not None for r in tracks),
             statistics.median(gaps) if gaps else 0.0,
+            any(sheet.order_status[r.show_id][1] for r in tracks if sheet.era(r.add_time) == "canonical"),
         )  # fmt: skip
     return stats
 
@@ -212,11 +214,15 @@ def _eligible(h: HourStats) -> bool:
 
 
 def select_hours(stats: dict[str, HourStats], *, era: str, target: int) -> list[str]:
-    """DJ hours in descending in-pool order until their in-pool plays reach ``target``."""
+    """DJ hours in descending in-pool order until their in-pool plays reach ``target``.
+
+    Hours holding a reorder-flagged show rank after every unflagged hour (plan §4).
+    To restrict the date window, filter ``stats`` before calling.
+    """
     candidates = sorted(
         (h for h in stats.values() if h.era == era and _eligible(h) and h.in_pool
          and h.track_rows >= MIN_TRACKS and h.median_gap_s >= MIN_MEDIAN_GAP_S),
-        key=lambda h: (-h.in_pool, h.key),
+        key=lambda h: (h.reorder_flagged, -h.in_pool, h.key),
     )  # fmt: skip
     chosen, total = [], 0
     for h in candidates:
@@ -241,41 +247,41 @@ def select_talk_hours(stats: dict[str, HourStats], *, count: int) -> list[str]:
 def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
     """Write one ``plays.jsonl`` record per track row in each hour; never overwrites ``out``.
 
+    Every key is validated before ``out`` is created, so a bad key leaves no partial file.
+
     Each hour also gets the previous hour's last track row as an attribution-only
     play (``carryover: true``, negative ``t_offset_s``): a song started before the
     top of the hour is still playing in it.
     """
-    with open(out, "x") as f:
-        for key in hours:
-            start = hour_start(key)
-            rows = sheet.by_hour.get(key, [])
-            tracks = [r for r in rows if r.entry_type == "track"]
-            before = [r for r in sheet.by_hour.get(hour_key(start - timedelta(hours=1)) or "", [])
-                      if r.entry_type == "track"]  # fmt: skip
-            plays = [(r, True) for r in before[-1:]] + [(r, False) for r in tracks]
-            for i, (r, carryover) in enumerate(plays):
-                t = (r.add_time - start).total_seconds()
-                t_next = (
-                    (plays[i + 1][0].add_time - start).total_seconds()
-                    if i + 1 < len(plays)
-                    else 3600.0
-                )
-                era = sheet.era(r.add_time)
-                tier = pool.tier(r.artist, r.album, r.title)
-                status, flag = (
-                    sheet.order_status[r.show_id] if era == "canonical" else ("etl", None)
-                )
-                record = {
-                    "hour_key": key, "play_id": r.id, "t_offset_s": t,
-                    "window_start_s": max(0.0, t - PADS[era]), "window_end_s": min(3600.0, t_next + PADS[era]),
-                    "artist": r.artist, "title": r.title, "album": r.album, "era": era, "pad_s": PADS[era],
-                    "in_pool": tier is not None if r.artist else None, "pool_match_tier": tier,
-                    "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
-                    "carryover": carryover, "track_rows": len(tracks),
-                    "talk_rows": sum(r.entry_type in TALK_TYPES for r in rows),
-                }  # fmt: skip
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
+    lines = []
+    for key in dict.fromkeys(hours):
+        start = hour_start(key)
+        rows = sheet.by_hour.get(key, [])
+        tracks = [r for r in rows if r.entry_type == "track"]
+        talk_rows = sum(r.entry_type in TALK_TYPES for r in rows)
+        before = [r for r in sheet.by_hour.get(hour_key(start - timedelta(hours=1)) or "", [])
+                  if r.entry_type == "track"]  # fmt: skip
+        plays = [(r, True) for r in before[-1:]] + [(r, False) for r in tracks]
+        for i, (r, carryover) in enumerate(plays):
+            t = (r.add_time - start).total_seconds()
+            t_next = (
+                (plays[i + 1][0].add_time - start).total_seconds() if i + 1 < len(plays) else 3600.0
+            )
+            era = sheet.era(r.add_time)
+            tier = pool.tier(r.artist, r.album, r.title)
+            status, flag = sheet.order_status[r.show_id] if era == "canonical" else ("etl", None)
+            record = {
+                "hour_key": key, "play_id": r.id, "t_offset_s": t,
+                "window_start_s": max(0.0, t - PADS[era]), "window_end_s": min(3600.0, t_next + PADS[era]),
+                "artist": r.artist, "title": r.title, "album": r.album, "era": era, "pad_s": PADS[era],
+                "in_pool": tier is not None if r.artist else None, "pool_match_tier": tier,
+                "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
+                "carryover": carryover, "track_rows": len(tracks), "talk_rows": talk_rows,
+            }  # fmt: skip
+            lines.append(json.dumps(record, ensure_ascii=False) + "\n")
+        log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
+    with open(out, "x") as f:  # built in full first, so a bad key leaves no partial file
+        f.writelines(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
