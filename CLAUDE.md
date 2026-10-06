@@ -15,7 +15,7 @@ The code lives in the `stream_sleuth` package; `recognizer.py` is a thin shim th
 | `stream_sleuth/outputs.py` | `Output` protocol; `HttpPostOutput`; `post()` |
 | `stream_sleuth/loop.py` | `identify_once()` and `main()`, the adaptive loop |
 
-Sibling modules bind settings with `from .config import ...`, so a test that changes the environment must re-import the package; use `fresh_recognizer` (see Tests). The loop calls `time.sleep` through the `time` module so a patch of `time.sleep` is seen at call time.
+Each conforming class subclasses its protocol explicitly, so mypy checks its signatures. Sibling modules bind settings with `from .config import ...`, so a test that changes the environment must re-import the package; use `fresh_recognizer` (see Tests). The loop calls `time.sleep` through the `time` module so a patch of `time.sleep` is seen at call time.
 
 ## Interpreter
 
@@ -47,7 +47,7 @@ These are exactly the CI jobs; run them before every push. Do not document or us
 - **A marker lands in the PR that adds the first test using it, never earlier**: declared in `pyproject.toml`, excluded in `addopts` as `not <marker>`, and given a same-named CI job, all at once. pytest exits 5 when a job collects nothing, so an empty job is a red build.
 - CI quotes the expression, `pytest -m "<marker>"`; the marker-sync check only recognizes a quoted `-m` argument.
 - The default CI job runs plain `pytest` and never names a subdirectory, so every unmarked test runs.
-- `recognizer.py` reads every `WXDU_*` variable into a module constant at import. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. The `fresh_recognizer` fixture in `tests/conftest.py` does all of this; use it.
+- `stream_sleuth/config.py` reads every `WXDU_*` variable into a module constant at import, and `recognizer.py` re-exports them. A test that sets the environment must delete every `WXDU_*` and `STREAM_SLEUTH_*` variable, remove `recognizer` and every `stream_sleuth*` entry from `sys.modules`, set its own values, and import afresh. Never `importlib.reload`. The `fresh_recognizer` fixture in `tests/conftest.py` does all of this; use it.
 - Fixtures are synthetic. Example artists are ones a freeform college station actually plays (Juana Molina, Jessica Pratt, Chuquimamani-Condori, Hermanos Gutiérrez), never mainstream ones.
 
 ## Characterization tests: what the refactor owes them

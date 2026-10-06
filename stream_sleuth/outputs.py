@@ -13,7 +13,7 @@ class Output(Protocol):
         """Deliver one identification; the return value is logged."""
 
 
-class HttpPostOutput:
+class HttpPostOutput(Output):
     """POSTs each identification to the ingest API (``WXDU_SHAZAM_API``)."""
 
     def emit(self, track: dict) -> object:
