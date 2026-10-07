@@ -19,12 +19,22 @@ _CRUFT = re.compile(
     r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
-# An unbracketed featuring credit: the whole word feat, feat., ft, ft. or featuring after some
-# text (not "with", a title word, and not a field's first word), and the words after it. It
-# stops before a bracket or a spaced hyphen, en dash or em dash, so a version that follows
-# ("feat. X (Live)", "feat. X - Live") is still there for the version rules to read.
+# An unbracketed featuring credit: "feat.", "ft." or "featuring" after some text, with a word
+# after it, and the words that follow. A bare "feat" or "ft" is a word ("Little Feat"), and so
+# is "ft." after a number, digits or a word ("50 Ft. Queenie", "Six Ft. Under"); "with" is a
+# title word. The credit stops before any bracket, opening or closing, ASCII or full-width (the
+# exact keys are not folded), and before a spaced hyphen, en dash or em dash, so a clause or
+# suffix that follows it, or holds it, is still there for the version rules to read.
+_CLOSERS = ")]}\uff09\uff3d\uff5d"
+_BRACKETS = re.escape("([{\uff08\uff3b\uff5b" + _CLOSERS)
+_NUMBER_WORDS = (
+    "zero one two three four five six seven eight nine ten eleven twelve twenty thirty forty"
+    " fifty sixty seventy eighty ninety hundred thousand".split()
+)
+_FEET = "".join(rf"(?<!\b{w})" for w in _NUMBER_WORDS)
 _CREDIT = re.compile(
-    r"(?<=\S)\s+(?:feat|ft|featuring)\b\.?[^(\[{]*?(?=\s[-‐-―]\s|[(\[{]|$)",
+    rf"(?:(?<=\S)\s+(?:feat\.|featuring\b)|(?<=[^\s\d]){_FEET}\s+ft\.)\s+(?=\w)"
+    rf"[^{_BRACKETS}]*?(?=\s[-\u2010-\u2015]\s|[{_BRACKETS}]|$)",
     re.IGNORECASE,
 )
 # A dotted initialism: two or more single letters, each followed by a period but the last,
@@ -102,7 +112,12 @@ def album_key(s: str | None) -> str:
         stems = {_stem(w) for w in _version_words(m.group())}
         return m.group() if stems & (VERSION_QUALIFIERS - {"version"}) else ""
 
-    return " ".join(_CREDIT.sub(" ", _CRUFT.sub(drop_unless_version, (s or "").lower())).split())
+    def drop_credit(m: re.Match[str]) -> str:
+        return "" if m.string[m.end() : m.end() + 1] in tuple(_CLOSERS) else " "
+
+    return " ".join(
+        _CREDIT.sub(drop_credit, _CRUFT.sub(drop_unless_version, (s or "").lower())).split()
+    )
 
 
 def fuzzy(s: str | None) -> str:

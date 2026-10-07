@@ -179,22 +179,40 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
     assert norm.fuzzy(s) == fuzzy
 
 
+DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
+
+
 @pytest.mark.parametrize(
     ("s", "album_key", "fuzzy"),
     [
-        # An unbracketed featuring credit goes as the bracketed one does: the whole word
-        # feat, feat., ft, ft. or featuring, in any case, and the words after it.
+        # An unbracketed featuring credit goes as the bracketed one does: the word "feat.",
+        # "ft." or "featuring" (any case) and the words after it.
         ("Hibiscus Feat. Bbyafricka", "hibiscus", "hibiscus"),
-        ("Hibiscus feat Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus (feat Bbyafricka)", "hibiscus", "hibiscus"),
         ("Hibiscus ft. Bbyafricka", "hibiscus", "hibiscus"),
-        ("Hibiscus FT Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus FT. Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus Featuring Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus  feat.  Bbyafricka  &  Juana Molina", "hibiscus", "hibiscus"),
         ("Hibiscus\tfeat.\nBbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus feat. R.E.M.", "hibiscus", "hibiscus"),
         ("Juana Molina feat. Jessica Pratt", "juana molina", "juana molina"),
-        # Not "with" (a title: "Dancing with Myself"), not a leading word, not part of a word.
+        ("Song 2 feat. Jessica Pratt", "song 2", "song 2"),
+        ("Hibiscus feat. Jay-Z", "hibiscus", "hibiscus"),
+        ("Hibiscus feat. Bbyafricka -Live", "hibiscus", "hibiscus"),
+        # A credit needs a period ("feat", "ft" alone are words), a word after it, and text
+        # before it; "ft." directly after a number is feet.
+        ("Hibiscus feat Bbyafricka", "hibiscus feat bbyafricka", "hibiscus feat bbyafricka"),
+        ("Hibiscus FT Bbyafricka", "hibiscus ft bbyafricka", "hibiscus ft bbyafricka"),
+        ("Hibiscus feat", "hibiscus feat", "hibiscus feat"),
+        ("Hibiscus feat.", "hibiscus feat.", "hibiscus feat"),
+        ("Hibiscus featuring", "hibiscus featuring", "hibiscus featuring"),
+        ("Hibiscus feat. (Live)", "hibiscus feat. (live)", "hibiscus feat live"),
+        ("Little Feat", "little feat", "little feat"),
+        ("No Mean Feat", "no mean feat", "no mean feat"),
+        ("A Feat of Clay", "a feat of clay", "a feat of clay"),
+        ("Six Ft. Under", "six ft. under", "six ft under"),
+        ("50 Ft. Queenie", "50 ft. queenie", "50 ft queenie"),
+        ("10 Ft. Ganja Plant", "10 ft. ganja plant", "10 ft ganja plant"),
         ("Dancing with Myself", "dancing with myself", "dancing with myself"),
         ("Waltz with Bashir", "waltz with bashir", "waltz with bashir"),
         ("Featuring Ourselves", "featuring ourselves", "featuring ourselves"),
@@ -203,13 +221,19 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         ("Feather", "feather", "feather"),
         ("Lift", "lift", "lift"),
         ("Ghost Feather Boa", "ghost feather boa", "ghost feather boa"),
-        ("Soft Feat", "soft", "soft"),
         # The credit never swallows a version qualifier that follows it: a bracketed clause
-        # or a spaced-dash suffix is kept (and read as one), and the other clauses go as before.
+        # of any kind or a spaced-dash suffix is kept (and read as one), the other clauses go
+        # as before.
         ("Hibiscus feat. Bbyafricka (Live)", "hibiscus (live)", "hibiscus live"),
         ("Hibiscus feat. Bbyafricka [Demo]", "hibiscus [demo]", "hibiscus demo"),
-        ("Hibiscus feat. Bbyafricka - Live", "hibiscus - live", "hibiscus live"),
-        ("Hibiscus feat. Bbyafricka – Live", "hibiscus – live", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka {Live}", "hibiscus {live}", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka（Live）", "hibiscus （live）", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka［Demo］", "hibiscus ［demo］", "hibiscus demo"),
+        ("Hibiscus feat. Bbyafricka｛Live｝", "hibiscus ｛live｝", "hibiscus live"),
+        *(
+            (f"Hibiscus feat. Bbyafricka {d} Live", f"hibiscus {d} live", "hibiscus live")
+            for d in DASHES
+        ),
         (
             "Hibiscus feat. Bbyafricka (Live) (Bonus Track Version)",
             "hibiscus (live)",
@@ -218,6 +242,21 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         ("Hibiscus feat. Bbyafricka (Deluxe Version)", "hibiscus", "hibiscus"),
         ("Hibiscus (Live) feat. Bbyafricka", "hibiscus (live)", "hibiscus live"),
         ("Hibiscus feat. Bbyafricka (Brazil)", "hibiscus (brazil)", "hibiscus"),
+        # A credit inside a bracketed clause stops at its closing bracket, so the clause
+        # is still one: main keys these the same on the fuzzy key.
+        ("Hibiscus (Radio Edit feat. Bbyafricka)", "hibiscus (radio edit)", "hibiscus"),
+        ("Hibiscus (Live feat. Bbyafricka)", "hibiscus (live)", "hibiscus live"),
+        ("Hibiscus [Live ft. Bbyafricka]", "hibiscus [live]", "hibiscus live"),
+        ("Hibiscus {Live featuring Bbyafricka}", "hibiscus {live}", "hibiscus live"),
+        # The edition rule judges a clause before the credit is cut from it: the clause is kept
+        # whole (its "Live Skull" a version word) and then loses the credit, on the exact key.
+        (
+            "Hibiscus (Remastered 2011 feat. Live Skull)",
+            "hibiscus (remastered 2011)",
+            "hibiscus",
+        ),
+        ("Hibiscus (Live feat. Bbyafricka) (Demo)", "hibiscus (live) (demo)", "hibiscus live demo"),
+        ("Hibiscus（Live feat. Bbyafricka）", "hibiscus（live）", "hibiscus live"),
     ],
 )
 def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
@@ -237,6 +276,8 @@ def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
         ("Hibiscus featuring Bbyafricka", "Hibiscus", "exact"),
         ("Hibiscus Feat. Bbyafricka!", "Hibiscus", "exact"),
         ("Dancing with Myself", "Dancing", None),
+        ("Six Ft. Under", "Six Ft. Deep", None),
+        ("Little Feat", "Little", None),
         # A version the credit precedes is still named, on the play side and the pool side.
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus (Live)", "exact"),
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus", None),
@@ -247,6 +288,16 @@ def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
         ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka - Live", "fuzzy"),
         ("Hibiscus feat. Bbyafricka - Live", "Hibiscus (Live)", "fuzzy"),
         ("Hibiscus feat. Bbyafricka (Demo)", "Hibiscus feat. Bbyafricka (Live)", None),
+        # ...also in full-width brackets, whose exact key is not folded.
+        ("Hibiscus", "Hibiscus feat. Bbyafricka（Live）", None),
+        ("Hibiscus feat. Bbyafricka（Live）", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka（Live）", "Hibiscus（Live）", "fuzzy"),
+        # A credit inside a version clause leaves the clause, and the qualifier, in place.
+        ("Hibiscus (Radio Edit feat. Bbyafricka)", "Hibiscus", "fuzzy"),
+        ("Hibiscus", "Hibiscus (Radio Edit feat. Bbyafricka)", "fuzzy"),
+        ("Hibiscus (Live feat. Bbyafricka)", "Hibiscus", None),
+        ("Hibiscus", "Hibiscus (Live feat. Bbyafricka)", None),
+        ("Hibiscus (Live feat. Bbyafricka)", "Hibiscus (Live)", "exact"),
     ],
 )
 def test_title_tier_joins_an_unbracketed_featuring_credit(
