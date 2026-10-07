@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -444,6 +445,79 @@ def _alive(pid):
     return bool(state.stdout.strip()) and not state.stdout.strip().startswith("Z")
 
 
+def hang(script):
+    """Make the fake ``olaf`` sleep, so a query outlives its timeout."""
+    script.write_text(
+        script.read_text().replace("sys.exit(reply", "import time; time.sleep(5); sys.exit(reply")
+    )
+
+
+@pytest.mark.parametrize("error", [PermissionError, ProcessLookupError])
+def test_a_kill_that_races_the_childs_exit_still_raises_olaf_error(
+    olaf, fake_olaf, snap, monkeypatch, error
+):
+    # On macOS killpg raises when Olaf exits just as the timeout fires.
+    script, set_output, _ = fake_olaf
+    hang(script)
+    set_output(json.dumps(query_object(0.0)))
+
+    def refuse(*_):
+        raise error
+
+    monkeypatch.setattr(olaf.os, "killpg", refuse)
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script), query_timeout_s=0.3)
+    with pytest.raises(olaf.OlafError, match="timed out"):
+        recognizer.recognize("clip.wav")
+
+
+def test_an_interrupted_query_kills_the_process_group_before_re_raising(
+    olaf, fake_olaf, snap, monkeypatch
+):
+    script, set_output, _ = fake_olaf
+    hang(script)
+    set_output(json.dumps(query_object(0.0)))
+    killed = []
+    real_killpg, real_communicate = olaf.os.killpg, subprocess.Popen.communicate
+
+    def killpg(pid, sig):
+        killed.append((pid, sig))
+        real_killpg(pid, sig)
+
+    def interrupted(self, *args, **kwargs):
+        if killed:
+            return real_communicate(self, *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(olaf.os, "killpg", killpg)
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        olaf.OlafRecognizer(snap, olaf_bin=str(script)).recognize("clip.wav")
+    assert [sig for _, sig in killed] == [signal.SIGKILL]
+
+
+@pytest.mark.parametrize("action", ["query", "store"])
+def test_olaf_never_inherits_the_terminal_as_stdin(olaf, fake_olaf, snap, monkeypatch, action):
+    # Olaf's ffmpeg child reads stdin unless told not to, and can leave echo off.
+    script, _, _ = fake_olaf
+    seen = []
+    real_popen = subprocess.Popen
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("stdin"))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(olaf.subprocess, "Popen", spy)
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script))
+    try:
+        if action == "query":
+            recognizer.recognize("clip.wav")
+        else:
+            recognizer.store([("/a.mp3", "id")])
+    except olaf.OlafError:
+        pass  # the fake prints no query result; only how it was started matters
+    assert seen == [subprocess.DEVNULL]
+
+
 def test_a_lookup_missing_a_key_falls_back_for_that_key(olaf, fake_olaf, snap):
     script, set_output, _ = fake_olaf
     set_output(json.dumps(README_RECORD))
@@ -471,3 +545,36 @@ def test_index_build_reports_an_olaf_failure_in_one_line(
     err = capsys.readouterr().err
     assert "File is not an audio file" in err
     assert "Traceback" not in err
+
+
+def test_store_reports_an_uncreatable_snapshot_as_olaf_error(olaf, fake_olaf, tmp_path):
+    script, _, calls = fake_olaf
+    (tmp_path / "file").write_text("")
+    recognizer = olaf.OlafRecognizer(tmp_path / "file" / "snap", olaf_bin=str(script))
+    with pytest.raises(olaf.OlafError, match="cannot create"):
+        recognizer.store([("/a.mp3", "id")])
+    assert calls() == []
+
+
+def test_index_build_reports_an_uncreatable_snapshot_in_one_line(
+    fresh_recognizer, fake_olaf, tmp_path, capsys
+):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    script, _, _ = fake_olaf
+    (tmp_path / "file").write_text("")
+    argv = ["index", "build", "--home", str(tmp_path / "file" / "snap"), "--olaf-bin", str(script)]
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main([*argv, "/a.mp3", "id"])
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "cannot create" in err
+    assert "Traceback" not in err
+
+
+def test_the_usage_line_is_the_invocation_that_works(fresh_recognizer, capsys):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    with pytest.raises(SystemExit):
+        cli.main(["index", "build", "--help"])
+    assert "usage: python -m stream_sleuth.cli index build" in capsys.readouterr().out
