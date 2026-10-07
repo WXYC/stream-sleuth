@@ -12,14 +12,19 @@ runs:
     # A user-owned directory, so the cache can read it and write it back. The
     # image OS (not the weekly image version) keeps the key stable; an Ubuntu
     # bump falls back to the older debs and apt fetches only what changed.
-    - shell: bash
-      run: mkdir -p "$HOME/.cache/apt-archives/partial"
+    # ImageOS is set in the runner's environment, which a composite action's
+    # `env` context does not see, so it is read in a shell and passed on.
+    - id: image
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.cache/apt-archives/partial"
+        echo "os=${ImageOS:?runner did not set ImageOS}" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@v6
       with:
         path: ~/.cache/apt-archives
-        key: apt-debs-${{ runner.os }}-${{ env.ImageOS }}-ffmpeg
+        key: apt-debs-${{ runner.os }}-${{ steps.image.outputs.os }}-ffmpeg
         restore-keys: |
-          apt-debs-${{ runner.os }}-${{ env.ImageOS }}-
+          apt-debs-${{ runner.os }}-${{ steps.image.outputs.os }}-
           apt-debs-${{ runner.os }}-
     - shell: bash
       run: |
