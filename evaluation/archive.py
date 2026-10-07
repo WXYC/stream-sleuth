@@ -33,6 +33,10 @@ class HourSizeMismatchError(FileExistsError):
     """A local hour file exists with a size other than the object's; it is left alone."""
 
 
+class InvalidHourKeyError(ValueError):
+    """A key :func:`hour_key` cannot produce was passed to :func:`fetch`; nothing was requested."""
+
+
 class ShortReadError(OSError):
     """The download ended before the object's ``ContentLength``; only the ``.part`` remains."""
 
@@ -61,20 +65,26 @@ def hour_start(key: str) -> datetime:
 
 
 def _is_missing(exc: Exception) -> bool:
-    error = getattr(exc, "response", {}).get("Error", {})
-    return error.get("Code") in {"404", "NoSuchKey"}
+    # GetObject's NoSuchKey only: HeadObject's bodiless "404" is also what a
+    # missing bucket returns, and a connection error's response is None.
+    response = getattr(exc, "response", None) or {}
+    return response.get("Error", {}).get("Code") == "NoSuchKey"
 
 
 def fetch(key: str, *, archive_dir: Path, client: Any = None, bucket: str | None = None) -> Path:
     """Download the hour ``key`` to ``archive_dir/key`` unless it is already there.
 
-    ``key`` must be one :func:`hour_key` produces. An existing file of the
+    ``key`` must be one :func:`hour_key` produces, or :class:`InvalidHourKeyError`
+    is raised before any request. An existing file of the
     object's size is kept; one of any other size raises
     :class:`HourSizeMismatchError` and is never overwritten. A new download
     streams into a ``.part`` file renamed only once its size matches the
     object's ``ContentLength``; a short read raises :class:`ShortReadError`.
     """
-    hour_start(key)  # rejects excluded hours and anything that could escape archive_dir
+    try:
+        hour_start(key)  # rejects excluded hours and anything that could escape archive_dir
+    except ValueError as exc:
+        raise InvalidHourKeyError(str(exc)) from exc
     client = client or archive_client()
     bucket = bucket or archive_bucket()
     dest = archive_dir / key
@@ -108,9 +118,10 @@ def fetch_all(
 ) -> list[str]:
     """Fetch every hour in ``keys`` and return the ones that failed.
 
-    Per-hour failures (a missing object, a size mismatch, a short read, a key
-    that is not an hour) are logged and skipped. Anything else, such as expired
-    credentials or a missing bucket, would fail every hour, so it propagates.
+    Per-hour failures (``NoSuchKey`` from ``GetObject``, a size mismatch, a
+    short read, a key that is not an hour) are logged and skipped. Anything
+    else, such as expired credentials, a missing bucket, a connection error, or
+    a bug, would fail every hour or hide a defect, so it propagates.
     """
     client = client or archive_client()
     bucket = bucket or archive_bucket()
@@ -120,7 +131,7 @@ def fetch_all(
             fetch(key, archive_dir=archive_dir, client=client, bucket=bucket)
         except Exception as exc:
             if not isinstance(
-                exc, (HourSizeMismatchError, ShortReadError, ValueError)
+                exc, (HourSizeMismatchError, ShortReadError, InvalidHourKeyError)
             ) and not _is_missing(exc):
                 raise
             log.error("failed %s: %s", key, exc)
