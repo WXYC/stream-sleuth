@@ -24,18 +24,15 @@ import pytest
 from evaluation import run as run_mod
 from evaluation import shazam_eval
 from evaluation.clips import ClipAddress, ClipError
+from evaluation.results import MAX_RETRIES, SHAZAMIO_VERSION, ResultStore, recognizer_identity
 from evaluation.shazam_eval import (
     MAX_FAILURE_STREAK,
-    MAX_RETRIES,
-    SHAZAMIO_VERSION,
     CountingClient,
     FutureStateError,
-    ResultStore,
     ShazamOutcome,
     Throttle,
     ThrottleBusyError,
     outcome_from,
-    recognizer_identity,
     require_pinned_shazamio,
     run,
 )

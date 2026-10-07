@@ -125,6 +125,7 @@ def test_real_tree_has_no_s3_write_or_presign_names():
         "evaluation/run.py",
         "evaluation/shazam_eval.py",
         "evaluation/names.py",
+        "evaluation/results.py",
         "evaluation/score.py",
         "evaluation/selection.py",
         "stream_sleuth/loop.py",

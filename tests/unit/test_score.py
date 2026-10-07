@@ -15,9 +15,8 @@ import pytest
 
 from evaluation import score
 from evaluation.clips import ClipAddress, grid
-from evaluation.run import Emission, Leg, Results, read_results
+from evaluation.results import Emission, Leg, Results, ResultStore, read_results
 from evaluation.score import attribute, load_emissions, plays_from, score_plays
-from evaluation.shazam_eval import ResultStore
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 

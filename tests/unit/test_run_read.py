@@ -9,13 +9,21 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress
-from evaluation.run import Emission, read_results, study_identities, to_identification
-from evaluation.shazam_eval import ResultStore, recognizer_identity
+from evaluation.results import (
+    Emission,
+    ResultStore,
+    read_results,
+    recognizer_identity,
+    study_identities,
+    to_identification,
+)
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 HOUR = "2026/08/12/202608121600.mp3"
@@ -161,7 +169,7 @@ def test_the_first_scoring_record_per_key_wins(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, kinds: list[str], emitted: int
 ) -> None:
     store = _store(tmp_path, *(_record(k, song=f"take {i}") for i, k in enumerate(kinds)))
-    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+    with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([store], {SHAZAM})
     assert len(result.emissions) == emitted
     if emitted:
@@ -188,7 +196,7 @@ def test_the_first_scoring_record_wins_across_stores(
     first = _store(tmp_path, _record("matched", song="first store"))
     copy = ResultStore(tmp_path / "copy.jsonl")
     copy.path.write_text(json.dumps(_record(second, song="second store")) + "\n")
-    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+    with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([first, copy], {SHAZAM})
     assert [e.found["song"] for e in result.emissions] == ["first store"]
     assert caplog.text.count("ignored") == 1
@@ -233,7 +241,7 @@ def test_records_under_other_identities_are_counted_in_a_warning(
 ) -> None:
     other = "shazam@9.9.9, segment=12"
     store = _store(tmp_path, _record("matched"), _record("no_match", recognizer=other))
-    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+    with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([store], {SHAZAM})
     assert len(result.emissions) == 1
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
@@ -248,7 +256,7 @@ def test_the_warning_counts_every_record_and_each_identity(
         _record("no_match", recognizer=a, address=f"{HOUR}#{15 * i}+12@128k") for i in range(3)
     ]
     store = _store(tmp_path, _record("matched"), *others, _record("no_match", recognizer=b))
-    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+    with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         read_results([store], {SHAZAM})
     assert "4 record(s)" in caplog.text
     assert f"{a!r}: 3" in caplog.text and f"{b!r}: 1" in caplog.text
@@ -257,7 +265,7 @@ def test_the_warning_counts_every_record_and_each_identity(
 def test_no_warning_when_every_record_is_under_a_requested_identity(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+    with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         read_results([_store(tmp_path, _record("matched"))], {SHAZAM})
     assert caplog.records == []
 
@@ -309,3 +317,14 @@ def test_study_identities_name_every_shazam_segment_and_the_snapshot() -> None:
         *(recognizer_identity(n) for n in CAPTURE_LENGTHS_S),
         olaf_identity("rotation", 12),
     }
+
+
+def test_importing_the_read_side_loads_neither_the_runner_nor_shazam():
+    code = (
+        "import sys, evaluation.results, evaluation.score; "
+        "print(sorted(m for m in ('evaluation.run', 'evaluation.shazam_eval', 'shazamio', 'aiohttp') "
+        "if m in sys.modules))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+
+    assert out.stdout.strip() == "[]"

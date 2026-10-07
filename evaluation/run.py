@@ -19,19 +19,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import shutil
 import sys
-from collections import Counter
 from collections.abc import Callable, Iterable
-from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
 
-from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError, cut, hour_addresses
+from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
 from evaluation.olaf_snapshot import (
     RESULTS,
     SnapshotError,
@@ -40,86 +36,28 @@ from evaluation.olaf_snapshot import (
     snapshot_lock,
 )
 from evaluation.pool import open_pool_db, tag_lookup
-from evaluation.selection import fail, load_selection
+from evaluation.results import LEGS, SOURCES, Leg, ResultStore, require_snapshot, select_legs
+from evaluation.selection import read_hours
 from evaluation.shazam_eval import (
-    SCORING_KINDS,
     CountingClient,
     FutureStateError,
-    Key,
-    ResultStore,
     ShazamOutcome,
     Throttle,
     budget_from_env,
-    recognizer_identity,
     require_pinned_shazamio,
 )
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
-from stream_sleuth.recognizers.base import EvalIdentification, IdentificationSource
+from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT, OlafRecognizer
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
 
 MIN_FREE_BYTES = 5 << 30
-# The recognizer identity's prefix -> the emission's source.
-SOURCES: dict[str, IdentificationSource] = {"shazam": "shazam", "olaf": "local"}
 
 OpenClip = Callable[[ClipAddress], AbstractContextManager[Path]]
 Recognize = Callable[[str], EvalIdentification | None]
-
-
-class Emission(NamedTuple):
-    """One matched record: its store key (address and recognizer identity, so legs at one
-    offset stay distinct), the parsed address (its ``hour_key`` is plays.jsonl's), and the answer."""
-
-    key: Key
-    address: ClipAddress
-    found: EvalIdentification
-
-
-class Results(NamedTuple):
-    """What :func:`read_results` found: the matched answers, the keys with a scoring record
-    (``matched`` or ``no_match``), and the tried-but-unscored keys with their latest kind."""
-
-    emissions: list[Emission]
-    scored: set[Key]
-    uncovered: dict[Key, str]
-
-
-class _Snapshot(ResultStore):
-    """A store's records read once, so ``history()`` and the emissions share one snapshot."""
-
-    def __init__(self, store: ResultStore, records: list[dict[str, Any]]) -> None:
-        self.path, self._records = store.path, records
-
-    def records(self) -> list[dict[str, Any]]:
-        return self._records
-
-
-@dataclass(frozen=True)
-class Leg:
-    """One capture length and codec profile over the ``all`` or ``subset`` hours, per recognizer."""
-
-    name: str
-    length_s: int
-    profile: str
-    hours: str
-    recognizers: tuple[str, ...]
-
-
-# The study's query budget. Shazam runs 12 s on the full corpus, then 6 s, 20 s, and 12 s @320k
-# on the four-hour subset, in that order. Olaf is free, so it runs every length on the full
-# corpus and 12 s @320k on the subset (plan 5.2). The two 12 s Shazam legs file results under
-# one recognizer identity; only the address's @profile tells them apart, so a reader keys on it.
-LEGS = (
-    Leg("12s", 12, "128k", "all", ("shazam", "olaf")),
-    Leg("6s", 6, "128k", "all", ("olaf",)),
-    Leg("20s", 20, "128k", "all", ("olaf",)),
-    Leg("6s-subset", 6, "128k", "subset", ("shazam",)),
-    Leg("20s-subset", 20, "128k", "subset", ("shazam",)),
-    Leg("12s-320k-subset", 12, "320k", "subset", ("shazam", "olaf")),
-)
 
 
 @dataclass(frozen=True)
@@ -214,162 +152,11 @@ def run_legs(
     return report
 
 
-def read_hours(selection: Path) -> dict[str, list[str]]:
-    """The hour keys of ``selection.json``, read once: ``all`` of them, and the ``subset``.
-
-    :func:`~evaluation.selection.load_selection` checks the structure (a hand-edited
-    ``"false"`` would be truthy, and ``hours.txt`` passed by mistake is not JSON); this adds
-    at least one hour in the subset, or the subset legs would report ``done`` having sent
-    nothing. Anything wrong refuses the run with one line naming the file.
-    """
-    hours = load_selection(selection)["hours"]
-    if not (chosen := [key for key, label in hours.items() if label["subset"]]):
-        fail(selection, "no hour with subset: true")
-    return {"all": list(hours), "subset": chosen}
-
-
-def to_identification(record: dict[str, Any]) -> Emission | None:
-    """A matched record as an :class:`Emission`; None for every other kind.
-
-    ``at`` is the address's grid offset. A Shazam answer sets ``query_offset_s = 0`` and
-    ``ref_start_s`` from its stored offset, or neither when it stored none (the two are set
-    together, and that answer is left out of lag estimation); an Olaf answer carries its own.
-    """
-    if record["kind"] != "matched":
-        return None
-    address = ClipAddress.parse(record["address"])
-    source = SOURCES[record["recognizer"].partition("@")[0]]
-    found: EvalIdentification = {
-        "artist": record["artist"],
-        "song": record["song"],
-        "album": record["album"],
-        "label": record["label"],
-        "at": float(address.offset_s),
-        "source": source,
-    }
-    if source == "local":
-        found["confidence"] = record["confidence"]
-        found["query_offset_s"] = record["query_offset_s"]
-        found["ref_start_s"] = record["ref_start_s"]
-        found["ref_key"] = record["ref_key"]
-    elif record["offset_s"] is not None:
-        found["query_offset_s"] = 0.0
-        found["ref_start_s"] = record["offset_s"]
-    return Emission((record["address"], record["recognizer"]), address, found)
-
-
-def study_identities(
-    snapshot: str | None, min_match_count: int = DEFAULT_MIN_MATCH_COUNT
-) -> set[str]:
-    """Every recognizer identity one study scores: each Shazam segment length and the Olaf snapshot.
-
-    With no ``snapshot`` there is no Olaf identity, for a run that scores Shazam alone. The Shazam
-    identities name the pinned shazamio version (``SHAZAMIO_VERSION``), so they match the stored
-    records; :func:`read_results` still warns about records under any other identity.
-    """
-    identities = {recognizer_identity(n) for n in CAPTURE_LENGTHS_S}
-    return identities | {olaf_identity(snapshot, min_match_count)} if snapshot else identities
-
-
-def _line_of(path: Path, address: str) -> int:
-    """The first line of ``path`` whose record has this ``address`` (0 if none), for an error."""
-    for n, line in enumerate(path.read_bytes().split(b"\n"), 1):
-        try:
-            if json.loads(line.decode("utf-8")).get("address") == address:
-                return n
-        except (ValueError, AttributeError):
-            continue
-    return 0
-
-
-def read_results(stores: Iterable[ResultStore], identities: AbstractSet[str]) -> Results:
-    """The matched answers, scored keys, and uncovered keys in the union of ``stores``.
-
-    Only records under ``identities`` are read. Per key the first ``matched`` or ``no_match``
-    record is the answer, in store order; a later scoring record for it is logged and ignored.
-    Scored keys include ``no_match`` ones, so a miss and an address never tried differ. A key is
-    uncovered when it has records but none scoring (a 429, a 5xx, a decode error), and its value
-    is its latest kind: missing data, never a miss. Which addresses were never tried needs the
-    expected grid, which is the scorer's. Each store is read once, so a live run appending
-    meanwhile cannot make its tallies and its emissions disagree.
-
-    A record filed under another identity, such as another match floor or shazamio version, is
-    not read, and a warning counts those per identity, so it never reads as zero coverage. A
-    record whose address does not parse raises ``ValueError`` naming the store and line.
-
-    ``identities`` is a set, never a bare ``str``: ``in`` on a string is a substring test, and
-    Olaf identities nest (``min=1`` is inside ``min=12``), so a string raises ``TypeError``.
-    """
-    if isinstance(identities, str):
-        raise TypeError(f"identities must be a set of identities, not the string {identities!r}")
-    emissions: list[Emission] = []
-    scored: set[Key] = set()
-    tried: dict[Key, str] = {}  # key -> latest kind
-    answered: set[Key] = set()
-    outside: Counter[str] = Counter()
-    for store in stores:
-        records = store.records()
-        store_scored, _, _ = _Snapshot(store, records).history()
-        scored |= {k for k in store_scored if k[1] in identities}
-        for r in records:
-            key = (r["address"], r["recognizer"])
-            if key[1] not in identities:
-                outside[key[1]] += 1
-                continue
-            tried[key] = r["kind"]
-            try:
-                ClipAddress.parse(key[0])
-            except ValueError as e:
-                raise ValueError(f"{store.path}:{_line_of(store.path, key[0])}: {e}") from e
-            if r["kind"] not in SCORING_KINDS:
-                continue
-            if key in answered:
-                log.warning("ignored a later scoring record for %s under %s", *key)
-            else:
-                answered.add(key)
-                emission = to_identification(r)
-                if emission:
-                    emissions.append(emission)
-    uncovered = {k: kind for k, kind in tried.items() if k not in scored}
-    if outside:
-        log.warning(
-            "%d record(s) under identities outside the requested set were not read: %s",
-            sum(outside.values()),
-            dict(outside),
-        )
-    return Results(emissions, scored, uncovered)
-
-
 def preflight(path: Path) -> None:
     """Refuse to start with less than 5 GiB free where ``path`` lives."""
     free = shutil.disk_usage(path).free
     if free < MIN_FREE_BYTES:
         raise SystemExit(f"{path}: {free / 2**30:.1f} GiB free; refusing to start below 5 GiB")
-
-
-def select_legs(
-    parser: argparse.ArgumentParser,
-    only: str | None,
-    names: Iterable[str] | None,
-) -> tuple[list[Leg], bool, bool]:
-    """The legs a run selects, and whether it uses Shazam and Olaf; the parser refuses (exit 2)
-    when none are selected.
-
-    ``only`` is one of :data:`SOURCES` or None for both; ``names`` are leg names or None for all.
-    """
-    use = {only} if only else set(SOURCES)
-    legs = [leg for leg in LEGS if (not names or leg.name in names) and use & set(leg.recognizers)]
-    if not legs:
-        parser.error("no leg is selected: --only and --legs name no leg in common")
-    use_shazam = "shazam" in use and any("shazam" in leg.recognizers for leg in legs)
-    use_olaf = "olaf" in use and any("olaf" in leg.recognizers for leg in legs)
-    return legs, use_shazam, use_olaf
-
-
-def require_snapshot(parser: argparse.ArgumentParser, use_olaf: bool, snapshot: str | None) -> None:
-    """The parser refuses (exit 2) an Olaf leg without a snapshot to query or score."""
-    if use_olaf and not snapshot:
-        parser.error("--snapshot is required for Olaf legs; pass --only shazam to skip them")
 
 
 def main(argv: list[str] | None = None) -> int:

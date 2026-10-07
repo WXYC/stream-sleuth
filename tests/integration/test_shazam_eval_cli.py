@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from evaluation.clips import hour_addresses
-from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, main
+from evaluation.results import MAX_RETRIES
+from evaluation.shazam_eval import Throttle, ThrottleBusyError, main
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.audio import render
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
