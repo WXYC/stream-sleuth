@@ -45,8 +45,8 @@ MIN_TRACKS = 8
 MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
 # Time-of-day bands by the hour's America/New_York start, and the plan §5.2 corpus:
 # 12 high-share and 4 low-share canonical DJ hours per band quota, and 4 contrast
-# hours from 2022-2024, at most one per show and per recurring slot. No talk-hour group: WXYC plays music
-# every hour, and its talkset rows are DJ mic breaks inside music hours.
+# hours from 2022-2024, at most one per show and per recurring slot. No talk-hour group:
+# WXYC plays music every hour, and its talkset rows are DJ mic breaks inside music hours.
 BANDS = {"overnight": range(0, 6), "daytime": range(6, 18), "evening": range(18, 24)}
 HIGH_QUOTAS = {"daytime": 5, "evening": 4, "overnight": 3}
 LOW_QUOTAS = {"daytime": 2, "evening": 1, "overnight": 1}
@@ -294,8 +294,9 @@ class Flowsheet:
         ``by_hour`` holds each hour key's rows; rows in the fall-back hour, which has
         no key, appear only in ``rows``. A show with a legacy row of any entry type
         has two writers (``unreliable``); rows with no show get no label. A show's
-        ``show_slot`` is the Eastern year, weekday and hour of its first track row, the
-        proxy for a recurring program: a weekly show is one ``show_id`` per broadcast.
+        ``show_slot`` is the Eastern year, weekday and hour of its first track row, a
+        proxy for a recurring program (a weekly show is one ``show_id`` per broadcast);
+        a show with no track row has none.
         """
         with open(export_dir / "flowsheet.csv", newline="", encoding="utf-8") as f:
             rows = [
@@ -398,16 +399,18 @@ class Selection:
     """Chosen hour keys -> ``(group, band)`` in selection order, and every shortfall.
 
     Groups are ``canonical-high`` (12), ``canonical-low`` (4) and ``contrast`` (4):
-    20 hours when nothing is short. Contrast hours come from distinct shows and
-    distinct recurring slots: a weekly program is one show per broadcast, so a slot
-    is a show's Eastern year, weekday and start hour. An hour belongs to the show and
-    slot of every track row in it, so an hour spanning two blocks both. This
-    guarantees distinct broadcasts and slots per year, not distinct DJs.
+    20 hours when nothing is short. Contrast hours come from distinct shows
+    (``show_id``, one per broadcast) and distinct recurring slots, where a slot is the
+    Eastern year, weekday and hour of a show's first track row. An hour belongs to the
+    show and slot of every track row in it, so an hour spanning two blocks both. The
+    slot is a proxy for distinct programs, not a guarantee: a program whose first
+    track lands in a neighbouring hour gets a different slot, a program holding the
+    same slot in different years can supply one hour per year, and no DJ is identified.
 
     A ``<group>/<band>`` shortfall was relaxed: filled from the group's other bands.
     A ``contrast/<year>`` shortfall was relaxed too: that year had no eligible hour
-    from an unused show, so its slot went to the next best hour from the other
-    contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
+    from an unused show and slot, so its place went to the next best hour from the
+    other contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
     could not be found at all; the one-per-show and per-slot caps are never relaxed
     to fill one.
     """
