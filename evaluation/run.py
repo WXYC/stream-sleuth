@@ -20,27 +20,37 @@ import json
 import logging
 import shutil
 import sys
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Collection, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
-from evaluation.clips import ClipAddress, cut, hour_addresses
+from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, cut, hour_addresses
 from evaluation.shazam_eval import (
     CountingClient,
     FutureStateError,
+    Key,
     ResultStore,
     Throttle,
     budget_from_env,
     require_pinned_shazamio,
+    recognizer_identity,
 )
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
+from stream_sleuth.recognizers.base import EvalIdentification, IdentificationSource
+from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
+from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
 
 MIN_FREE_BYTES = 5 << 30
+# The recognizer identity's prefix -> the emission's source.
+SOURCES: dict[str, IdentificationSource] = {"shazam": "shazam", "olaf": "local"}
+
+Emission = tuple[str, EvalIdentification]  # the hour key, as in plays.jsonl, and the emission
 
 
 @dataclass(frozen=True)
@@ -130,6 +140,83 @@ def read_hours(selection: Path) -> dict[str, list[str]]:
     if not (chosen := [key for key, label in hours.items() if label["subset"]]):
         fail("no hour with subset: true")
     return {"all": list(hours), "subset": chosen}
+
+
+def to_identification(record: dict[str, Any]) -> Emission | None:
+    """A matched record as ``(hour key, EvalIdentification)``; None for every other kind.
+
+    ``at`` is the address's grid offset. A Shazam answer sets ``query_offset_s = 0`` and
+    ``ref_start_s`` from its stored offset, or neither when it stored none (the two are set
+    together, and that answer is left out of lag estimation); an Olaf answer carries its own.
+    """
+    if record["kind"] != "matched":
+        return None
+    address = ClipAddress.parse(record["address"])
+    source = SOURCES[record["recognizer"].partition("@")[0]]
+    found: EvalIdentification = {
+        "artist": record["artist"],
+        "song": record["song"],
+        "album": record["album"],
+        "label": record["label"],
+        "at": float(address.offset_s),
+        "source": source,
+    }
+    if source == "local":
+        found["confidence"] = record["confidence"]
+        found["query_offset_s"] = record["query_offset_s"]
+        found["ref_start_s"] = record["ref_start_s"]
+        found["ref_key"] = record["ref_key"]
+    elif record["offset_s"] is not None:
+        found["query_offset_s"] = 0.0
+        found["ref_start_s"] = record["offset_s"]
+    return address.hour_key, found
+
+
+def study_identities(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COUNT) -> set[str]:
+    """Every recognizer identity one study scores: each Shazam segment length and the Olaf snapshot.
+
+    The Shazam identities name the *installed* shazamio version, so a lock change makes them
+    stop matching the records already stored; :func:`read_results` warns when that happens.
+    """
+    return {
+        *(recognizer_identity(n) for n in CAPTURE_LENGTHS_S),
+        olaf_identity(snapshot, min_match_count),
+    }
+
+
+def read_results(
+    stores: Iterable[ResultStore], identities: Collection[str]
+) -> tuple[list[Emission], dict[Key, str]]:
+    """The emissions and the uncovered keys in the union of ``stores``, for ``identities`` only.
+
+    A key is uncovered when it has records but none scoring (a 429, a 5xx, a decode error); the
+    value is its latest kind. The scorer reports it as missing data, never as a miss. Which
+    addresses were never tried at all needs the expected grid, which is the scorer's.
+
+    A record filed under another identity, such as another match floor, is not returned, and
+    a warning counts those per identity, so a version mismatch never reads as zero coverage.
+    """
+    emissions: list[Emission] = []
+    uncovered: dict[Key, str] = {}
+    outside: Counter[str] = Counter()
+    for store in stores:
+        records = store.records()  # one read, so the kinds and the emissions agree
+        scored, last, _ = store.history()
+        kinds = {(r["address"], r["recognizer"]): r["kind"] for r in records}  # latest wins
+        uncovered |= {
+            k: kinds[k] for k in last.keys() - scored if k[1] in identities and k in kinds
+        }
+        outside.update(r["recognizer"] for r in records if r["recognizer"] not in identities)
+        emissions += [
+            e for r in records if r["recognizer"] in identities and (e := to_identification(r))
+        ]
+    if outside:
+        log.warning(
+            "%d record(s) under identities outside the requested set were not read: %s",
+            sum(outside.values()),
+            dict(outside),
+        )
+    return emissions, uncovered
 
 
 def preflight(path: Path) -> None:
