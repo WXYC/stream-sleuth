@@ -47,3 +47,17 @@ def load_selection(path: Path) -> dict[str, Any]:
         if not isinstance(label.get("subset"), bool):
             fail(path, f"`hours` entry {key}: subset {label.get('subset')!r} is not a boolean")
     return record
+
+
+def read_hours(selection: Path) -> dict[str, list[str]]:
+    """The hour keys of ``selection.json``, read once: ``all`` of them, and the ``subset``.
+
+    :func:`~evaluation.selection.load_selection` checks the structure (a hand-edited
+    ``"false"`` would be truthy, and ``hours.txt`` passed by mistake is not JSON); this adds
+    at least one hour in the subset, or the subset legs would report ``done`` having sent
+    nothing. Anything wrong refuses the run with one line naming the file.
+    """
+    hours = load_selection(selection)["hours"]
+    if not (chosen := [key for key, label in hours.items() if label["subset"]]):
+        fail(selection, "no hour with subset: true")
+    return {"all": list(hours), "subset": chosen}

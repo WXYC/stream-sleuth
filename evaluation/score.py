@@ -1,13 +1,13 @@
 """Score recognizer emissions against ``plays.jsonl``: attribution, coverage, recall, precision, lag.
 
 Station-neutral. It reads ``plays.jsonl``, the result stores through
-:func:`evaluation.run.read_results`, and replay emissions files in the format ``JsonlOutput``
+:func:`evaluation.results.read_results`, and replay emissions files in the format ``JsonlOutput``
 writes; it never reads a flowsheet or station config, and never imports
 :mod:`evaluation.corpus` or :mod:`evaluation.archive` (the station import scan enforces it). The
 scoring functions touch no database: they take the Olaf references' artist names as an argument,
 and only the CLI's :func:`main` opens the snapshot's own ``pool.db``, read-only, to build them.
 
-Both inputs become :class:`evaluation.run.Emission` (store key, parsed address, identification)
+Both inputs become :class:`evaluation.results.Emission` (store key, parsed address, identification)
 before :func:`attribute`, so attribution, precision, and per-play scores run on one code path;
 only coverage differs (:func:`score_leg` computes a grid leg's, and the replay reports its own).
 An emission is **correct** when :func:`evaluation.names.title_tier` is not None for it and a
@@ -50,19 +50,20 @@ from evaluation import names
 from evaluation.clips import ClipAddress, grid, hour_addresses
 from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir
 from evaluation.pool import open_read_only, reference_artists
-from evaluation.run import (
+from evaluation.results import (
     LEGS,
     SOURCES,
     Emission,
     Leg,
     Results,
-    read_hours,
+    ResultStore,
     read_results,
+    recognizer_identity,
     require_snapshot,
     select_legs,
     study_identities,
 )
-from evaluation.shazam_eval import ResultStore, recognizer_identity
+from evaluation.selection import read_hours
 from stream_sleuth.paths import DataPathError, data_dir, require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT

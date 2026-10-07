@@ -18,9 +18,10 @@ from evaluation import score
 from evaluation.clips import ClipAddress, grid
 from evaluation.olaf_snapshot import RESULTS
 from evaluation.pool import open_pool_db
-from evaluation.run import Emission, OlafOutcome
+from evaluation.results import Emission, ResultStore, recognizer_identity
+from evaluation.run import OlafOutcome
 from evaluation.score import attribute, plays_from
-from evaluation.shazam_eval import ResultStore, ShazamOutcome, recognizer_identity
+from evaluation.shazam_eval import ShazamOutcome
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 from tests.unit.test_score import (
     COCREDIT,

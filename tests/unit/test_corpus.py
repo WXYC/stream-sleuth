@@ -20,7 +20,7 @@ import pytest
 
 from evaluation import corpus, names
 from evaluation.pool import SCHEMA
-from evaluation.run import read_hours
+from evaluation.selection import read_hours
 from stream_sleuth import paths
 from stream_sleuth.paths import CHECKOUT, DataPathError
 

@@ -20,25 +20,17 @@ import pytest
 
 from evaluation import run as run_mod
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError
-from evaluation.run import (
+from evaluation.results import (
     LEGS,
-    main,
-    preflight,
-    read_hours,
+    MAX_RETRIES,
+    ResultStore,
     read_results,
-    run_legs,
-    run_olaf,
+    recognizer_identity,
     study_identities,
 )
-from evaluation.shazam_eval import (
-    MAX_RETRIES,
-    CountingClient,
-    ResultStore,
-    ShazamOutcome,
-    Throttle,
-    budget_from_env,
-    recognizer_identity,
-)
+from evaluation.run import main, preflight, run_legs, run_olaf
+from evaluation.selection import read_hours
+from evaluation.shazam_eval import CountingClient, ShazamOutcome, Throttle, budget_from_env
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT, OlafError
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity

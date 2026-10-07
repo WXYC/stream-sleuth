@@ -31,10 +31,9 @@ import logging
 import os
 import sys
 import time
-from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -47,36 +46,26 @@ from shazamio.interfaces.client import HTTPClientInterface
 
 from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
 from evaluation.envvars import env_number
+from evaluation.results import (
+    SCORING_KINDS,
+    SHAZAMIO_VERSION,
+    STOP_REASONS,
+    Key,
+    ResultStore,
+    recognizer_identity,
+)
 from stream_sleuth.paths import data_dir, require_outside_checkout
 from stream_sleuth.recognizers.shazam import parse
 
 log = logging.getLogger(__name__)
 
-Key = tuple[str, str]  # a clip address and the recognizer identity it was queried with
-SCORING_KINDS = frozenset({"matched", "no_match"})
 # Consecutive non-scoring outcomes that stop the day: a systemic failure other than a
 # 429 or 403 (a changed response shape, a flapping 5xx) would otherwise spend the whole budget.
 MAX_FAILURE_STREAK = 20
-# Retries after an address's first non-scoring outcome; past them it is reported, not queried.
-MAX_RETRIES = 3
-# Statuses that stop the day, with the reason: 429 is load, 403 is access policy. Neither is
-# the address's fault, so neither counts toward its retries.
-STOP_REASONS = {429: "rate_limited", 403: "forbidden"}
 
 
 def _utc(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
-
-
-# The stored recognizer identity names this version, never the installed one: a new version is a
-# new identity, so the whole corpus would be queried again. Change it with the owner's go-ahead;
-# it must equal uv.lock's (a test checks).
-SHAZAMIO_VERSION = "0.8.1"
-
-
-def recognizer_identity(segment_s: int) -> str:
-    """The store's recognizer key: the pinned shazamio version and the fingerprinted length."""
-    return f"shazam@{SHAZAMIO_VERSION}, segment={segment_s}"
 
 
 def require_pinned_shazamio() -> None:
@@ -275,63 +264,6 @@ class CountingClient(HTTPClientInterface):
                     body = None
                 self.last = (resp.status, body if isinstance(body, dict) else None)
         return self.last[1] or {}
-
-
-class ResultStore:
-    """Append-only JSONL of Shazam outcomes keyed by clip address and recognizer identity."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = require_outside_checkout(path)
-
-    def records(self) -> list[dict[str, Any]]:
-        """Every whole record; a line torn by a crash is logged and skipped, never rewritten."""
-        if not self.path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        # Decoded per line, so a crash inside a multibyte character tears only that line.
-        for line in filter(None, self.path.read_bytes().split(b"\n")):
-            try:
-                records.append(json.loads(line.decode("utf-8")))
-            except ValueError:  # includes UnicodeDecodeError
-                log.warning("skipped a torn line in %s: %.60r", self.path, line)
-        return records
-
-    def _ends_mid_line(self) -> bool:
-        try:
-            with open(self.path, "rb") as f:
-                f.seek(-1, os.SEEK_END)
-                return f.read(1) != b"\n"
-        except OSError:  # missing or empty
-            return False
-
-    def history(self) -> tuple[set[Key], dict[Key, int], set[Key]]:
-        """The scored keys, each tried key's latest status (ordered by its latest record), and
-        the exhausted keys: the one tally that ``run`` and the report share.
-
-        A key is exhausted after a first failure and ``MAX_RETRIES`` failed retries, where a
-        failure is a non-scoring outcome that is not a day-stopping status.
-        """
-        scored, last, failures = set[Key](), dict[Key, int](), Counter[Key]()
-        for r in self.records():
-            key = (r["address"], r["recognizer"])
-            last.pop(key, None)  # re-inserted, so ``last`` is ordered by each key's latest record
-            last[key] = r["status"]
-            if r["kind"] in SCORING_KINDS:
-                scored.add(key)
-            elif r["status"] not in STOP_REASONS:
-                failures[key] += 1
-        return scored, last, {key for key, n in failures.items() if n > MAX_RETRIES}
-
-    def append(self, address: str, recognizer: str, outcome: ShazamOutcome) -> None:
-        record = {
-            "address": address,
-            "recognizer": recognizer,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            **asdict(outcome),
-        }
-        lead = "\n" if self._ends_mid_line() else ""  # never glue onto a torn line
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(lead + json.dumps(record, ensure_ascii=False) + "\n")
 
 
 async def run(
