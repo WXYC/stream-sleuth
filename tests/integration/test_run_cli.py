@@ -65,7 +65,9 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key in (HOUR, OTHER):
         path = tmp_path / "data" / "archive" / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        render(path, 20, args=["-c:a", "libmp3lame", "-b:a", "128k"])
+        # 20.5 s, not 20: a 20 s clip at 0 must fit however the MP3 decodes, and a 6 s clip at 15
+        # must not.
+        render(path, 20.5, args=["-c:a", "libmp3lame", "-b:a", "128k"])
     labels = {
         HOUR: {"group": "contrast", "band": "evening", "subset": True},
         OTHER: {"group": "contrast", "band": "evening", "subset": False},
