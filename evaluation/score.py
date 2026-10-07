@@ -24,7 +24,7 @@ Audio without a scoring record is **uncovered**, never a miss: a play counts in 
 every grid address of the leg that starts in its window has a ``matched`` or ``no_match``
 record, and a carryover play is a candidate only, never scored.
 
-``python -m evaluation.score`` scores every leg and writes the score file and the near-miss queue
+``python -m evaluation.score`` scores every selected leg and writes the score file and the near-miss queue
 (:func:`main`); wrong emissions a person should judge are queued, never absorbed.
 """
 
@@ -412,6 +412,7 @@ def score_leg(
 NEAR_MISS_SIMILARITY = 0.8
 RUN_COLUMNS = (
     "leg",
+    "recognizer",
     "address",
     "last_address",
     "emissions",
@@ -422,10 +423,12 @@ RUN_COLUMNS = (
     "artist",
     "song",
     "album",
+    "reference_artists",
 )
 NEAR_COLUMNS = (
     *RUN_COLUMNS,
     "play_id",
+    "play_carryover",
     "play_artist",
     "play_title",
     "play_album",
@@ -453,7 +456,11 @@ PLAY_FIELDS = (
 
 
 def wrong_runs(verdicts: Sequence[Verdict]) -> list[list[Verdict]]:
-    """Runs of consecutive wrong emissions of one song (``distinct_precision``'s key)."""
+    """Runs of consecutive wrong emissions of one song (``distinct_precision``'s song key).
+
+    A run also ends at a correct emission, which ``distinct_precision``'s runs do not: a song run
+    it counts once can contribute more than one wrong run here.
+    """
     groups = groupby(verdicts, lambda v: (v.play is None, _song(v)))
     return [list(run) for (wrong, _), run in groups if wrong]
 
@@ -463,11 +470,13 @@ def _clock(seconds: float) -> str:
 
 
 def run_row(tag: str, run: Sequence[Verdict]) -> dict[str, Any]:
-    """A queue row for a run: leg, first and last clip address, count, and hour-file position."""
+    """A queue row for a run: leg, the identity it was scored under, first and last clip address,
+    count, and hour-file position, with the first emission's metadata."""
     first, last = run[0].emission, run[-1].emission
     f = first.found
     return {
         "leg": tag,
+        "recognizer": first.key[1],
         "address": first.address.key,
         "last_address": last.address.key,
         "emissions": len(run),
@@ -511,8 +520,10 @@ def near_miss(
     run: Sequence[Verdict],
     by_hour: Mapping[str, Sequence[Play]],
     references: Mapping[str, tuple[str, ...]] | None,
-) -> tuple[Play, str] | None:
-    """The play nearest a run of wrong emissions, and why, judged from every emission of the run.
+) -> tuple[Play, str, Emission] | None:
+    """The play nearest a run of wrong emissions, why, and the emission that found it.
+
+    Every emission of the run is judged.
 
     A candidate is a play whose window holds an emission's ``at`` and that shares ``artist`` or
     ``title`` with it (both can hold, as for a version mismatch) under the fuzzy key, else
@@ -527,7 +538,8 @@ def near_miss(
             if p.window_start_s <= f["at"] <= p.window_end_s:
                 fields, similarity = _nearness(p, f, artists)
                 if fields or similarity >= NEAR_MISS_SIMILARITY:
-                    near.append(((len(fields), similarity), p, "+".join(fields) or "similarity"))
+                    label = "+".join(fields) or "similarity"
+                    near.append(((len(fields), similarity), p, label, v.emission))
     return max(near, key=lambda n: n[0])[1:] if near else None
 
 
@@ -545,11 +557,14 @@ def near_miss_rows(
     for tag, ls in legs.items():
         for run in wrong_runs(ls.verdicts):
             if found := near_miss(run, by_hour, references):
-                play, matched_on = found
+                play, matched_on, emission = found
+                tags = references.get(emission.found.get("ref_key", ""), ()) if references else ()
                 rows.append(
                     {
                         **run_row(tag, run),
+                        "reference_artists": " | ".join(tags),
                         "play_id": play.play_id,
+                        "play_carryover": play.carryover,
                         "play_artist": play.artist,
                         "play_title": play.title,
                         "play_album": play.album,
@@ -591,13 +606,14 @@ def check_queue(path: Path, columns: Sequence[str] = NEAR_COLUMNS) -> None:
 
 
 def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
-    """Write a queue as UTF-8 CSV, its header always, so an empty queue still says what it holds.
+    """Write a queue as UTF-8 CSV with a byte-order mark, so a spreadsheet shows diacritics, and
+    its header always, so an empty queue still says what it holds.
 
     A person's work is never overwritten (:func:`check_queue`): the caller writes nothing else.
     """
     check_queue(path, columns)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, columns)
         writer.writeheader()
         writer.writerows(rows)
@@ -697,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         "--legs", nargs="+", choices=[leg.name for leg in LEGS], help="default: all"
     )
     parser.add_argument("--out", type=Path, help="the score file; default: <data>/score/score.json")
-    parser.add_argument("--near-misses", type=Path, help="default: <data>/score/near_misses.csv")
+    parser.add_argument("--near-misses", type=Path, help="default: near_misses.csv beside --out")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
@@ -718,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outside_checkout(args.store or data / "shazam" / "results.jsonl")
         )
         out = require_outside_checkout(args.out or data / "score" / "score.json")
-        near_path = require_outside_checkout(args.near_misses or data / "score" / "near_misses.csv")
+        near_path = require_outside_checkout(args.near_misses or out.parent / "near_misses.csv")
         home = checked_snapshot_dir(snapshot) if snapshot else None
     except (DataPathError, SnapshotError) as refusal:
         raise SystemExit(str(refusal)) from None
