@@ -11,6 +11,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -132,6 +133,9 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "call your name",
         ),
         ("Back, Baby", "back, baby", "back, baby", "back baby"),
+        # Cruft words match whole words only: "(Feathers)" is part of the name.
+        ("Ghost (Feathers)", "ghost (feathers)", "ghost (feathers)", "ghost feathers"),
+        ("Halo (ft. Someone)", "halo (ft. someone)", "halo", "halo"),
         (None, "", "", ""),
         # Letters and digits of any script survive the fuzzy key; diacritics still fold.
         (
@@ -292,17 +296,103 @@ def test_plays_windows_pads_and_carryover(tmp_path: Path, pool_db: Path) -> None
     }  # fmt: skip
 
 
-def test_a_play_without_an_artist_has_unknown_pool_status(tmp_path: Path, pool_db: Path) -> None:
-    export = write_export(tmp_path, [row(1, ts(20, 10), artist="")], "2026-08-09 05:00:43+00")
+def plays_for(
+    tmp_path: Path, pool_db: Path, rows: list[dict[str, object]], hour: str
+) -> list[dict[str, object]]:
+    """Write ``plays.jsonl`` for one hour of a synthetic export and read it back."""
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
     out = tmp_path / "plays.jsonl"
-    corpus.write_plays(
-        out,
-        ["2026/08/12/202608121600.mp3"],
-        corpus.Flowsheet.load(export),
-        corpus.PoolIndex.load(pool_db),
+    corpus.write_plays(out, [hour], corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    return read_plays(out)
+
+
+@pytest.mark.parametrize("artist", ["", "   "])
+def test_a_play_without_an_artist_has_unknown_pool_status(
+    tmp_path: Path, pool_db: Path, artist: str
+) -> None:
+    (play,) = plays_for(
+        tmp_path, pool_db, [row(1, ts(20, 10), artist=artist)], "2026/08/12/202608121600.mp3"
     )
-    (play,) = read_plays(out)
     assert (play["in_pool"], play["pool_match_tier"], play["pool_format"]) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # A legacy-mirrored talkset makes the show two-writer, though no track row is legacy.
+        [
+            row(1, ts(20, 10), play_order=1),
+            row(2, ts(20, 20), "talkset", play_order=2, legacy_entry_id="9001"),
+            row(3, ts(20, 30), play_order=3),
+        ],
+        # Tracks with no show have no play order to check, whatever their play_order says.
+        [
+            row(1, ts(20, 10), show_id="", play_order=2),
+            row(2, ts(20, 30), show_id="", play_order=1),
+        ],
+    ],
+)
+def test_play_order_is_unreliable_beyond_single_writer_track_rows(
+    tmp_path: Path, pool_db: Path, rows: list[dict[str, object]]
+) -> None:
+    plays = plays_for(tmp_path, pool_db, rows, "2026/08/12/202608121600.mp3")
+    assert {(p["play_order_status"], p["reorder_flag"]) for p in plays} == {("unreliable", None)}
+
+
+def test_the_hour_after_fall_back_gets_its_carryover(tmp_path: Path, pool_db: Path) -> None:
+    # 06:58 UTC is 01:58 EST in the repeated 01:00 hour, which has no hour key of its own.
+    rows = [row(1, "2026-11-01 06:58:00+00"), row(2, "2026-11-01 07:10:00+00")]
+    carry, play = plays_for(tmp_path, pool_db, rows, "2026/11/01/202611010200.mp3")
+    assert (carry["play_id"], carry["carryover"], carry["t_offset_s"]) == (1, True, -120.0)
+    assert (play["play_id"], play["carryover"]) == (2, False)
+
+
+def test_an_hour_with_no_rows_is_logged_as_a_warning(
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    plays = plays_for(tmp_path, pool_db, [row(1, ts(20, 10))], "2021/06/01/202106011600.mp3")
+    assert plays == []
+    assert any(
+        r.levelname == "WARNING" and "no flowsheet rows" in r.message for r in caplog.records
+    )
+
+
+def test_a_failed_write_leaves_no_partial_file(
+    tmp_path: Path, pool_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sheet = corpus.Flowsheet.load(
+        write_export(tmp_path, [row(1, ts(20, 10))], "2026-08-09 05:00:43+00")
+    )
+    real_open = open
+
+    class FullDisk:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.f = real_open(*args, **kwargs)
+
+        def __enter__(self) -> FullDisk:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.f.close()
+
+        def writelines(self, lines: list[str]) -> None:
+            self.f.write(lines[0][:10])
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(corpus, "open", FullDisk, raising=False)
+    out = tmp_path / "plays.jsonl"
+    with pytest.raises(OSError, match="No space"):
+        corpus.write_plays(
+            out, ["2026/08/12/202608121600.mp3"], sheet, corpus.PoolIndex.load(pool_db)
+        )
+    assert not out.exists()
+
+
+def test_cli_help_works_without_docstrings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(corpus, "__doc__", None)  # as under python -OO
+    with pytest.raises(SystemExit) as exit_:
+        corpus.main(["--help"])
+    assert exit_.value.code == 0
 
 
 @pytest.mark.parametrize(
