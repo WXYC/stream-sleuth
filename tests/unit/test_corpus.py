@@ -210,29 +210,42 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "back, baby（feat. mix master mike）",
             "back baby",
         ),
-        # An edition word that does not lead the clause, or a full-width bracket, is still an
-        # edition clause: the fuzzy key keeps no "version" for it.
+        # An edition phrase that does not lead the clause is cruft on the exact key too.
         *(
-            (
-                f"Back, Baby ({clause})",
-                f"back, baby ({clause.lower()})",
-                f"back, baby ({clause.lower()})",
-                "back baby",
+            (f"Back, Baby ({clause})", f"back, baby ({clause.lower()})", "back, baby", "back baby")
+            for clause in (
+                "2011 Deluxe Version",
+                "Super Deluxe Version",
+                "Special Version",
+                "2011 Expanded Version",
+                "25th Anniversary Version",
+                "Japan Bonus Track Version",
             )
-            for clause in ("2011 Deluxe Version", "Super Deluxe Version", "Special Version")
         ),
+        # A "with" credit is a featuring clause on every key, whatever words it holds.
+        (
+            "Back, Baby (with Live Skull)",
+            "back, baby (with live skull)",
+            "back, baby",
+            "back baby",
+        ),
+        # A full-width bracket is folded only by the fuzzy key, so the exact key keeps the
+        # clause; the cruft rule runs after the fold there, as the fuzzy key's must.
         (
             "Back, Baby（Deluxe Version）",
             "back, baby(deluxe version)",
             "back, baby（deluxe version）",
             "back baby",
         ),
-        # A "with" credit is a featuring clause, whatever words it holds.
-        (
-            "Back, Baby (with Live Skull)",
-            "back, baby (with live skull)",
-            "back, baby (with live skull)",
-            "back baby",
+        *(
+            (
+                f"Back, Baby{wide[0]}{clause}{wide[1]}",
+                f"back, baby{narrow[0]}{clause.lower()}{narrow[1]}",
+                f"back, baby{wide[0]}{clause.lower()}{wide[1]}",
+                "back baby",
+            )
+            for wide, narrow in (("（）", "()"), ("［］", "[]"))
+            for clause in ("Remastered 2011 Version", "Deluxe Edition Version", "Bonus 2CD Version")
         ),
         # A qualifier is keyed by its stem, so its plural and past forms join it.
         *(
@@ -328,20 +341,17 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
             ("Jessica Pratt", "On Your Own Love Again", f"Back, Baby ({clause})", "exact", "flac")
             for clause in ("Remastered 2011 Version", "feat. Mix Master Mike", "ft. Live Skull")
         ),
-        # So do an edition clause the cruft rule cannot see, and a "with" credit.
-        (
-            "Jessica Pratt",
-            "On Your Own Love Again (2011 Deluxe Version)",
-            "Back, Baby",
-            "fuzzy",
-            "flac",
-        ),
-        (
-            "Jessica Pratt",
-            "On Your Own Love Again（Super Deluxe Version）",
-            "Back, Baby",
-            "fuzzy",
-            "flac",
+        # So do an edition phrase that does not lead its clause, and a "with" credit.
+        *(
+            ("Jessica Pratt", f"On Your Own Love Again ({edition})", "Back, Baby", "exact", "flac")
+            for edition in (
+                "2011 Deluxe Version",
+                "Special Version",
+                "2011 Expanded Version",
+                "25th Anniversary Version",
+                "Japan Bonus Track Version",
+                "with Live Skull",
+            )
         ),
         (
             "Jessica Pratt",
@@ -349,6 +359,32 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
             "Back, Baby (with Live Skull)",
             "exact",
             "flac",
+        ),
+        # A full-width bracket is folded by the fuzzy keys only, so the album joins there; a
+        # play's title joins on the exact album key, which never sees the clause. The fuzzy
+        # key and the qualifiers read each clause after the fold, whichever bracket it has.
+        *(
+            (
+                "Jessica Pratt",
+                f"On Your Own Love Again{wide[0]}{clause}{wide[1]}",
+                "Back, Baby",
+                "fuzzy",
+                "flac",
+            )
+            for wide in ("（）", "［］")
+            for clause in (
+                "Remastered 2011 Version",
+                "Deluxe Edition Version",
+                "Super Deluxe Version",
+            )
+        ),
+        *(
+            ("Jessica Pratt", "On Your Own Love Again", f"Back, Baby（{clause}）", "exact", "flac")
+            for clause in (
+                "Remastered 2011 Version",
+                "Deluxe Edition Version",
+                "Super Deluxe Version",
+            )
         ),
     ],
 )
@@ -404,10 +440,17 @@ def test_pool_index_tiers(
             for clause in (
                 "Deluxe Version, Bonus Track Version, Remastered 2011 Version, "
                 "feat. Mix Master Mike, ft. Live Skull, with Live Skull, 2011 Deluxe Version, "
-                "Super Deluxe Version, Special Version, Expanded Version, Anniversary Version"
+                "Super Deluxe Version, Special Version, Expanded Version, Anniversary Version, "
+                "2011 Expanded Version, 25th Anniversary Version, Japan Bonus Track Version"
             ).split(", ")
         ),
-        ("Back, Baby（Deluxe Version）", "title"),
+        # A full-width clause is read after the fold: "version" beside words that no
+        # same-recording phrase covers is still an edition clause.
+        *(
+            (f"Back, Baby{wide[0]}{clause}{wide[1]}", "title")
+            for wide in ("（）", "［］")
+            for clause in ("Deluxe Version", "Remastered 2011 Version", "Deluxe Edition Version")
+        ),
     ],
 )
 def test_version_qualified_plays_do_not_join_the_studio_title(
@@ -479,10 +522,17 @@ def test_an_album_tier_play_joins_the_first_file_naming_its_version(
 @pytest.mark.parametrize(
     ("pool_album", "pool_title", "play_album", "tier"),
     [
-        # The pool names the version anywhere in its album or title, brackets or not.
+        # The pool names the version in its album anywhere, in its title bracketed or after
+        # a dash.
         ("Live at KEXP", "Back, Baby", "Live at KEXP", "exact"),
         ("Bootleg", "Back, Baby - Live", "Bootleg", "exact"),
         ("Bootleg", "Back, Baby - Live", "Other", "title"),
+        # An en dash, an em dash, or a Unicode hyphen with spaces is a " - " too.
+        *(
+            ("Bootleg", f"Back, Baby {dash} Live", album, tier)
+            for dash in ("\u2010", "\u2013", "\u2014")
+            for album, tier in (("Bootleg", "exact"), ("Other", "title"))
+        ),
         ("Bootleg", "Back, Baby (Live Version)", "Bootleg", "exact"),
         # A same-recording phrase names no version there either.
         ("Bootleg", "Back, Baby - Mono", "Bootleg", None),
@@ -505,9 +555,13 @@ def test_a_pool_file_names_its_version_outside_brackets(
 @pytest.mark.parametrize(
     ("names", "play", "pool"),
     [
-        # The play side reads bracketed clauses only; the pool side reads every word.
+        # The play side reads bracketed clauses only; the pool side reads outside them too.
         (("Live at KEXP", "Back, Baby"), set(), {"live"}),
         (("Bootleg", "Back, Baby - Live"), set(), {"live"}),
+        (("Bootleg", "Back, Baby \u2013 Live"), set(), {"live"}),
+        (("Bootleg", "Back, Baby \u2014 Live"), set(), {"live"}),
+        # A dash without spaces separates no suffix.
+        (("Bootleg", "Back, Baby-Live"), set(), set()),
         # A title's unbracketed words count only after " - "; an album's count anywhere.
         (("Bootleg", "Live Forever"), set(), set()),
         (("Bootleg", "Session 9 - Demo"), set(), {"demo"}),
@@ -520,6 +574,23 @@ def test_a_pool_file_names_its_version_outside_brackets(
         (("Bootleg", "Back, Baby (feat. Mix Master Mike)"), set(), set()),
         (("Bootleg", "Back, Baby (Edited)"), set(), set()),
         (("Bootleg", "Back, Baby - Radio Edit"), set(), set()),
+        # Every edition phrase of SAME_RECORDING names no version, outside brackets as well.
+        *(
+            ((f"Bootleg {phrase}", "Back, Baby"), set(), set())
+            for phrase in (
+                "Deluxe Version",
+                "2011 Expanded Version",
+                "25th Anniversary Version",
+                "Japan Bonus Track Version",
+                "Special Version",
+            )
+        ),
+        (("Bootleg", "Back, Baby {2011 Expanded Version}"), set(), set()),
+        # A credit closed by another bracket kind goes whole, full-width or not.
+        (("Bootleg", "Back, Baby (feat. Live Skull]"), set(), set()),
+        (("Bootleg", "Back, Baby（feat. Live Skull]"), set(), set()),
+        (("Bootleg（feat. Live Skull]", "Back, Baby"), set(), set()),
+        (("Bootleg", "Back, Baby - Demo（feat. Live Skull]"), set(), {"demo"}),
     ],
 )
 def test_qualifiers(names: tuple[str, str], play: set[str], pool: set[str]) -> None:
