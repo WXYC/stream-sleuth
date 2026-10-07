@@ -144,4 +144,5 @@ def test_identification_has_exactly_the_four_wire_keys(shim):
 def test_evaluation_source_vocabulary_is_closed(shim):
     base = load("stream_sleuth.recognizers.base")
 
-    assert typing.get_args(base.Source) == ("shazam", "local")
+    assert typing.get_args(base.IdentificationSource) == ("shazam", "local")
+    assert typing.get_type_hints(base.EvalIdentification)["source"] == base.IdentificationSource
