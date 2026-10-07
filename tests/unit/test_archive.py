@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from moto import mock_aws
@@ -77,18 +78,8 @@ def test_archive_bucket_requires_the_setting(monkeypatch):
 
 
 @pytest.fixture
-def synthetic_archive(monkeypatch, tmp_path_factory):
+def synthetic_archive(monkeypatch, aws_isolated_env):
     """A moto archive bucket, with no real AWS configuration, credentials, or settings visible."""
-    for name in list(os.environ):
-        if name.startswith(("AWS_", "STREAM_SLEUTH_")):
-            monkeypatch.delenv(name)
-    aws_dir = tmp_path_factory.mktemp("aws")
-    for name, path in (("AWS_CONFIG_FILE", "config"), ("AWS_SHARED_CREDENTIALS_FILE", "creds")):
-        (aws_dir / path).write_text("")
-        monkeypatch.setenv(name, str(aws_dir / path))
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("STREAM_SLEUTH_ARCHIVE_BUCKET", BUCKET)
     with mock_aws():
         seed_objects(None, BUCKET, HOURS)
@@ -292,3 +283,10 @@ def test_fetch_all_propagates_errors_that_are_not_about_one_hour(tmp_path, metho
         archive.fetch_all([SUMMER_KEY, WINTER_KEY], archive_dir=tmp_path, client=client)
 
     assert raised.value is error
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+def test_synthetic_archive_builds_on_the_shared_aws_isolation(request, tmp_path_factory):
+    assert "aws_isolated_env" in request.fixturenames
+    config = Path(os.environ["AWS_CONFIG_FILE"])
+    assert config.is_relative_to(tmp_path_factory.getbasetemp())

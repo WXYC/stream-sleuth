@@ -6,6 +6,8 @@ import importlib
 import os
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -43,3 +45,59 @@ def fresh_recognizer(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., 
     # monkeypatch restores only entries that existed before the test, afterwards.
     for name in [n for n in sys.modules if _ours(n)]:
         del sys.modules[name]
+
+
+# Every prefix a test module's own settings could collide with: AWS's, the recognizer's,
+# the harness's, and Backend-Service's names that the pool settings fall back to.
+_ISOLATED_PREFIXES = ("AWS_", "WXDU_", "STREAM_SLEUTH_", "DIGITAL_ARCHIVE_STORE_")
+
+
+@dataclass(frozen=True)
+class AwsEnv:
+    """What ``aws_isolated_env`` set up, for module fixtures that add to it."""
+
+    config: Path
+    credentials: Path
+    _monkeypatch: pytest.MonkeyPatch
+
+    def allow_custom_endpoints(self, *endpoints: str) -> None:
+        """Register non-AWS endpoints with moto.
+
+        Without this, moto passes an unrecognized host through to a real request.
+        """
+        self._monkeypatch.setenv("MOTO_S3_CUSTOM_ENDPOINTS", ",".join(endpoints))
+
+
+@pytest.fixture
+def aws_isolated_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> AwsEnv:
+    """Cut a test off from the developer's real AWS setup, for moto to answer.
+
+    Deletes every ``AWS_*``, ``WXDU_*``, ``STREAM_SLEUTH_*`` and
+    ``DIGITAL_ARCHIVE_STORE_*`` variable. Purging ``AWS_*`` alone removes
+    ``AWS_PROFILE`` but leaves ``~/.aws/config`` and ``~/.aws/credentials`` in
+    play, so a ``[default]`` section's region, ``s3`` settings or ``endpoint_url``
+    would reach the test; this points ``AWS_CONFIG_FILE`` and
+    ``AWS_SHARED_CREDENTIALS_FILE`` at empty files in a temp directory instead,
+    and sets fake keys and ``AWS_DEFAULT_REGION``. The files live outside
+    ``tmp_path`` so a test that lists its own ``tmp_path`` does not see them.
+
+    A module fixture builds on this and adds only its own settings; a profile
+    goes in the returned files, and non-AWS endpoints go through
+    :meth:`AwsEnv.allow_custom_endpoints`. This sets environment variables and
+    writes files only, so it imports no ``boto3``, ``botocore`` or ``s3transfer``
+    and the import scan's exemptions are unchanged.
+    """
+    for name in [n for n in os.environ if n.startswith(_ISOLATED_PREFIXES)]:
+        monkeypatch.delenv(name)
+    aws_dir = tmp_path_factory.mktemp("aws")
+    config, credentials = aws_dir / "config", aws_dir / "credentials"
+    config.write_text("")
+    credentials.write_text("")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    return AwsEnv(config, credentials, monkeypatch)

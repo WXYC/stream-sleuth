@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+from pathlib import Path
 
 import boto3
 import pytest
@@ -30,24 +31,13 @@ POOL_ENDPOINT = "https://pool.example.test"
 
 
 @pytest.fixture(autouse=True)
-def isolated_aws(monkeypatch, tmp_path):
-    """No test may see real AWS configuration, real credentials, or real settings."""
-    for name in list(os.environ):
-        if name.startswith(("AWS_", "WXDU_", "STREAM_SLEUTH_", "DIGITAL_ARCHIVE_STORE_")):
-            monkeypatch.delenv(name)
-    config = tmp_path / "config"
-    config.write_text("[profile synthetic-archive]\nregion = us-east-1\n")
-    credentials = tmp_path / "credentials"
-    credentials.write_text(
+def isolated_aws(aws_isolated_env):
+    """The shared isolation, plus a ``synthetic-archive`` profile and the pool endpoint."""
+    aws_isolated_env.config.write_text("[profile synthetic-archive]\nregion = us-east-1\n")
+    aws_isolated_env.credentials.write_text(
         "[synthetic-archive]\naws_access_key_id = testing\naws_secret_access_key = testing\n"
     )
-    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials))
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    # Without this, moto passes an unrecognized host through to a real request.
-    monkeypatch.setenv("MOTO_S3_CUSTOM_ENDPOINTS", POOL_ENDPOINT)
+    aws_isolated_env.allow_custom_endpoints(POOL_ENDPOINT)
 
 
 def _archive(monkeypatch):
@@ -200,3 +190,9 @@ def test_a_missing_pool_setting_names_both_variables(monkeypatch):
     message = str(excinfo.value)
     assert "STREAM_SLEUTH_POOL_ENDPOINT" in message
     assert "DIGITAL_ARCHIVE_STORE_AZURACAST_ENDPOINT" in message
+
+
+def test_isolated_aws_builds_on_the_shared_aws_isolation(request, tmp_path_factory):
+    assert "aws_isolated_env" in request.fixturenames
+    config = Path(os.environ["AWS_CONFIG_FILE"])
+    assert config.is_relative_to(tmp_path_factory.getbasetemp())
