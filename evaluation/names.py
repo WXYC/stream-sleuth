@@ -19,20 +19,6 @@ _CRUFT = re.compile(
     r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
-# An unbracketed featuring credit: "feat." (with the period) or "featuring" after some text,
-# with a word after it, and the words that follow. A bare "feat" is a word ("Little Feat"), and
-# "with" is a title word. "ft." is not handled here: the pool carries it inline nowhere, and it
-# is feet and Fort as often as featuring ("Six Ft. Under", "Ft. Worth"); the bracketed rule
-# still drops "(ft. X)". The credit stops before any bracket, opening or closing, ASCII or
-# full-width (the exact keys are not folded), and before a spaced hyphen, en dash or em dash,
-# so a clause or suffix that follows it, or holds it, is still there for the version rules.
-_CLOSERS = ")]}\uff09\uff3d\uff5d"
-_BRACKETS = re.escape("([{\uff08\uff3b\uff5b" + _CLOSERS)
-_CREDIT = re.compile(
-    rf"(?<=\S)\s+(?:feat\.|featuring\b)\s+(?=\w)"
-    rf"[^{_BRACKETS}]*?(?=\s[-\u2010-\u2015]\s|[{_BRACKETS}]|$)",
-    re.IGNORECASE,
-)
 # A dotted initialism: two or more single letters, each followed by a period but the last,
 # whose period is optional. A letter inside a longer word, or beside a digit, is no initial;
 # an underscore is a separator, as in the keys, so it is no part of a word here.
@@ -44,6 +30,24 @@ _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 # "version" counts only alone: "(Live Version)" names what "(Live)" names.
 VERSION_QUALIFIERS = frozenset(
     "live remix mix demo edit version acoustic instrumental session rehearsal".split()
+)
+# An unbracketed featuring credit: "feat." (with the period) or "featuring" after some text,
+# with a word after it, and the words that follow. A bare "feat" is a word ("Little Feat"), and
+# "with" is a title word. "ft." is not handled here: the pool carries it inline nowhere, and it
+# is feet and Fort as often as featuring ("Six Ft. Under", "Ft. Worth"); the bracketed rule
+# still drops "(ft. X)". A credit never swallows a version, so it stops before any bracket,
+# opening or closing (ASCII, full-width, or CJK: the exact keys are not folded), a comma,
+# semicolon, colon, slash, or spaced hyphen, en dash or em dash, and before a whole
+# VERSION_QUALIFIERS word, plural and past forms included, however it is separated ("feat. X
+# Remix", "feat. X -Live"); a credit that opens with one ("feat. Live Skull") is left whole.
+_CLOSERS = ")]}\uff09\uff3d\uff5d\u3011\u300d\u300f\u3015"
+_TIGHT = ",;:" + _CLOSERS
+_STOPS = re.escape("([{\uff08\uff3b\uff5b\u3010\u300c\u300e\u3014/" + _TIGHT)
+_VERSIONED = rf"(?:{'|'.join(sorted(VERSION_QUALIFIERS))})(?:e?s|ed)?\b"
+_CREDIT = re.compile(
+    rf"(?<=\S)\s+(?:feat\.|featuring\b)\s+(?=\w)(?!{_VERSIONED})"
+    rf"[^{_STOPS}]*?(?=\s[-\u2010-\u2015]\s|[{_STOPS}]|\W+{_VERSIONED}|$)",
+    re.IGNORECASE,
 )
 # Phrases naming the same recording, removed from a clause before qualifiers are looked for.
 # Phrases come before the bare words, so "clean version" goes whole.
@@ -109,7 +113,8 @@ def album_key(s: str | None) -> str:
         return m.group() if stems & (VERSION_QUALIFIERS - {"version"}) else ""
 
     def drop_credit(m: re.Match[str]) -> str:
-        return "" if m.string[m.end() : m.end() + 1] in tuple(_CLOSERS) else " "
+        after = m.string[m.end() : m.end() + 1]
+        return "" if after.isspace() or after in tuple(_TIGHT) else " "
 
     return " ".join(
         _CREDIT.sub(drop_credit, _CRUFT.sub(drop_unless_version, (s or "").lower())).split()

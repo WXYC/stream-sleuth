@@ -180,6 +180,10 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
 
 
 DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
+ASCII_AND_WIDE = [
+    tuple(p) for p in ("()", "[]", "{}", "\uff08\uff09", "\uff3b\uff3d", "\uff5b\uff5d")
+]
+CJK = [tuple(p) for p in ("\u3010\u3011", "\u300c\u300d", "\u300e\u300f", "\u3014\u3015")]
 
 
 @pytest.mark.parametrize(
@@ -196,7 +200,6 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
         ("Juana Molina feat. Jessica Pratt", "juana molina", "juana molina"),
         ("Song 2 feat. Jessica Pratt", "song 2", "song 2"),
         ("Hibiscus feat. Jay-Z", "hibiscus", "hibiscus"),
-        ("Hibiscus feat. Bbyafricka -Live", "hibiscus", "hibiscus"),
         # A credit needs a period ("feat" alone is a word), a word after it, and text before
         # it. "ft." is no inline credit at all: it is feet and Fort as often as featuring.
         ("Hibiscus ft. Bbyafricka", "hibiscus ft. bbyafricka", "hibiscus ft bbyafricka"),
@@ -224,7 +227,61 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
         ("Ghost Feather Boa", "ghost feather boa", "ghost feather boa"),
         # The credit never swallows a version qualifier that follows it: a bracketed clause
         # of any kind or a spaced-dash suffix is kept (and read as one), the other clauses go
-        # as before.
+        # as before. So does anything after a comma, semicolon, colon or slash.
+        ("Hibiscus feat. Bbyafricka -Live", "hibiscus -live", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka - Y", "hibiscus - y", "hibiscus y"),
+        ("Hibiscus feat. Bbyafricka- Y", "hibiscus", "hibiscus"),
+        ("Hibiscus feat. Jay-Z - Y", "hibiscus - y", "hibiscus y"),
+        ("Hibiscus feat. Bbyafricka, Y", "hibiscus, y", "hibiscus y"),
+        ("Hibiscus feat. Bbyafricka; Y", "hibiscus; y", "hibiscus y"),
+        ("Hibiscus feat. Bbyafricka: Y", "hibiscus: y", "hibiscus y"),
+        ("Hibiscus feat. Bbyafricka / Y", "hibiscus / y", "hibiscus y"),
+        # ...and so does a version word, plural and past forms included, wherever it sits.
+        ("Hibiscus feat. Bbyafricka Remix", "hibiscus remix", "hibiscus remix"),
+        ("Hibiscus Featuring Bbyafricka Remixes", "hibiscus remixes", "hibiscus remixes"),
+        ("Hibiscus feat. Bbyafricka Remixed", "hibiscus remixed", "hibiscus remixed"),
+        (
+            "Hibiscus feat. Bbyafricka Live Version",
+            "hibiscus live version",
+            "hibiscus live version",
+        ),
+        (
+            "Hibiscus feat. Bbyafricka, Live at KEXP",
+            "hibiscus, live at kexp",
+            "hibiscus live at kexp",
+        ),
+        (
+            "Hibiscus feat. Bbyafricka: Live in Tokyo",
+            "hibiscus: live in tokyo",
+            "hibiscus live in tokyo",
+        ),
+        ("Hibiscus feat. Bbyafricka / Demo", "hibiscus / demo", "hibiscus demo"),
+        ("Hibiscus feat. Bbyafricka \u2212 Remix", "hibiscus \u2212 remix", "hibiscus remix"),
+        ("Hibiscus feat. Live Skull", "hibiscus feat. live skull", "hibiscus feat live skull"),
+        (
+            "Hibiscus feat. Mix Master Mike",
+            "hibiscus feat. mix master mike",
+            "hibiscus feat mix master mike",
+        ),
+        # A leading space is no text before the word, so a leading credit word stays a word.
+        (" Featuring Ourselves", "featuring ourselves", "featuring ourselves"),
+        ("Hibiscus [Live feat. Bbyafricka]", "hibiscus [live]", "hibiscus live"),
+        # Every bracket kind stops a credit and closes one, spaced from it or not: the exact
+        # keys see full-width and CJK brackets unfolded.
+        *(
+            (f"Hibiscus feat. Bbyafricka{o}Y{c}", f"hibiscus {o}y{c}", "hibiscus")
+            for o, c in ASCII_AND_WIDE
+        ),
+        *((f"Hibiscus feat. Bbyafricka{o}Y{c}", f"hibiscus {o}y{c}", "hibiscus y") for o, c in CJK),
+        *(
+            (f"Hibiscus {o}Y feat. Bbyafricka{c}", f"hibiscus {o}y{c}", "hibiscus")
+            for o, c in ASCII_AND_WIDE
+        ),
+        *(
+            (f"Hibiscus {o}Y feat. Bbyafricka{c}", f"hibiscus {o}y{c}", "hibiscus y")
+            for o, c in CJK
+        ),
+        *((f"Hibiscus feat. Bbyafricka {d} Y", f"hibiscus {d} y", "hibiscus y") for d in DASHES),
         ("Hibiscus feat. Bbyafricka (Live)", "hibiscus (live)", "hibiscus live"),
         ("Hibiscus feat. Bbyafricka [Demo]", "hibiscus [demo]", "hibiscus demo"),
         ("Hibiscus feat. Bbyafricka {Live}", "hibiscus {live}", "hibiscus live"),
@@ -253,13 +310,10 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
             "hibiscus live ft bbyafricka",
         ),
         ("Hibiscus {Live featuring Bbyafricka}", "hibiscus {live}", "hibiscus live"),
-        # The edition rule judges a clause before the credit is cut from it: the clause is kept
-        # whole (its "Live Skull" a version word) and then loses the credit, on the exact key.
-        (
-            "Hibiscus (Remastered 2011 feat. Live Skull)",
-            "hibiscus (remastered 2011)",
-            "hibiscus",
-        ),
+        # The edition rule judges a clause before the credit is cut from it: "special version"
+        # is no edition phrase until the credit is gone, so the clause is kept whole and then
+        # loses the credit, on the exact key.
+        ("Hibiscus (Special feat. Bbyafricka Version)", "hibiscus (special version)", "hibiscus"),
         ("Hibiscus (Live feat. Bbyafricka) (Demo)", "hibiscus (live) (demo)", "hibiscus live demo"),
         ("Hibiscus（Live feat. Bbyafricka）", "hibiscus（live）", "hibiscus live"),
     ],
@@ -293,6 +347,15 @@ def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
         ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka - Live", "fuzzy"),
         ("Hibiscus feat. Bbyafricka - Live", "Hibiscus (Live)", "fuzzy"),
         ("Hibiscus feat. Bbyafricka (Demo)", "Hibiscus feat. Bbyafricka (Live)", None),
+        # A credit never swallows a version word: none of these joins the plain title.
+        ("Hibiscus", "Hibiscus feat. Bbyafricka Remix", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka, Live at KEXP", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka\u3010Live\u3011", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka: Live in Tokyo", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka -Live", None),
+        ("Hibiscus feat. Bbyafricka Remix", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka", "Hibiscus", "exact"),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka", "exact"),
         # ...also in full-width brackets, whose exact key is not folded.
         ("Hibiscus", "Hibiscus feat. Bbyafricka（Live）", None),
         ("Hibiscus feat. Bbyafricka（Live）", "Hibiscus", None),
