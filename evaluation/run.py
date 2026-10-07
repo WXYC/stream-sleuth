@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from evaluation.clips import ClipAddress, cut, hour_addresses
 from evaluation.shazam_eval import (
@@ -98,18 +99,36 @@ def run_legs(
 def read_hours(selection: Path) -> dict[str, list[str]]:
     """The hour keys of ``selection.json``, read once: ``all`` of them, and the ``subset``.
 
-    ``hours`` must be an object keyed by hour (so every key is a string), and each hour's
-    ``subset`` a JSON boolean; anything else, such as a hand-edited ``"false"``, which
-    would be truthy, refuses the run with one line naming the file and the hour.
+    The file must be a JSON object whose ``hours`` is a non-empty object keyed by hour (so
+    every key is a string), each hour's ``subset`` a JSON boolean, and at least one hour in
+    the subset, or the subset legs would report ``done`` having sent nothing. Anything else,
+    such as a hand-edited ``"false"``, which would be truthy, or ``hours.txt`` passed by
+    mistake, refuses the run with one line naming the file (and the hour, when one is at fault).
     """
-    hours = json.loads(selection.read_text(encoding="utf-8")).get("hours")
+
+    def fail(problem: str) -> NoReturn:
+        raise SystemExit(f"{selection}: {problem}")
+
+    try:
+        record = json.loads(selection.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        fail(f"cannot read: {e}")
+    except json.JSONDecodeError as e:
+        fail(f"not JSON ({e}); pass the selection.json that `select` wrote")
+    if not isinstance(record, dict):
+        fail("not an object")
+    hours = record.get("hours")
     if not isinstance(hours, dict):
-        raise SystemExit(f"{selection}: hours must be an object keyed by hour")
+        fail("hours must be an object keyed by hour")
+    if not hours:
+        fail("no hours")
     for key, label in hours.items():
         subset = label.get("subset") if isinstance(label, dict) else None
         if not isinstance(subset, bool):
-            raise SystemExit(f"{selection}: hour {key}: subset must be true or false")
-    return {"all": list(hours), "subset": [key for key, label in hours.items() if label["subset"]]}
+            fail(f"hour {key}: subset must be true or false")
+    if not (chosen := [key for key, label in hours.items() if label["subset"]]):
+        fail("no hour with subset: true")
+    return {"all": list(hours), "subset": chosen}
 
 
 def preflight(path: Path) -> None:

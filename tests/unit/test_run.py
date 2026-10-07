@@ -118,6 +118,28 @@ def test_a_selection_without_a_boolean_subset_per_hour_is_refused_naming_it(
     assert str(path) in str(refusal.value)
 
 
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        (None, "cannot read"),  # no file at all
+        (f"{HOUR}\n{OTHER}\n", "not JSON"),  # hours.txt passed by mistake
+        (json.dumps([{"hours": {}}]), "not an object"),
+        (json.dumps({"hours": {}}), "no hours"),  # the subset legs would be done with 0 requests
+        (json.dumps({"hours": {HOUR: {"subset": False}}}), "no hour with subset: true"),
+    ],
+)
+def test_a_selection_that_cannot_drive_the_legs_is_refused_in_one_line(
+    tmp_path: Path, text: str | None, problem: str
+) -> None:
+    path = tmp_path / "selection.json"
+    if text is not None:
+        path.write_text(text)
+    with pytest.raises(SystemExit) as refusal:
+        read_hours(path)
+    message = str(refusal.value)
+    assert message.startswith(f"{path}: ") and problem in message and "\n" not in message
+
+
 def test_two_shazam_legs_share_one_throttle(tmp_path: Path, shazam) -> None:
     setup = shazam([json_response(200, NO_MATCH)] * 6)
     report = run_legs(legs("12s", "6s-subset"), HOURS, tmp_path, tmp_path, *setup[:2])
