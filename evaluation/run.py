@@ -25,10 +25,11 @@ from collections.abc import Collection, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, cut, hour_addresses
 from evaluation.shazam_eval import (
+    SCORING_KINDS,
     CountingClient,
     FutureStateError,
     Key,
@@ -50,7 +51,33 @@ MIN_FREE_BYTES = 5 << 30
 # The recognizer identity's prefix -> the emission's source.
 SOURCES: dict[str, IdentificationSource] = {"shazam": "shazam", "olaf": "local"}
 
-Emission = tuple[str, EvalIdentification]  # the hour key, as in plays.jsonl, and the emission
+
+class Emission(NamedTuple):
+    """One matched record: its store key (address and recognizer identity, so legs at one
+    offset stay distinct), the parsed address (its ``hour_key`` is plays.jsonl's), and the answer."""
+
+    key: Key
+    address: ClipAddress
+    found: EvalIdentification
+
+
+class Results(NamedTuple):
+    """What :func:`read_results` found: the matched answers, the keys with a scoring record
+    (``matched`` or ``no_match``), and the tried-but-unscored keys with their latest kind."""
+
+    emissions: list[Emission]
+    scored: set[Key]
+    uncovered: dict[Key, str]
+
+
+class _Snapshot(ResultStore):
+    """A store's records read once, so ``history()`` and the emissions share one snapshot."""
+
+    def __init__(self, store: ResultStore, records: list[dict[str, Any]]) -> None:
+        self.path, self._records = store.path, records
+
+    def records(self) -> list[dict[str, Any]]:
+        return self._records
 
 
 @dataclass(frozen=True)
@@ -143,7 +170,7 @@ def read_hours(selection: Path) -> dict[str, list[str]]:
 
 
 def to_identification(record: dict[str, Any]) -> Emission | None:
-    """A matched record as ``(hour key, EvalIdentification)``; None for every other kind.
+    """A matched record as an :class:`Emission`; None for every other kind.
 
     ``at`` is the address's grid offset. A Shazam answer sets ``query_offset_s = 0`` and
     ``ref_start_s`` from its stored offset, or neither when it stored none (the two are set
@@ -169,7 +196,7 @@ def to_identification(record: dict[str, Any]) -> Emission | None:
     elif record["offset_s"] is not None:
         found["query_offset_s"] = 0.0
         found["ref_start_s"] = record["offset_s"]
-    return address.hour_key, found
+    return Emission((record["address"], record["recognizer"]), address, found)
 
 
 def study_identities(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COUNT) -> set[str]:
@@ -184,39 +211,68 @@ def study_identities(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COU
     }
 
 
-def read_results(
-    stores: Iterable[ResultStore], identities: Collection[str]
-) -> tuple[list[Emission], dict[Key, str]]:
-    """The emissions and the uncovered keys in the union of ``stores``, for ``identities`` only.
+def _line_of(path: Path, address: str) -> int:
+    """The first line of ``path`` whose record has this ``address`` (0 if none), for an error."""
+    for n, line in enumerate(path.read_bytes().split(b"\n"), 1):
+        try:
+            if json.loads(line.decode("utf-8")).get("address") == address:
+                return n
+        except (ValueError, AttributeError):
+            continue
+    return 0
 
-    A key is uncovered when it has records but none scoring (a 429, a 5xx, a decode error); the
-    value is its latest kind. The scorer reports it as missing data, never as a miss. Which
-    addresses were never tried at all needs the expected grid, which is the scorer's.
 
-    A record filed under another identity, such as another match floor, is not returned, and
-    a warning counts those per identity, so a version mismatch never reads as zero coverage.
+def read_results(stores: Iterable[ResultStore], identities: Collection[str]) -> Results:
+    """The matched answers, scored keys, and uncovered keys in the union of ``stores``.
+
+    Only records under ``identities`` are read. Per key the first ``matched`` or ``no_match``
+    record is the answer, in store order; a later scoring record for it is logged and ignored.
+    Scored keys include ``no_match`` ones, so a miss and an address never tried differ. A key is
+    uncovered when it has records but none scoring (a 429, a 5xx, a decode error), and its value
+    is its latest kind: missing data, never a miss. Which addresses were never tried needs the
+    expected grid, which is the scorer's. Each store is read once, so a live run appending
+    meanwhile cannot make its tallies and its emissions disagree.
+
+    A record filed under another identity, such as another match floor or shazamio version, is
+    not read, and a warning counts those per identity, so it never reads as zero coverage. A
+    record whose address does not parse raises ``ValueError`` naming the store and line.
     """
     emissions: list[Emission] = []
-    uncovered: dict[Key, str] = {}
+    scored: set[Key] = set()
+    tried: dict[Key, str] = {}  # key -> latest kind
+    answered: set[Key] = set()
     outside: Counter[str] = Counter()
     for store in stores:
-        records = store.records()  # one read, so the kinds and the emissions agree
-        scored, last, _ = store.history()
-        kinds = {(r["address"], r["recognizer"]): r["kind"] for r in records}  # latest wins
-        uncovered |= {
-            k: kinds[k] for k in last.keys() - scored if k[1] in identities and k in kinds
-        }
-        outside.update(r["recognizer"] for r in records if r["recognizer"] not in identities)
-        emissions += [
-            e for r in records if r["recognizer"] in identities and (e := to_identification(r))
-        ]
+        records = store.records()
+        store_scored, _, _ = _Snapshot(store, records).history()
+        scored |= {k for k in store_scored if k[1] in identities}
+        for r in records:
+            key = (r["address"], r["recognizer"])
+            if key[1] not in identities:
+                outside[key[1]] += 1
+                continue
+            tried[key] = r["kind"]
+            try:
+                ClipAddress.parse(key[0])
+            except ValueError as e:
+                raise ValueError(f"{store.path}:{_line_of(store.path, key[0])}: {e}") from e
+            if r["kind"] not in SCORING_KINDS:
+                continue
+            if key in answered:
+                log.warning("ignored a later scoring record for %s under %s", *key)
+            else:
+                answered.add(key)
+                emission = to_identification(r)
+                if emission:
+                    emissions.append(emission)
+    uncovered = {k: kind for k, kind in tried.items() if k not in scored}
     if outside:
         log.warning(
             "%d record(s) under identities outside the requested set were not read: %s",
             sum(outside.values()),
             dict(outside),
         )
-    return emissions, uncovered
+    return Results(emissions, scored, uncovered)
 
 
 def preflight(path: Path) -> None:
