@@ -61,10 +61,27 @@ _CRUFT = re.compile(
     re.IGNORECASE,
 )
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
-# A bracketed clause with one of these whole words names a different recording, so the fuzzy key keeps it.
+# A bracketed clause with one of these whole words, or its plural or past form, names a
+# different recording: a version clause, which the keys keep and every tier honors.
 VERSION_QUALIFIERS = frozenset(
     "live remix mix demo edit version acoustic instrumental session rehearsal".split()
 )
+# Phrases naming the same recording, removed from a clause before qualifiers are looked for.
+SAME_RECORDING = re.compile(
+    r"\b(?:(?:radio|single|fcc|clean) edit|(?:album|single|mono|stereo|remaster(?:ed)?) version"
+    r"|(?:original|mono|stereo) mix|remaster(?:ed)?|mono|stereo)\b"
+)
+
+
+def _stem(word: str) -> str:
+    """``word`` less a plural or past suffix: "remixes" and "remixed" are "remix"."""
+    return re.sub(r"(?:e?s|ed)$", "", word)
+
+
+def _version_words(clause: str) -> list[str]:
+    """A version clause's words, split as the key splits, less same-recording phrases; else []."""
+    words = SAME_RECORDING.sub(" ", " ".join(re.split(r"[\W_]+", clause))).split()
+    return words if any(_stem(w) in VERSION_QUALIFIERS for w in words) else []
 
 
 def parse_add_time(text: str) -> datetime:
@@ -102,8 +119,12 @@ def fold(s: str | None) -> str:
 
 
 def album_key(s: str | None) -> str:
-    """Lowercase, drop featuring and edition cruft, collapse whitespace."""
-    return " ".join(_CRUFT.sub("", (s or "").lower()).split())
+    """Lowercase, drop featuring and edition cruft but not a version clause, collapse whitespace."""
+
+    def drop_unless_version(m: re.Match[str]) -> str:
+        return m.group() if _version_words(m.group()) else ""
+
+    return " ".join(_CRUFT.sub(drop_unless_version, (s or "").lower()).split())
 
 
 def fuzzy(s: str | None) -> str:
@@ -111,7 +132,7 @@ def fuzzy(s: str | None) -> str:
 
     ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
     full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
-    A clause with a :data:`VERSION_QUALIFIERS` word is kept, its words in the key, so
+    A version clause is kept, its words less :data:`SAME_RECORDING` phrases in the key, so
     "Back, Baby (Live)" never joins the studio "Back, Baby". Letters and digits of every
     script outside brackets survive (a Japanese or Cyrillic name keeps a real key); a
     name that is all brackets keys to "" and never joins on this tier. Underscores and
@@ -119,29 +140,37 @@ def fuzzy(s: str | None) -> str:
     """
 
     def drop_unless_version(m: re.Match[str]) -> str:
-        return m.group() if VERSION_QUALIFIERS.intersection(re.findall(r"\w+", m.group())) else " "
+        return f" {' '.join(_version_words(m.group()))} "
 
     return " ".join(
         re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, fold(album_key(s)))).split()
     )
 
 
+def qualifiers(*names: str | None) -> frozenset[str]:
+    """The stemmed qualifiers in the version clauses of ``names``: the recording they name."""
+    clauses = [c for s in names for c in _BRACKETED.findall(fold(album_key(s)))]
+    return frozenset(_stem(w) for c in clauses for w in _version_words(c)) & VERSION_QUALIFIERS
+
+
 Key = tuple[str, str]
 FileRef = tuple[str, str]  # (files.key, files.format)
+Entry = tuple[FileRef, frozenset[str]]  # a file and the qualifiers of its album and title
 
 
 @dataclass
 class PoolIndex:
     """Join keys over ``pool.db``'s indexed files, by tier (plan §5.1).
 
-    Each key maps to the first indexed file by ``files.key`` that has it. A key with
-    an empty part (a missing tag, or a name that normalizes to nothing) never joins.
+    Each key maps to its indexed files in ``files.key`` order, each with the qualifiers
+    its album and title name. A key with an empty part (a missing tag, or a name that
+    normalizes to nothing) never joins.
     """
 
-    album: dict[Key, FileRef] = field(default_factory=dict)
-    album_fuzzy: dict[Key, FileRef] = field(default_factory=dict)
-    title: dict[Key, FileRef] = field(default_factory=dict)
-    title_fuzzy: dict[Key, FileRef] = field(default_factory=dict)
+    album: dict[Key, list[Entry]] = field(default_factory=dict)
+    album_fuzzy: dict[Key, list[Entry]] = field(default_factory=dict)
+    title: dict[Key, list[Entry]] = field(default_factory=dict)
+    title_fuzzy: dict[Key, list[Entry]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, pool_db: Path) -> PoolIndex:
@@ -156,14 +185,15 @@ class PoolIndex:
         finally:
             db.close()
         for key, fmt, artist, album_artist, album, title in rows:
+            entry = ((key, fmt), qualifiers(album, title))
             for a in {artist, album_artist} - {None, ""}:
                 for _, keys, k in index._keys(a, album, title):
-                    keys.setdefault(k, (key, fmt))
+                    keys.setdefault(k, []).append(entry)
         return index
 
     def _keys(
         self, artist: str, album: str | None, title: str | None
-    ) -> list[tuple[str, dict[Key, FileRef], Key]]:
+    ) -> list[tuple[str, dict[Key, list[Entry]], Key]]:
         """``(tier, map, key)`` in tier order, leaving out every key with an empty part."""
         candidates = [
             ("exact", self.album, (fold(artist), album_key(album))),
@@ -177,8 +207,16 @@ class PoolIndex:
         """``(tier, format)`` of the first file by key at the best matching tier, else None.
 
         Tiers: ``exact`` or ``fuzzy`` on (artist, album), else ``title`` on (artist, title).
+        On every tier a file joins only when its album or title names each qualifier the
+        play's album or title names, so a live play never joins the studio file.
         """
-        hits = [(tier, keys[k]) for tier, keys, k in self._keys(artist, album, title) if k in keys]
+        need = qualifiers(album, title)
+        hits = [
+            (tier, ref)
+            for tier, keys, k in self._keys(artist, album, title)
+            for ref, has in keys.get(k, [])
+            if need <= has
+        ]
         if not hits:
             return None
         best = hits[0][0]
