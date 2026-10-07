@@ -104,8 +104,10 @@ def test_each_reader_returns_the_tags_and_stream_info(tmp_path, fmt):
     assert tags["bitrate_kbps"] > 0
 
 
-def test_an_untagged_file_reads_as_no_tags(tmp_path):
-    path = tmp_path / "untagged.mp3"
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_an_untagged_file_reads_as_no_tags(tmp_path, fmt):
+    extension, args, _ = FORMATS[fmt]
+    path = tmp_path / f"untagged{extension}"
     subprocess.run(
         [
             "ffmpeg",
@@ -115,14 +117,13 @@ def test_an_untagged_file_reads_as_no_tags(tmp_path):
             "lavfi",
             "-i",
             "sine=duration=2",
-            "-c:a",
-            "libmp3lame",
+            *args,
             str(path),
         ],
         check=True,
     )
 
-    tags = pool.read_tags(path, "mp3")
+    tags = pool.read_tags(path, fmt)
 
     assert tags["artist"] is None and tags["title"] is None
     assert tags["duration_s"] == pytest.approx(2.0, abs=0.2)
