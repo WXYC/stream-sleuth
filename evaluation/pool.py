@@ -200,8 +200,11 @@ def tag_lookup(db: sqlite3.Connection) -> Callable[[str], Identification]:
 
 
 def open_read_only(path: Path) -> sqlite3.Connection:
-    """Open an existing ``pool.db`` read-only: it never creates, migrates, or writes one."""
-    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    """Open an existing ``pool.db`` read-only: it never creates, migrates, or writes one, and
+    the connection cannot ``ATTACH`` (and so create) another file."""
+    db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    db.set_authorizer(lambda action, *_: sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)  # fmt: skip
+    return db
 
 
 def reference_artists(db: sqlite3.Connection) -> Mapping[str, tuple[str, ...]]:

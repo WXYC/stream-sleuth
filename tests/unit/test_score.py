@@ -566,6 +566,20 @@ def _molina_plays(artist: str = "Juana Molina") -> list[score.Play]:
         pytest.param("Jessica Pratt", STAGE, REFERENCES, False, id="another artist is still wrong"),
         pytest.param("Juana Molina", STAGE, None, False, id="no names mapping: as before"),
         pytest.param("Juana Molina", "b" * 40, REFERENCES, False, id="a ref_key not in it"),
+        pytest.param(COCREDIT, STAGE, None, True, id="no mapping: the emission's own artist joins"),
+        pytest.param(
+            COCREDIT, "b" * 40, REFERENCES, True, id="a ref_key not in it: own artist joins"
+        ),
+        pytest.param(
+            COCREDIT,
+            STAGE,
+            {STAGE: ("Jessica Pratt",)},
+            True,
+            id="a mismatched mapping never loses the emission's own artist",
+        ),  # fmt: skip
+        pytest.param(
+            "Jessica Pratt", STAGE, {STAGE: ("Jessica Pratt",)}, True, id="the mapping's name joins"
+        ),  # fmt: skip
     ],
 )
 def test_an_olaf_match_on_a_co_credited_file_is_correct_by_either_artist_tag(
@@ -586,6 +600,12 @@ def test_a_shazam_co_credit_stays_wrong_whatever_the_names_mapping_holds() -> No
     assert verdict.play is None
 
 
+def test_a_shazam_emission_still_joins_by_its_own_artist_whatever_its_ref_key_maps_to() -> None:
+    shazam = _hit((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
+    [verdict] = attribute(_molina_plays(COCREDIT), [shazam], {STAGE: ("Jessica Pratt",)})
+    assert verdict.play is not None and verdict.play.play_id == 1
+
+
 @pytest.mark.parametrize(("references", "play_id"), [(REFERENCES, 1), (None, None)])
 def test_a_leg_scores_an_olaf_co_credit_with_the_names_mapping(
     references: dict[str, tuple[str, ...]] | None, play_id: int | None
@@ -597,7 +617,7 @@ def test_a_leg_scores_an_olaf_co_credit_with_the_names_mapping(
         _molina_plays(),
         results,
         OLAF,
-        Leg("12s", 12, "128k", "all"),
+        LEG,
         [HOUR],
         grid(HOUR, 12),
         references,  # fmt: skip
