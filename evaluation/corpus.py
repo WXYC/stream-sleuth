@@ -60,16 +60,20 @@ _CRUFT = re.compile(
     r"\s*[\(\[](?:feat|ft|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
+_FEATURING = frozenset({"feat", "ft", "featuring"})
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 # A bracketed clause with one of these whole words, or its plural or past form, names a
 # different recording: a version clause, which the keys keep and every tier honors.
+# "version" counts only alone: "(Live Version)" names what "(Live)" names.
 VERSION_QUALIFIERS = frozenset(
     "live remix mix demo edit version acoustic instrumental session rehearsal".split()
 )
 # Phrases naming the same recording, removed from a clause before qualifiers are looked for.
+# Phrases come before the bare words, so "clean version" goes whole.
 SAME_RECORDING = re.compile(
-    r"\b(?:(?:radio|single|fcc|clean) edit|(?:album|single|mono|stereo|remaster(?:ed)?) version"
-    r"|(?:original|mono|stereo) mix|remaster(?:ed)?|mono|stereo)\b"
+    r"\b(?:(?:radio|single|fcc|clean) edit"
+    r"|(?:album|single|mono|stereo|lp|clean|explicit|radio|original|edited|remaster(?:ed)?)"
+    r" version|(?:original|mono|stereo) mix|remaster(?:ed)?|mono|stereo|clean|explicit|edited)\b"
 )
 
 
@@ -78,9 +82,20 @@ def _stem(word: str) -> str:
     return re.sub(r"(?:e?s|ed)$", "", word)
 
 
+def _words(text: str) -> list[str]:
+    """``text``'s words, split as the key splits, less same-recording phrases and a generic
+    "version" beside another qualifier."""
+    words = SAME_RECORDING.sub(" ", " ".join(re.split(r"[\W_]+", text))).split()
+    if {_stem(w) for w in words} & (VERSION_QUALIFIERS - {"version"}):
+        return [w for w in words if _stem(w) != "version"]
+    return words
+
+
 def _version_words(clause: str) -> list[str]:
-    """A version clause's words, split as the key splits, less same-recording phrases; else []."""
-    words = SAME_RECORDING.sub(" ", " ".join(re.split(r"[\W_]+", clause))).split()
+    """A version clause's :func:`_words`; [] for any other clause, a featuring one included."""
+    words = _words(clause)
+    if words[:1] and words[0] in _FEATURING:
+        return []
     return words if any(_stem(w) in VERSION_QUALIFIERS for w in words) else []
 
 
@@ -119,10 +134,16 @@ def fold(s: str | None) -> str:
 
 
 def album_key(s: str | None) -> str:
-    """Lowercase, drop featuring and edition cruft but not a version clause, collapse whitespace."""
+    """Lowercase, drop featuring and edition cruft, collapse whitespace.
+
+    A featuring clause always goes. An edition clause stays only when it names another
+    recording by more than the generic "version": "(Deluxe Version)" and "(Remastered
+    2011 Version)" go, "(Bonus Live Track)" stays.
+    """
 
     def drop_unless_version(m: re.Match[str]) -> str:
-        return m.group() if _version_words(m.group()) else ""
+        stems = {_stem(w) for w in _version_words(m.group())}
+        return m.group() if stems & (VERSION_QUALIFIERS - {"version"}) else ""
 
     return " ".join(_CRUFT.sub(drop_unless_version, (s or "").lower()).split())
 
@@ -132,11 +153,11 @@ def fuzzy(s: str | None) -> str:
 
     ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
     full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
-    A version clause is kept, its words less :data:`SAME_RECORDING` phrases in the key, so
-    "Back, Baby (Live)" never joins the studio "Back, Baby". Letters and digits of every
-    script outside brackets survive (a Japanese or Cyrillic name keeps a real key); a
-    name that is all brackets keys to "" and never joins on this tier. Underscores and
-    punctuation separate.
+    A version clause is kept, its words less :data:`SAME_RECORDING` phrases and a generic
+    "version" in the key, so "Back, Baby (Live)" never joins the studio "Back, Baby" and
+    "(Live Version)" keys as "(Live)". Letters and digits of every script outside
+    brackets survive (a Japanese or Cyrillic name keeps a real key); a name that is all
+    brackets keys to "" and never joins on this tier. Underscores and punctuation separate.
     """
 
     def drop_unless_version(m: re.Match[str]) -> str:
@@ -148,14 +169,24 @@ def fuzzy(s: str | None) -> str:
 
 
 def qualifiers(*names: str | None) -> frozenset[str]:
-    """The stemmed qualifiers in the version clauses of ``names``: the recording they name."""
+    """The stemmed qualifiers in the version clauses of ``names``: the recording a play names."""
     clauses = [c for s in names for c in _BRACKETED.findall(fold(album_key(s)))]
     return frozenset(_stem(w) for c in clauses for w in _version_words(c)) & VERSION_QUALIFIERS
 
 
+def named_qualifiers(*names: str | None) -> frozenset[str]:
+    """The stemmed qualifiers anywhere in ``names``, bracketed or not: what a pool file has.
+
+    :func:`qualifiers` plus the qualifier words outside brackets, so a pool album "Live
+    at KEXP" or title "Back, Baby - Live" names the live recording.
+    """
+    outside = (w for s in names for w in _words(_BRACKETED.sub(" ", fold(album_key(s)))))
+    return qualifiers(*names) | (frozenset(_stem(w) for w in outside) & VERSION_QUALIFIERS)
+
+
 Key = tuple[str, str]
 FileRef = tuple[str, str]  # (files.key, files.format)
-Entry = tuple[FileRef, frozenset[str]]  # a file and the qualifiers of its album and title
+Entry = tuple[FileRef, frozenset[str]]  # a file and the qualifiers named in its album and title
 
 
 @dataclass
@@ -163,8 +194,8 @@ class PoolIndex:
     """Join keys over ``pool.db``'s indexed files, by tier (plan §5.1).
 
     Each key maps to its indexed files in ``files.key`` order, each with the qualifiers
-    its album and title name. A key with an empty part (a missing tag, or a name that
-    normalizes to nothing) never joins.
+    its album and title name (:func:`named_qualifiers`). A key with an empty part (a
+    missing tag, or a name that normalizes to nothing) never joins.
     """
 
     album: dict[Key, list[Entry]] = field(default_factory=dict)
@@ -185,7 +216,7 @@ class PoolIndex:
         finally:
             db.close()
         for key, fmt, artist, album_artist, album, title in rows:
-            entry = ((key, fmt), qualifiers(album, title))
+            entry = ((key, fmt), named_qualifiers(album, title))
             for a in {artist, album_artist} - {None, ""}:
                 for _, keys, k in index._keys(a, album, title):
                     keys.setdefault(k, []).append(entry)
@@ -207,8 +238,9 @@ class PoolIndex:
         """``(tier, format)`` of the first file by key at the best matching tier, else None.
 
         Tiers: ``exact`` or ``fuzzy`` on (artist, album), else ``title`` on (artist, title).
-        On every tier a file joins only when its album or title names each qualifier the
-        play's album or title names, so a live play never joins the studio file.
+        On every tier a file joins only when its album or title names, anywhere, each
+        qualifier the play's album or title names in a version clause, so a live play never
+        joins the studio file.
         """
         need = qualifiers(album, title)
         hits = [

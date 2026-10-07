@@ -186,7 +186,40 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "Back, Baby (Remastered Live Version)",
             "back, baby (remastered live version)",
             "back, baby (remastered live version)",
-            "back baby live version",
+            "back baby live",
+        ),
+        # An edition clause whose only qualifier is the generic "version" is still cruft,
+        # and a featuring clause always is, whatever words it holds.
+        *(
+            (f"Back, Baby ({clause})", f"back, baby ({clause.lower()})", "back, baby", "back baby")
+            for clause in (
+                "Deluxe Version",
+                "Bonus Track Version",
+                "Expanded Version",
+                "Anniversary Version",
+                "Remastered 2011 Version",
+                "feat. Mix Master Mike",
+                "ft. Live Skull",
+            )
+        ),
+        (
+            "Back, Baby（feat. Mix Master Mike）",
+            "back, baby(feat. mix master mike)",
+            "back, baby（feat. mix master mike）",
+            "back baby",
+        ),
+        # "Version" beside another qualifier adds nothing: "(Live Version)" keys as "(Live)".
+        (
+            "Back, Baby (Live Version)",
+            "back, baby (live version)",
+            "back, baby (live version)",
+            "back baby live",
+        ),
+        (
+            "Back, Baby (Alternate Version)",
+            "back, baby (alternate version)",
+            "back, baby (alternate version)",
+            "back baby alternate version",
         ),
         # A clause naming the same recording is no version clause.
         (
@@ -247,6 +280,15 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         # A same-recording clause names no other recording, so it does not refuse.
         ("Jessica Pratt", "On Your Own Love Again", "Back, Baby (Radio Edit)", "exact", "flac"),
         ("Stereolab", "Dots and Loops (2011 Remastered Version)", "Brakhage", "fuzzy", "m4a"),
+        # Edition and featuring clauses are cruft on every tier, so the exact tier joins.
+        *(
+            ("Jessica Pratt", f"On Your Own Love Again ({edition})", "Back, Baby", "exact", "flac")
+            for edition in ("Deluxe Version", "Bonus Track Version", "Expanded Version")
+        ),
+        *(
+            ("Jessica Pratt", "On Your Own Love Again", f"Back, Baby ({clause})", "exact", "flac")
+            for clause in ("Remastered 2011 Version", "feat. Mix Master Mike", "ft. Live Skull")
+        ),
     ],
 )
 def test_pool_index_tiers(
@@ -278,6 +320,9 @@ def test_pool_index_tiers(
         ("Back, Baby (Bonus Live Track)", None),
         ("Back, Baby (Bonus Track - Demo)", None),
         ("Back, Baby (Remastered Live Version)", None),
+        # A lone "version" still names another recording.
+        ("Back, Baby (Alternate Version)", None),
+        ("Back, Baby (Extended Version)", None),
         # ...but a bracket that names no recording is still dropped...
         ("Back, Baby (Feathers)", "title"),
         ("Back, Baby（ザ・ワーム）", "title"),
@@ -288,7 +333,16 @@ def test_pool_index_tiers(
             for phrase in (
                 "Radio Edit, Single Edit, FCC Edit, Clean_Edit, Album Version, Single Version, "
                 "Original Mix, 2011 Remaster, 2011 Remastered Version, Mono Version, "
-                "Stereo Version, Mono"
+                "Stereo Version, Mono, LP Version, Clean Version, Explicit Version, "
+                "Radio Version, Original Version, Edited Version, Edited, Clean, Explicit"
+            ).split(", ")
+        ),
+        # ...and so are edition and featuring clauses, which are cruft.
+        *(
+            (f"Back, Baby ({clause})", "title")
+            for clause in (
+                "Deluxe Version, Bonus Track Version, Remastered 2011 Version, "
+                "feat. Mix Master Mike, ft. Live Skull"
             ).split(", ")
         ),
     ],
@@ -325,6 +379,11 @@ def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Pat
         ("Back, Baby (Live_Session)", "Back, Baby [Live Session]", "title"),
         ("Back, Baby (Live)", "Back, Baby (Demo)", None),
         ("Back, Baby (Live)", "Back, Baby", None),
+        # "(Live Version)" is "(Live)", in either direction.
+        ("Back, Baby (Live)", "Back, Baby (Live Version)", "title"),
+        ("Back, Baby (Live Version)", "Back, Baby (Live)", "title"),
+        # A pool file naming its version outside brackets names it all the same.
+        ("Back, Baby - Live", "Back, Baby (Live)", "title"),
         # A pool file naming the same recording still joins the bare title.
         ("Back, Baby (Radio Edit)", "Back, Baby", "title"),
         ("Back, Baby (2011 Remastered Version)", "Back, Baby", "title"),
@@ -347,6 +406,49 @@ def test_an_album_tier_play_joins_the_first_file_naming_its_version(
     files = [("a.mp3", "Bootleg", "Back, Baby"), ("b.flac", "Bootleg", "Back, Baby (Live)")]
     path = jessica_pratt_pool(tmp_path, files)
     assert corpus.PoolIndex.load(path).match("Jessica Pratt", "Bootleg", play_title) == match
+
+
+@pytest.mark.parametrize(
+    ("pool_album", "pool_title", "play_album", "tier"),
+    [
+        # The pool names the version anywhere in its album or title, brackets or not.
+        ("Live at KEXP", "Back, Baby", "Live at KEXP", "exact"),
+        ("Bootleg", "Back, Baby - Live", "Bootleg", "exact"),
+        ("Bootleg", "Back, Baby - Live", "Other", "title"),
+        ("Bootleg", "Back, Baby (Live Version)", "Bootleg", "exact"),
+        # A same-recording phrase names no version there either.
+        ("Bootleg", "Back, Baby - Mono", "Bootleg", None),
+        ("Bootleg", "Back, Baby", "Bootleg", None),
+    ],
+)
+def test_a_pool_file_names_its_version_outside_brackets(
+    tmp_path: Path, pool_album: str, pool_title: str, play_album: str, tier: str | None
+) -> None:
+    path = jessica_pratt_pool(tmp_path, [("k.mp3", pool_album, pool_title)])
+    assert (
+        corpus.PoolIndex.load(path).tier("Jessica Pratt", play_album, "Back, Baby (Live)") == tier
+    )
+
+
+@pytest.mark.parametrize(
+    ("names", "play", "pool"),
+    [
+        # The play side reads bracketed clauses only; the pool side reads every word.
+        (("Live at KEXP", "Back, Baby"), set(), {"live"}),
+        (("Bootleg", "Back, Baby - Live"), set(), {"live"}),
+        (("Bootleg", "Back, Baby (Live Version)"), {"live"}, {"live"}),
+        (("Bootleg", "Back, Baby (Alternate Version)"), {"version"}, {"version"}),
+        # A clause's lone "version" is judged within the clause, not beside the name's words.
+        (("Live at KEXP", "Back, Baby (Alternate Version)"), {"version"}, {"live", "version"}),
+        (("Bootleg", "Back, Baby (Remixes) [Demo]"), {"remix", "demo"}, {"remix", "demo"}),
+        (("Bootleg", "Back, Baby (feat. Mix Master Mike)"), set(), set()),
+        (("Bootleg", "Back, Baby (Edited)"), set(), set()),
+        (("Bootleg", "Back, Baby - Radio Edit"), set(), set()),
+    ],
+)
+def test_qualifiers(names: tuple[str, str], play: set[str], pool: set[str]) -> None:
+    assert corpus.qualifiers(*names) == play
+    assert corpus.named_qualifiers(*names) == pool
 
 
 def test_pool_format_is_the_first_matching_file_by_key(tmp_path: Path) -> None:
