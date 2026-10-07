@@ -192,9 +192,12 @@ def test_refuses_a_jsonl_path_it_cannot_append_to(start, tmp_path, capsys, make_
     )
 
 
-def test_refuses_a_jsonl_path_inside_the_checkout(start, capsys):
+@pytest.mark.parametrize(
+    "name", ["wxyc-emissions.jsonl", ""], ids=["in-checkout", "checkout-itself"]
+)
+def test_refuses_a_jsonl_path_inside_the_checkout(start, capsys, name):
     checkout = Path(__file__).resolve().parents[2]
-    path = checkout / "wxyc-emissions.jsonl"
+    path = checkout / name
 
     with pytest.raises(SystemExit) as exit_info:
         start(STREAM_SLEUTH_OUTPUT="jsonl", STREAM_SLEUTH_OUTPUT_PATH=str(path))
@@ -203,4 +206,4 @@ def test_refuses_a_jsonl_path_inside_the_checkout(start, capsys):
     assert capsys.readouterr().err == (
         f"STREAM_SLEUTH_OUTPUT_PATH {path} is inside the checkout {checkout}; refusing to run.\n"
     )
-    assert not path.exists()
+    assert not name or not path.exists()

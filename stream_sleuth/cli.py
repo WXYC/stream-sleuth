@@ -15,7 +15,7 @@ from .recognizers.olaf import OlafError, OlafRecognizer
 
 def main(argv: list[str] | None = None) -> int:
     """Run the command line; returns 0, or exits 2 on a usage error and 1 if Olaf fails."""
-    parser = argparse.ArgumentParser(prog="stream-sleuth")
+    parser = argparse.ArgumentParser(prog="python -m stream_sleuth.cli")
     commands = parser.add_subparsers(dest="command", required=True)
     index = commands.add_parser("index", help="manage a local fingerprint index")
     actions = index.add_subparsers(dest="action", required=True)

@@ -117,8 +117,13 @@ class OlafRecognizer(Recognizer):
             return
         config = self.home / SNAPSHOT_CONFIG_PATH
         if not config.exists():
-            config.parent.mkdir(parents=True, exist_ok=True)
-            config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
+            try:
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
+            except OSError as exc:
+                raise OlafError(
+                    f"cannot create the snapshot in {self.home}: {exc.strerror}"
+                ) from exc
         for i in range(0, len(pairs), STORE_BATCH):
             batch = [arg for pair in pairs[i : i + STORE_BATCH] for arg in pair]
             self._run("store", "--with-ids", *batch)
@@ -131,6 +136,7 @@ class OlafRecognizer(Recognizer):
                 [self.olaf_bin, *args],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,  # Olaf's ffmpeg must not read the terminal
                 text=True,
                 env={**os.environ, "HOME": str(self.home)},
                 start_new_session=timeout is not None,
@@ -140,8 +146,15 @@ class OlafRecognizer(Recognizer):
         with proc:
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                os.killpg(proc.pid, signal.SIGKILL)
+            except BaseException as exc:
+                # A timeout or an interrupt must not leave Olaf and its ffmpeg running.
+                if timeout is not None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (PermissionError, ProcessLookupError):
+                        proc.kill()  # Olaf exited just as the kill fired
+                if not isinstance(exc, subprocess.TimeoutExpired):
+                    raise
                 proc.communicate()
                 raise OlafError(f"olaf {args[0]} timed out after {timeout} s") from exc
         if proc.returncode != 0:
