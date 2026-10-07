@@ -2,7 +2,7 @@
 
 from typing import Literal, Protocol, TypedDict, runtime_checkable
 
-Source = Literal["shazam", "local"]
+IdentificationSource = Literal["shazam", "local"]
 """Which recognizer produced an emission: ``"shazam"`` (the Shazam client) or ``"local"`` (the Olaf index)."""
 
 
@@ -18,14 +18,17 @@ class Identification(TypedDict, total=True):
 class EvalIdentification(Identification, total=False):
     """An identification plus what the evaluation harness records about it.
 
-    Every field is optional. None of them reach the ingest API, which sees only the four wire keys.
+    Every field is optional. They are for the evaluation harness, but nothing strips them: an
+    ``Output`` serializes whatever mapping it is handed, so an ``EvalIdentification`` passed to
+    ``HttpPostOutput`` sends them to the ingest API too. A live deploy that should send only the four
+    wire keys needs a recognizer that returns a plain ``Identification``.
     """
 
     at: float
     """Seconds from the start of the hour file at which the clip (grid run) or capture (replay)
     begins; the origin and unit of ``plays.jsonl``'s ``t_offset_s`` and ``window_*_s``."""
 
-    source: Source
+    source: IdentificationSource
     """Which recognizer produced this emission."""
 
     confidence: float
