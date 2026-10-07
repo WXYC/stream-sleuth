@@ -12,7 +12,10 @@ An emission is **correct** when :func:`evaluation.names.title_tier` is not None 
 candidate play, a play whose window holds the emission's ``at``, under the in-pool join's rules:
 the play stands where the join's play does and the emission where its pool file does. Among correct
 candidates it goes to the play whose logged interval holds ``at``, else the earliest; a correct
-emission outside that interval is also a **neighbor** match. A play's logged interval runs from
+emission outside that interval is also a **neighbor** match. A local (Olaf) emission names every
+artist tag its reference file carries when :func:`attribute` is given ``references``
+(:func:`evaluation.pool.reference_artists`), as the join does, so a match on a co-credited file is
+correct by either tag; a Shazam emission names its one artist. A play's logged interval runs from
 its ``t_offset_s`` to the next play's in its hour, the last to 3,600 s.
 
 Audio without a scoring record is **uncovered**, never a miss: a play counts in recall only when
@@ -25,7 +28,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,19 +207,38 @@ def _logged(play: Play, at: float) -> bool:
     return play.t_offset_s <= at < play.logged_end_s
 
 
-def attribute(plays: Sequence[Play], emissions: Iterable[Emission]) -> list[Verdict]:
-    """Each emission's verdict, in ``(hour, at)`` order."""
+def _artists(
+    f: EvalIdentification, references: Mapping[str, tuple[str, ...]] | None
+) -> tuple[str, ...]:
+    """The artist names an emission names: its own, or for a local match every name its reference carries."""
+    if f["source"] == "local" and references and f.get("ref_key", "") in references:
+        return references[f["ref_key"]]
+    return (f["artist"],)
+
+
+def attribute(
+    plays: Sequence[Play],
+    emissions: Iterable[Emission],
+    references: Mapping[str, tuple[str, ...]] | None = None,
+) -> list[Verdict]:
+    """Each emission's verdict, in ``(hour, at)`` order.
+
+    ``references`` is :func:`evaluation.pool.reference_artists`'s stage id to artist names. A
+    local emission whose ``ref_key`` is in it names all of them, so a co-credited file is correct
+    when the play joins it by either tag; any other emission names its one artist.
+    """
     by_hour: defaultdict[str, list[Play]] = defaultdict(list)
     for p in plays:
         by_hour[p.hour_key].append(p)
     verdicts = []
     for e in sorted(emissions, key=lambda x: (x.address.hour_key, x.found["at"])):
         f, at = e.found, e.found["at"]
+        artists = _artists(f, references)
         joined = [
             p
             for p in by_hour[e.address.hour_key]
             if p.window_start_s <= at <= p.window_end_s
-            and names.title_tier(p.artist, p.album, p.title, (f["artist"],), f["album"], f["song"])
+            and names.title_tier(p.artist, p.album, p.title, artists, f["album"], f["song"])
             is not None
         ]
         play = min(joined, key=lambda p: (not _logged(p, at), p.t_offset_s), default=None)
@@ -301,6 +323,7 @@ def score_leg(
     leg: Leg,
     hours: Sequence[str],
     addresses: Sequence[ClipAddress],
+    references: Mapping[str, tuple[str, ...]] | None = None,
 ) -> LegScore:
     """Score one leg (``recognizer`` at ``leg``'s capture length and profile) over ``hours``.
 
@@ -311,7 +334,8 @@ def score_leg(
     ``addresses`` is the leg's grid as ``clips.hour_addresses`` returns it: each hour's clips that
     fit its decoded length, nothing for a skipped hour. A play is uncovered when a grid address
     of a full hour that starts in its window is missing from ``addresses`` (its hour was skipped,
-    or the window runs past the hour's last address) or has no scoring record.
+    or the window runs past the hour's last address) or has no scoring record. ``references``
+    is passed to :func:`attribute`.
     """
 
     def in_leg(key: tuple[str, str]) -> ClipAddress | None:
@@ -333,7 +357,7 @@ def score_leg(
         ]
         if all(k in scored for k in inside):
             covered.add(p)
-    verdicts = attribute(plays, [e for e in results.emissions if in_leg(e.key)])
+    verdicts = attribute(plays, [e for e in results.emissions if in_leg(e.key)], references)
     coverage = Coverage(
         grid_addresses=len(keys),
         scored_addresses=len(scored),
