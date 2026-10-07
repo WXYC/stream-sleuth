@@ -78,7 +78,9 @@ jobs:
       UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # One shared, bounded install (.github/actions/install-ffmpeg) so the two jobs cannot drift.
+      - uses: ./.github/actions/install-ffmpeg
+        timeout-minutes: 4
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
@@ -96,7 +98,9 @@ jobs:
       ZIG_VERSION: 0.16.0
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # One shared, bounded install (.github/actions/install-ffmpeg) so the two jobs cannot drift.
+      - uses: ./.github/actions/install-ffmpeg
+        timeout-minutes: 4
       - id: olaf-cache
         uses: actions/cache@v6
         with:
