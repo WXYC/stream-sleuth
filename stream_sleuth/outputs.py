@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import NoReturn, Protocol, runtime_checkable
 
 from .config import API_SECRET, API_URL, OUTPUT, OUTPUT_PATH
+from .paths import CHECKOUT, inside_checkout
 
 
 @runtime_checkable
@@ -71,18 +72,14 @@ def select_output() -> tuple[Output, str]:
         path = Path(OUTPUT_PATH)
         if not path.is_absolute():
             _refuse(f"STREAM_SLEUTH_OUTPUT_PATH must be an absolute path, not {OUTPUT_PATH!r}")
-        if _CHECKOUT in path.resolve().parents:
-            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH {path} is inside the checkout {_CHECKOUT}")
+        if inside_checkout(path):
+            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH {path} is inside the checkout {CHECKOUT}")
         try:
             path.open("a", encoding="utf-8").close()
         except OSError as e:
             _refuse(f"cannot append to STREAM_SLEUTH_OUTPUT_PATH {path} ({e.strerror})")
         return JsonlOutput(OUTPUT_PATH), OUTPUT_PATH
     _refuse(f"STREAM_SLEUTH_OUTPUT must be http or jsonl, not {OUTPUT!r}")
-
-
-# The directory holding this package: the repo checkout, which a result store never enters.
-_CHECKOUT = Path(__file__).resolve().parents[1]
 
 
 def _refuse(reason: str) -> NoReturn:

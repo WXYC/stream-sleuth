@@ -97,11 +97,13 @@ zig build -Doptimize=ReleaseFast          # Zig 0.16.0; also fetches Olaf's zigz
 export STREAM_SLEUTH_OLAF_BIN="$PWD/zig-out/bin/olaf"
 ```
 
-Olaf decodes with `ffmpeg`. Each index is a *snapshot* directory that the adapter passes to Olaf as `HOME`, so snapshots never share a database and `~/.olaf` is never touched. Fill one with:
+Olaf decodes with `ffmpeg`. Each index is a *snapshot* directory that the adapter passes to Olaf as `HOME`, so snapshots never share a database and `~/.olaf` is never touched. Keep snapshots under `$STREAM_SLEUTH_DATA_DIR/olaf/<snapshot>/`; the adapter refuses a relative path, the home directory itself, and any path inside the checkout. Only `index build` creates a snapshot; querying one that holds no index is an error, so a mistyped path fails rather than matching nothing. Fill one with:
 
 ```bash
-uv run python -m stream_sleuth.cli index build --home /path/to/snapshot track.mp3 some-identifier [more.mp3 another-id ...]
+uv run python -m stream_sleuth.cli index build --home "$STREAM_SLEUTH_DATA_DIR/olaf/rotation" track.mp3 some-identifier [more.mp3 another-id ...]
 ```
+
+Olaf reports the identifier as the match's `ref_key`. A snapshot the evaluation harness scores must use each reference's pool stage id (`evaluation.pool.stage_id(object_key)`) as its identifier, or its matches cannot be joined to `pool.db`.
 
 Matches below a `match_count` of 12 are ignored: in WXYC's first test, real songs scored 17 to 178 on a 12 s clip and stray matches 6 to 10.
 

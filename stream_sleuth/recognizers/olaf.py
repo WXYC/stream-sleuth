@@ -5,6 +5,12 @@ Each index is a *snapshot* with its own directory, which the adapter passes to O
 real ``~/.olaf`` is never touched. References are stored with ``olaf store --with-ids``,
 so every match names the caller's identifier rather than a file path that may be gone.
 
+A snapshot lives under ``$STREAM_SLEUTH_DATA_DIR/olaf/<snapshot>/``; the caller passes
+that path, since this module reads no data-directory setting. It must be absolute, and
+neither the real home (whose ``~/.olaf`` is never touched) nor inside the checkout.
+Only ``store`` creates a snapshot: querying one with no index raises ``OlafError``, so a
+mistyped path fails instead of scoring as an empty index.
+
 Olaf reports only that identifier. ``lookup`` maps it to the four wire keys (a station's
 tag database, say); without one, the identifier is the song and the other keys are empty.
 """
@@ -16,6 +22,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from ..config import OLAF_BIN
+from ..paths import CHECKOUT, inside_checkout
 from .base import EvalIdentification, Identification, Recognizer
 
 # Phase 1 of the viability study (2026-10-06): over 2,400 12 s clips, Olaf's own
@@ -29,9 +36,12 @@ DEFAULT_QUERY_TIMEOUT_S = 60.0
 # Written into each snapshot so Olaf never falls back to a config beside its binary.
 SNAPSHOT_CONFIG = {"db_folder": "~/.olaf/db/", "cache_folder": "~/.olaf/cache/"}
 
+# The LMDB file Olaf's first successful store creates in that db_folder.
+SNAPSHOT_INDEX = Path(".olaf", "db", "data.mdb")
+
 
 class OlafError(RuntimeError):
-    """Olaf exited non-zero or printed output that is not a query result."""
+    """Olaf failed or printed no query result, or the snapshot directory is unusable."""
 
 
 class OlafRecognizer(Recognizer):
@@ -43,13 +53,15 @@ class OlafRecognizer(Recognizer):
         lookup: Callable[[str], Identification | None] | None = None,
         query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S,
     ) -> None:
-        self.home = Path(home)
+        self.home = _snapshot_home(home)
         self.olaf_bin = olaf_bin or OLAF_BIN
         self.min_match_count = min_match_count
         self.lookup = lookup
         self.query_timeout_s = query_timeout_s
 
     def recognize(self, wav_path: str) -> EvalIdentification | None:
+        if not (self.home / SNAPSHOT_INDEX).is_file():
+            raise OlafError(f"no Olaf index in {self.home}; fill it with `index build` first")
         matches = [
             m
             for m in parse_matches(
@@ -81,14 +93,15 @@ class OlafRecognizer(Recognizer):
     def store(self, items: Iterable[tuple[str, str]]) -> None:
         """Index ``(audio path, identifier)`` pairs; Olaf skips identifiers it already holds."""
         args = [arg for pair in items for arg in pair]
-        if args:
-            self._run("store", "--with-ids", *args)
-
-    def _run(self, *args: str, timeout: float | None = None) -> str:
+        if not args:
+            return
         config = self.home / ".olaf" / "olaf_config.json"
         if not config.exists():
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
+        self._run("store", "--with-ids", *args)
+
+    def _run(self, *args: str, timeout: float | None = None) -> str:
         try:
             proc = subprocess.run(
                 [self.olaf_bin, *args],
@@ -100,10 +113,23 @@ class OlafRecognizer(Recognizer):
         except subprocess.TimeoutExpired as exc:
             raise OlafError(f"olaf {args[0]} timed out after {timeout} s") from exc
         if proc.returncode != 0:
-            raise OlafError(
-                f"olaf {args[0]} exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
-            )
+            # Olaf prints argument-parsing errors to stdout, not stderr.
+            reason = proc.stderr.strip() or proc.stdout.strip()
+            raise OlafError(f"olaf {args[0]} exited {proc.returncode}: {reason[-500:]}")
         return proc.stdout
+
+
+def _snapshot_home(home: str | Path) -> Path:
+    path = Path(home)
+    if not path.is_absolute():
+        raise OlafError(f"the snapshot directory must be an absolute path, not {str(home)!r}")
+    if path.resolve() == Path.home().resolve():
+        raise OlafError(
+            f"the snapshot directory {path} is the home directory, whose ~/.olaf is never touched"
+        )
+    if inside_checkout(path):
+        raise OlafError(f"the snapshot directory {path} is inside the checkout {CHECKOUT}")
+    return path
 
 
 def parse_matches(output: str) -> list[dict]:
