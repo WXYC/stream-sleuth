@@ -263,7 +263,8 @@ def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
             key, sheet.era(hour_start(key)), len(tracks), sum(r.entry_type in TALK_TYPES for r in rows),
             sum(pool.tier(r.artist, r.album, r.title) is not None for r in tracks),
             statistics.median(gaps) if gaps else 0.0,
-            any(sheet.order_status[r.show_id][1] for r in tracks if sheet.era(r.add_time) == "canonical"),
+            any(sheet.order_status.get(r.show_id, ("unreliable", None))[1]
+                for r in tracks if sheet.era(r.add_time) == "canonical"),
         )  # fmt: skip
     return stats
 
