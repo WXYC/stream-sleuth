@@ -311,6 +311,13 @@ def _song(v: Verdict) -> tuple[str, str, str]:
     return v.emission.address.hour_key, f["artist"].lower(), f["song"].lower()
 
 
+def _song_start(f: EvalIdentification) -> float | None:
+    """``at + query_offset_s - ref_start_s``; None for an answer without offsets (Shazam's null)."""
+    if f.get("query_offset_s") is None or f.get("ref_start_s") is None:
+        return None
+    return f["at"] + f["query_offset_s"] - f["ref_start_s"]
+
+
 def score_plays(
     plays: Sequence[Play], verdicts: Iterable[Verdict], covered: AbstractSet[Play]
 ) -> list[PlayScore]:
@@ -325,10 +332,7 @@ def score_plays(
             continue
         hits = sorted(found[p], key=lambda h: h["at"])
         first = hits[0]["at"] if hits else None
-        timed = [h for h in hits if "query_offset_s" in h and "ref_start_s" in h]
-        start = (
-            timed[0]["at"] + timed[0]["query_offset_s"] - timed[0]["ref_start_s"] if timed else None
-        )
+        start = next((s for h in hits if (s := _song_start(h)) is not None), None)
         ttfi = lag = None
         if first is not None and start is not None and p in covered:
             ttfi, lag = max(0.0, first - start), p.t_offset_s - start
@@ -583,13 +587,6 @@ def near_miss_rows(
                     }
                 )
     return rows
-
-
-def _song_start(f: EvalIdentification) -> float | None:
-    """``at + query_offset_s - ref_start_s``; None for an answer without offsets (Shazam's null)."""
-    if f.get("query_offset_s") is None or f.get("ref_start_s") is None:
-        return None
-    return f["at"] + f["query_offset_s"] - f["ref_start_s"]
 
 
 def _steady(run: Sequence[Verdict]) -> bool:
