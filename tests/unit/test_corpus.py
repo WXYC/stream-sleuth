@@ -557,6 +557,33 @@ def test_hour_stats_counts_and_median_gap(tmp_path: Path, pool_db: Path) -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("gaps", "median", "dj_hour"),
+    [
+        # Batch-logged with one long break: the mean (~234 s) would pass, the median does not.
+        ([10.0] * 3 + [1800.0] + [10.0] * 4, 10.0, False),
+        # Logged live but a few tracks entered at once: the mean (62.5 s) would fail.
+        ([100.0, 0.0, 100.0, 0.0, 100.0, 0.0, 100.0, 100.0], 100.0, True),
+    ],
+    ids=["mean-would-admit", "mean-would-reject"],
+)
+def test_hour_stats_gap_is_the_median_not_the_mean(
+    tmp_path: Path, pool_db: Path, gaps: list[float], median: float, dj_hour: bool
+) -> None:
+    offsets = [60.0]
+    for gap in gaps:
+        offsets.append(offsets[-1] + gap)
+    rows = [
+        row(i + 1, ts(20, second=s), artist="Juana Molina", album="DOGA")
+        for i, s in enumerate(offsets)
+    ]
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    key = "2026/08/12/202608121600.mp3"
+    assert (stats[key].track_rows, stats[key].median_gap_s) == (9, median)
+    assert corpus.select_hours(stats, era="canonical", target=1) == ([key] if dj_hour else [])
+
+
 def test_select_hours_ranks_by_in_pool_and_applies_rules(tmp_path: Path, pool_db: Path) -> None:
     pooled: dict[str, Any] = {"artist": "Juana Molina", "album": "DOGA"}
     rows = []
@@ -694,12 +721,109 @@ def test_select_corpus_relaxes_a_thin_band_from_canonical_only() -> None:
     )
 
 
-def test_select_corpus_ranks_reorder_flagged_hours_last() -> None:
-    stats = {k: stat(k) for k in keys_in(1, range(6, 18))}
-    flagged = keys_in(2, range(6, 7))[0]
-    stats[flagged] = stat(flagged, in_pool=10, flagged=True)  # best share, but flagged
+@pytest.mark.parametrize(
+    ("group", "quotas", "unflagged", "flagged"),
+    [
+        # The best share in its band, but flagged.
+        ("canonical-high", corpus.HIGH_QUOTAS, {"in_pool": 5}, {"in_pool": 10}),
+        # The most track rows in its band, but flagged.
+        ("canonical-low", corpus.LOW_QUOTAS, {"in_pool": 0}, {"in_pool": 0, "tracks": 20}),
+    ],
+    ids=["high", "low"],
+)
+def test_select_corpus_ranks_reorder_flagged_hours_last_in_their_band(
+    group: str, quotas: dict[str, int], unflagged: dict[str, Any], flagged: dict[str, Any]
+) -> None:
+    # Every band has exactly its quota of unflagged hours, so nothing is relaxed.
+    stats = {
+        k: stat(k, **unflagged)
+        for name, quota in quotas.items()
+        for k in keys_in(1, corpus.BANDS[name])[:quota]
+    }
+    flagged_key = keys_in(2, corpus.BANDS["daytime"])[0]
+    stats[flagged_key] = stat(flagged_key, flagged=True, **flagged)
     sel = corpus.select_corpus(stats)
-    assert flagged not in sel.hours
+    assert flagged_key not in sel.hours
+    assert sum(g == group for g, _ in sel.hours.values()) == sum(quotas.values())
+
+
+def test_select_corpus_ranks_high_share_hours_by_share_then_in_pool() -> None:
+    # Ranking by in-pool count (Phase 1's rule) would put the long rotation-heavy hours first.
+    long_show, tie_short, tie_long, short_show = keys_in(1, range(6, 10))
+    stats = {
+        long_show: stat(long_show, tracks=20, in_pool=7),  # share 0.35
+        tie_short: stat(tie_short, tracks=10, in_pool=5),  # share 0.5, fewer in-pool plays
+        tie_long: stat(tie_long, tracks=20, in_pool=10),  # share 0.5, more in-pool plays
+        short_show: stat(short_show, tracks=8, in_pool=6),  # share 0.75
+    }
+    sel = corpus.select_corpus(stats)
+    assert [k for k, (g, _) in sel.hours.items() if g == "canonical-high"] == [
+        short_show,
+        tie_long,
+        tie_short,
+        long_show,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tracks", "group"),
+    [
+        (11, "canonical-low"),  # share 1/11, just below
+        (10, "canonical-low"),  # share exactly LOW_SHARE_MAX
+        (9, "canonical-high"),  # share 1/9, just above
+    ],
+)
+def test_select_corpus_low_share_includes_the_boundary(tracks: int, group: str) -> None:
+    key = keys_in(1, range(10, 11))[0]
+    sel = corpus.select_corpus({key: stat(key, tracks=tracks, in_pool=1)})
+    assert sel.hours[key] == (group, "daytime")
+
+
+@pytest.mark.parametrize(
+    ("ineligible", "chosen"),
+    [
+        ({"tracks": 7}, False),
+        ({"gap": 89.0}, False),  # batch-logged
+        ({"tracks": 8, "gap": 90.0}, True),  # both minimums met exactly
+    ],
+    ids=["too-few-tracks", "batch-logged", "at-the-minimums"],
+)
+def test_select_corpus_contrast_hours_must_be_dj_hours(
+    ineligible: dict[str, Any], chosen: bool
+) -> None:
+    key = keys_in(5, range(20, 21), month=6, year=2023)[0]
+    sel = corpus.select_corpus({key: stat(key, era="etl", in_pool=6, **ineligible)})
+    assert (key in sel.hours) is chosen
+    assert ("contrast/2023" in sel.shortfalls) is not chosen
+
+
+# Excluded days are Eastern dates. Each evening key's UTC date is the next day's.
+EXCLUDED_DAY_EDGES = [
+    ("2026/08/08/202608082000.mp3", True),  # 2026-08-09 00:00 UTC
+    ("2026/08/08/202608082300.mp3", True),  # 2026-08-09 03:00 UTC
+    ("2026/08/09/202608090000.mp3", False),
+    ("2026/08/11/202608112000.mp3", False),  # 2026-08-12 00:00 UTC
+    ("2026/08/11/202608112300.mp3", False),  # 2026-08-12 03:00 UTC
+    ("2026/08/12/202608120000.mp3", True),
+]
+
+
+def era_of(key: str) -> str:
+    return "canonical" if corpus.hour_start(key) >= corpus.ETL_STOP_FLOOR else "etl"
+
+
+@pytest.mark.parametrize(("key", "eligible"), EXCLUDED_DAY_EDGES)
+def test_excluded_days_are_eastern_dates_for_dj_hours(key: str, eligible: bool) -> None:
+    era = era_of(key)
+    selected = corpus.select_hours({key: stat(key, era=era)}, era=era, target=1)
+    assert selected == ([key] if eligible else [])
+
+
+@pytest.mark.parametrize(("key", "eligible"), EXCLUDED_DAY_EDGES)
+def test_excluded_days_are_eastern_dates_for_talk_hours(key: str, eligible: bool) -> None:
+    sel = corpus.select_corpus({key: stat(key, era=era_of(key), tracks=2, talk=5, in_pool=0)})
+    assert (key in sel.hours) is eligible
+    assert (sel.shortfalls.get("talk/unfilled") == 1) is eligible
 
 
 def test_select_corpus_skips_ineligible_hours() -> None:
