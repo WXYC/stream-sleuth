@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from evaluation.s3_readonly import archive_bucket, archive_client
+from evaluation.s3_readonly import STREAM_ERRORS, archive_bucket, archive_client
 
 log = logging.getLogger(__name__)
 
@@ -91,8 +91,11 @@ def fetch(key: str, *, archive_dir: Path, client: Any = None, bucket: str | None
     response = client.get_object(Bucket=bucket, Key=key)
     size = response["ContentLength"]
     with contextlib.closing(response["Body"]) as body, open(part, "wb") as f:
-        for chunk in body.iter_chunks(1 << 20):
-            f.write(chunk)
+        try:
+            for chunk in body.iter_chunks(1 << 20):
+                f.write(chunk)
+        except STREAM_ERRORS as exc:
+            raise ShortReadError(f"short read for {key}: {exc}") from exc
     if part.stat().st_size != size:
         raise ShortReadError(f"short read for {key}: {part.stat().st_size} of {size} bytes")
     part.rename(dest)

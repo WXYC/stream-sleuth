@@ -29,7 +29,18 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from botocore.exceptions import IncompleteReadError, ReadTimeoutError, ResponseStreamingError
+
 ALLOWED_OPERATIONS = frozenset({"ListObjectsV2", "GetObject", "HeadObject"})
+
+# What a ``GetObject`` body raises when its stream ends before ``ContentLength``:
+# the connection closed early, reset, or stalled. Exported here because no other
+# module may import botocore.
+STREAM_ERRORS: tuple[type[Exception], ...] = (
+    IncompleteReadError,
+    ResponseStreamingError,
+    ReadTimeoutError,
+)
 
 _POOL_PREFIX = "STREAM_SLEUTH_POOL_"
 _POOL_FALLBACK_PREFIX = "DIGITAL_ARCHIVE_STORE_AZURACAST_"
