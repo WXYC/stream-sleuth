@@ -32,7 +32,15 @@ from pathlib import Path
 from typing import Any
 
 from evaluation.archive import EASTERN, hour_key, hour_start
-from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers, title_keys
+from evaluation.names import (
+    album_key,
+    artist_keys,
+    fold,
+    fuzzy,
+    named_qualifiers,
+    qualifiers,
+    title_keys,
+)
 from evaluation.pool import open_read_only
 from evaluation.selection import fail, load_selection
 from stream_sleuth.paths import data_dir, require_outside_checkout
@@ -135,8 +143,8 @@ class PoolIndex:
         """``(tier, map, key)`` in tier order, leaving out every key with an empty part."""
         candidates = [
             ("exact", self.album, (fold(artist), album_key(album))),
-            ("fuzzy", self.album_fuzzy, (fuzzy(artist), fuzzy(album))),
         ]
+        candidates += [("fuzzy", self.album_fuzzy, (a, fuzzy(album))) for a in artist_keys(artist)]
         title_maps = {"exact": self.title, "fuzzy": self.title_fuzzy}
         found = [(tier, keys, k) for tier, keys, k in candidates if all(k)]
         return found + [("title", title_maps[kind], k) for kind, k in title_keys(artist, title)]

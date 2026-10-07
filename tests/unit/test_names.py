@@ -508,6 +508,113 @@ def test_title_keys(artist: str | None, title: str | None, keys: list[tuple[str,
 
 
 @pytest.mark.parametrize(
+    ("artist", "keys"),
+    [
+        ("Cass McCombs", ["cass mccombs"]),
+        ("", []),
+        (None, []),
+        # A co-credit also keys as its sorted names, so the order of the names is lost.
+        (
+            "Cass McCombs & Chris Cohen",
+            ["cass mccombs chris cohen", "cass mccombs|chris cohen"],
+        ),
+        (
+            "Chris Cohen, Cass McCombs",
+            ["chris cohen cass mccombs", "cass mccombs|chris cohen"],
+        ),
+        # Every separator reads alike, and a bracketed clause is no part of a name.
+        (
+            "Cass McCombs and Chris Cohen",
+            ["cass mccombs and chris cohen", "cass mccombs|chris cohen"],
+        ),
+        (
+            "Cass McCombs (solo, live) & Chris Cohen",
+            ["cass mccombs solo live chris cohen", "cass mccombs solo live|chris cohen"],
+        ),
+        # Three names, and a repeated one stays twice.
+        (
+            "Chuquimamani-Condori; Juana Molina / Jessica Pratt",
+            [
+                "chuquimamani condori juana molina jessica pratt",
+                "chuquimamani condori|jessica pratt|juana molina",
+            ],
+        ),
+        ("Juana Molina & Juana Molina", ["juana molina juana molina", "juana molina|juana molina"]),
+        # A name that is no co-credit is not split: "x" inside or at the edge of a name,
+        # a separator with nothing on one side, a featuring credit, "with" in a bracket.
+        ("Charli XCX", ["charli xcx"]),
+        ("Lil Nas X", ["lil nas x"]),
+        ("X Ambassadors", ["x ambassadors"]),
+        ("Cass McCombs &", ["cass mccombs"]),
+        ("Jessica Pratt feat. Juana Molina", ["jessica pratt"]),
+        ("Jessica Pratt (with Juana Molina)", ["jessica pratt"]),
+        ("Stereolab（ステレオラブ）", ["stereolab"]),
+        # A dotted initialism is one word on each side of a separator.
+        ("R.E.M. + A.R. Kane", ["rem ar kane", "ar kane|rem"]),
+    ],
+)
+def test_artist_keys(artist: str | None, keys: list[str]) -> None:
+    assert norm.artist_keys(artist) == keys
+
+
+@pytest.mark.parametrize(
+    ("play", "recording", "tier"),
+    [
+        # The Steel Reserve case (WXYC/stream-sleuth#126): the same artists in another order
+        # join on the fuzzy keys only; the exact keys keep the logged order.
+        ("Cass McCombs & Chris Cohen", "Chris Cohen, Cass McCombs", "fuzzy"),
+        ("Chris Cohen, Cass McCombs", "Cass McCombs & Chris Cohen", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Cass McCombs & Chris Cohen", "exact"),
+        ("Cass McCombs & Chris Cohen", "Cass McCombs and Chris Cohen", "fuzzy"),
+        # Separators read alike.
+        ("Cass McCombs & Chris Cohen", "Chris Cohen and Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen x Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen / Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen + Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen with Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen vs. Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen vs Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen; Cass McCombs", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen&Cass McCombs", "fuzzy"),
+        # Case, diacritics, and a featuring credit on either side.
+        ("Hermanos Gutiérrez & Juana Molina", "JUANA MOLINA, Hermanos Gutierrez", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen & Cass McCombs feat. Jessica Pratt", "fuzzy"),
+        # A different set of names, a subset, or a superset never joins under this rule.
+        ("Cass McCombs & Chris Cohen", "Chris Cohen & Jessica Pratt", None),
+        ("Cass McCombs", "Cass McCombs & Chris Cohen", None),
+        ("Cass McCombs & Chris Cohen", "Cass McCombs", None),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen & Cass McCombs & Jessica Pratt", None),
+        ("Juana Molina & Juana Molina", "Juana Molina & Jessica Pratt", None),
+        # A single name is never split: it joins itself, and only the reading of its two halves.
+        ("Belle and Sebastian", "Belle and Sebastian", "exact"),
+        ("Belle and Sebastian", "Belle & Sebastian", "fuzzy"),
+        ("Belle and Sebastian", "Belle", None),
+        ("Belle and Sebastian", "Sebastian", None),
+        ("Simon & Garfunkel", "Garfunkel & Simon", "fuzzy"),
+        # A name with "x" as part of it is no co-credit, so it joins nothing reordered.
+        ("Charli XCX", "XCX Charli", None),
+        ("Charli XCX", "Charli", None),
+        ("Lil Nas X", "X Nas Lil", None),
+        ("Juana Molina x Lil Nas X", "Lil Nas X & Juana Molina", "fuzzy"),
+        # A joined literal reading keeps working: no separator on one side.
+        ("Cass McCombs Chris Cohen", "Cass McCombs & Chris Cohen", "fuzzy"),
+        # A last-name-first tag is not a reordered credit.
+        ("Chris Cohen", "Cohen, Chris", None),
+    ],
+)
+def test_title_tier_joins_a_co_credit_in_another_order(
+    play: str, recording: str, tier: str | None
+) -> None:
+    assert norm.title_tier(play, "x", "Steel Reserve", (recording,), "y", "Steel Reserve") == tier
+
+
+def test_title_tier_joins_a_co_credit_through_any_of_the_artist_tags() -> None:
+    artists = ("Various Artists", "Chris Cohen, Cass McCombs")
+    play = ("Cass McCombs & Chris Cohen", "x", "Steel Reserve")
+    assert norm.title_tier(*play, artists, "y", "Steel Reserve") == "fuzzy"
+
+
+@pytest.mark.parametrize(
     ("play", "recording", "tier"),
     [
         # The same spelling joins on the exact key; punctuation and case alone, on the fuzzy.
