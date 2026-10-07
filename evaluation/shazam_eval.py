@@ -379,6 +379,14 @@ async def run(
     return "done"
 
 
+def budget_from_env() -> tuple[int, float]:
+    """The account's daily request budget and request spacing: the one place both settings are read."""
+    return (
+        int(os.environ.get("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500")),
+        float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--hours", type=Path, required=True, help="file of hour keys, one per line")
@@ -402,11 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (work_dir, store.path.parent, state_path.parent):
         directory.mkdir(parents=True, exist_ok=True)
     # Held until the run ends, before any decode: a second run on this state is refused.
-    with Throttle(
-        state_path,
-        int(os.environ.get("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500")),
-        float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
-    ) as throttle:
+    with Throttle(state_path, *budget_from_env()) as throttle:
         client = CountingClient(throttle, base_url=args.base_url)
         addresses = hour_addresses(
             args.hours.read_text().split(), args.archive_dir, args.length, args.profile

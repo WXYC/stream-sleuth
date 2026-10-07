@@ -104,6 +104,8 @@ Known gap on the `title` tier: it joins only when the play's title key equals th
 - One process per throttle state file, enforced: a `Throttle` takes a non-blocking `fcntl.flock` on `<state>.lock` when constructed and holds it until `close()` (use it as a context manager), so a second opener, in this process or another, gets `ThrottleBusyError`. The state file is replaced atomically on every save, so never lock the state file itself. A test that simulates a restart closes the first `Throttle` before opening the next, and gives it the same clock: a restart whose clock runs more than the interval behind the state file's `last` is refused (`ValueError`), not slept on.
 - `ResultStore.history()` is the one tally of scored keys, each tried key's latest status, and exhausted keys, shared by `run()` and the CLI's end summary; do not recompute them from `records()`. Day-stopping statuses (`STOP_REASONS`: 429 `rate_limited`, 403 `forbidden`) are never counted as an address's failures. The module sits at about 291 of its 300 production lines (no blanks, comments, or docstrings): remove before you add.
 
+- `evaluation/run.py` runs the legs (a constant `LEGS` table, hours from `selection.json` only) by calling `shazam_eval.run()` per leg inside one `Throttle` and `CountingClient`; it adds no second resume, retry, or budget mechanism. A leg that returns anything but `done` leaves the later legs `not started`. The two budget variables are read by `shazam_eval.budget_from_env()` and nowhere else; never give a leg its own state file, which would give it a second daily budget.
+
 ## WXYC fork
 
 This section applies to the `WXYC/stream-sleuth` fork and is dropped from anything offered upstream to `landmarco/stream-sleuth`.
