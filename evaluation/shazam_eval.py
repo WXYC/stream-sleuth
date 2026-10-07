@@ -46,6 +46,9 @@ from stream_sleuth.paths import data_dir, require_outside_checkout
 log = logging.getLogger(__name__)
 
 SCORING_KINDS = frozenset({"matched", "no_match"})
+# Consecutive non-scoring outcomes that stop the day: a systemic failure other than a
+# 429 (a 403, a changed response shape) would otherwise spend the whole daily budget.
+MAX_FAILURE_STREAK = 20
 
 
 def recognizer_identity(segment_s: int) -> str:
@@ -246,11 +249,12 @@ class ResultStore:
         if not self.path.exists():
             return []
         records: list[dict[str, Any]] = []
-        for line in filter(None, self.path.read_text(encoding="utf-8").splitlines()):
+        # Decoded per line, so a crash inside a multibyte character tears only that line.
+        for line in filter(None, self.path.read_bytes().split(b"\n")):
             try:
-                records.append(json.loads(line))
-            except ValueError:
-                log.warning("skipped a torn line in %s: %.60s", self.path, line)
+                records.append(json.loads(line.decode("utf-8")))
+            except ValueError:  # includes UnicodeDecodeError
+                log.warning("skipped a torn line in %s: %.60r", self.path, line)
         return records
 
     def _ends_mid_line(self) -> bool:
@@ -285,8 +289,13 @@ async def run(
     store: ResultStore,
     client: CountingClient,
 ) -> str:
-    """Query every unscored address in order; return ``done``, ``rate_limited``, or ``daily_cap``."""
+    """Query every unscored address in order.
+
+    Returns ``done``, ``rate_limited``, ``daily_cap``, or ``failure_streak`` (after
+    ``MAX_FAILURE_STREAK`` non-scoring outcomes in a row, which stops the day like a 429).
+    """
     scored = store.scored()
+    streak = 0
     for address in addresses:
         identity = recognizer_identity(address.length_s)
         if (str(address), identity) in scored:
@@ -309,6 +318,11 @@ async def run(
             store.append(str(address), identity, outcome)
             return "rate_limited"
         store.append(str(address), identity, outcome)
+        streak = 0 if outcome.kind in SCORING_KINDS else streak + 1
+        if streak >= MAX_FAILURE_STREAK:
+            log.warning("%d non-scoring outcomes in a row; stopping for the day", streak)
+            client.throttle.stop_for_day()
+            return "failure_streak"
     return "done"
 
 

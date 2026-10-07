@@ -27,6 +27,7 @@ import pytest
 
 from evaluation.clips import ClipAddress, ClipError
 from evaluation.shazam_eval import (
+    MAX_FAILURE_STREAK,
     CountingClient,
     ResultStore,
     ShazamOutcome,
@@ -441,6 +442,49 @@ def test_a_torn_line_is_skipped_and_the_next_append_starts_a_new_line(
     store.append("c#0+12@128k", recognizer_identity(12), ShazamOutcome(200, "no_match"))
     assert path.read_text().startswith(torn + "\n")  # the torn bytes are kept, never rewritten
     assert [r["address"] for r in store.records()] == ["a#0+12@128k", "c#0+12@128k"]
+
+
+def test_a_line_torn_inside_a_multibyte_character_is_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "shazam.jsonl"
+    store = ResultStore(path)
+    store.append("a#0+12@128k", recognizer_identity(12), ShazamOutcome(200, "no_match"))
+    line = json.dumps(
+        {"address": "b#0+12@128k", "artist": "Hermanos Gutiérrez"}, ensure_ascii=False
+    )
+    raw = line.encode("utf-8")
+    cut = raw.index("é".encode()) + 1  # between the two bytes of é
+    with open(path, "ab") as f:
+        f.write(raw[:cut])
+    with caplog.at_level("WARNING"):
+        assert [r["address"] for r in store.records()] == ["a#0+12@128k"]
+    assert str(path) in caplog.text
+    store.append("c#0+12@128k", recognizer_identity(12), ShazamOutcome(200, "no_match"))
+    assert [r["address"] for r in store.records()] == ["a#0+12@128k", "c#0+12@128k"]
+
+
+def test_a_streak_of_non_scoring_outcomes_stops_the_day(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    n = MAX_FAILURE_STREAK + 5
+    fake = FakeShazam([_json(503, {"error": "busy"})] * n)
+    server.append(fake)
+    store, throttle, client, stop = _run(tmp_path, tone, fake, n)
+    assert (stop, client.requests) == ("failure_streak", MAX_FAILURE_STREAK)
+    # The stop persists, so a rerun the same day sends nothing.
+    _, _, rerun, again = _run(tmp_path, tone, fake, n)
+    assert (again, rerun.requests) == ("rate_limited", 0)
+
+
+def test_a_scoring_outcome_resets_the_failure_streak(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    almost = [_json(503, {})] * (MAX_FAILURE_STREAK - 1)
+    fake = FakeShazam([*almost, _json(200, NO_MATCH), *almost])
+    server.append(fake)
+    _, _, client, stop = _run(tmp_path, tone, fake, 2 * MAX_FAILURE_STREAK - 1)
+    assert (stop, client.requests) == ("done", 2 * MAX_FAILURE_STREAK - 1)
 
 
 def test_the_client_requires_an_explicit_base_url(tmp_path: Path) -> None:
