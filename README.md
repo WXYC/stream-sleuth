@@ -31,7 +31,8 @@ python3 -m venv venv
 cp .env.example .env
 #   - set STREAM_SLEUTH_SHAZAM_SECRET to the SAME value as the API's SHAZAM_INGEST_SECRET
 #     (generate one with: openssl rand -hex 32); an existing WXDU_SHAZAM_SECRET still works
-#   - or, for WXYC: cp examples/wxyc.env .env (writes JSONL locally, no secret needed)
+#   - or, for WXYC: cp examples/wxyc.env .env and mkdir -p ~/.local/share/stream-sleuth
+#     (appends JSONL there, outside the checkout; no secret needed)
 
 # 4. test by hand
 ./run.sh
@@ -73,7 +74,7 @@ Every setting is `STREAM_SLEUTH_<NAME>`. WXDU's original `WXDU_<NAME>` spelling 
 |---|---|---|---|
 | `STREAM_SLEUTH_STREAM_URL` | `WXDU_STREAM_URL` | WXDU's 192 kbps stream | Stream to sample |
 | `STREAM_SLEUTH_OUTPUT` | (none) | `http` | `http` posts each new song to the API; `jsonl` appends it to a local file |
-| `STREAM_SLEUTH_OUTPUT_PATH` | (none) | (none) | The JSONL file; required when the output is `jsonl` |
+| `STREAM_SLEUTH_OUTPUT_PATH` | (none) | (none) | The JSONL file, an absolute path outside the checkout (e.g. under `~/.local/share/stream-sleuth/`); required when the output is `jsonl` |
 | `STREAM_SLEUTH_SHAZAM_API` | `WXDU_SHAZAM_API` | `https://api.wxdu.art/api/shazam` | Ingest endpoint for the `http` output |
 | `STREAM_SLEUTH_SHAZAM_SECRET` | `WXDU_SHAZAM_SECRET` | (none) | Shared secret; required for the `http` output |
 | `STREAM_SLEUTH_INTERVAL` | `WXDU_INTERVAL` | `23` | Pause between tries while getting hits, seconds |
@@ -82,7 +83,7 @@ Every setting is `STREAM_SLEUTH_<NAME>`. WXDU's original `WXDU_<NAME>` spelling 
 | `STREAM_SLEUTH_CAPTURE_SLOW` | `WXDU_CAPTURE_SLOW` | `12` | Capture length after a miss, seconds |
 | `STREAM_SLEUTH_VERBOSE` | `WXDU_VERBOSE` | off | `1`, `true`, or `yes` logs every cycle |
 
-The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret, or `jsonl` without a path. A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
+The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret (the message names the `WXDU_SHAZAM_SECRET` alias, as it always has), or `jsonl` without an absolute path in an existing directory. A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
 
 ## Development
 
