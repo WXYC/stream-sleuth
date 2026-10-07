@@ -319,7 +319,7 @@ class Selection:
     other contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
     could not be found at all; the one-per-show and per-slot caps are never relaxed
     to fill one. A ``subset/<group>`` shortfall (added by :func:`choose_subset`) is
-    neither: it counts four-hour-subset slots of that group left empty, never filled
+    neither: it counts four-hour-subset positions of that group left empty, never filled
     from another group, and says nothing about the corpus itself.
     """
 
@@ -423,7 +423,7 @@ def choose_subset(sel: Selection, stats: dict[str, HourStats]) -> list[str]:
     The two high hours are the top-ranked ``canonical-high`` hour and the top-ranked one
     from a different band, in the corpus's own ranking (reorder-flagged hours last); the
     low hour is the top-ranked ``canonical-low`` hour and the contrast hour the top-ranked
-    ``contrast`` hour. A slot with no candidate is a ``subset/<group>`` shortfall in
+    ``contrast`` hour. A subset position with no candidate is a ``subset/<group>`` shortfall in
     ``sel`` and is never filled from another group.
     """
 
