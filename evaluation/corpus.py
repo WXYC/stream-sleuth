@@ -30,10 +30,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from evaluation.archive import EASTERN, hour_key, hour_start
 from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers, title_keys
+from evaluation.selection import fail, load_selection
 from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
@@ -601,37 +602,24 @@ def read_selection(path: Path, export: Path, pool_db: Path) -> dict[str, dict[st
     its key's own :func:`band`, since plays stamp it on every record of the hour.
     """
 
-    def fail(problem: str) -> NoReturn:
-        raise SystemExit(f"{path}: {problem}")
-
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as e:
-        fail(f"cannot read: {e}")
-    except json.JSONDecodeError as e:
-        fail(f"not JSON ({e}); pass the selection.json that `select` wrote")
-    if not isinstance(record, dict):
-        fail("not an object")
-    hours = record.get("hours")
-    if hours is None:
-        fail("no `hours` key")
-    if not isinstance(hours, dict):
-        fail("`hours` is not an object")
+    record = load_selection(path)
+    hours = record["hours"]
     allowed = {"group": GROUPS, "band": tuple(BANDS)}
     for key, label in hours.items():
-        if not isinstance(label, dict):
-            fail(f"`hours` entry {key} is not an object")
         for field_, values in allowed.items():
             if label.get(field_) not in values:
-                fail(f"`hours` entry {key}: {field_} {label.get(field_)!r} is not one of {values}")
-        if not isinstance(label.get("subset"), bool):
-            fail(f"`hours` entry {key}: subset {label.get('subset')!r} is not a boolean")
+                fail(
+                    path,
+                    f"`hours` entry {key}: {field_} {label.get(field_)!r} is not one of {values}",
+                )
         try:
             own = band(key)
         except ValueError as e:
-            fail(f"`hours` entry {key}: {e}")
+            fail(path, f"`hours` entry {key}: {e}")
         if label["band"] != own:
-            fail(f"`hours` entry {key}: band {label['band']!r} is not the hour's own, {own!r}")
+            fail(
+                path, f"`hours` entry {key}: band {label['band']!r} is not the hour's own, {own!r}"
+            )
     made_from = record.get("export"), record.get("pool_db")
     if made_from[0] != export.name or Path(str(made_from[1])).resolve() != pool_db.resolve():
         log.warning(

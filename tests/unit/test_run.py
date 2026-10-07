@@ -151,46 +151,20 @@ def test_every_leg_reads_the_hours_of_selection_json(tmp_path: Path) -> None:
     assert read_hours(path) == {"all": [HOUR, OTHER], "subset": [HOUR]}
 
 
-@pytest.mark.parametrize(
-    ("hours", "names"),
-    [
-        ({HOUR: {"subset": True}, OTHER: {"subset": "false"}}, OTHER),  # a hand edit, truthy
-        ({HOUR: {"subset": 1}}, HOUR),
-        ({HOUR: {"group": "contrast"}}, HOUR),  # no subset label at all
-        ({HOUR: True}, HOUR),
-        ([HOUR, OTHER], "hours"),  # a list of keys, not an object keyed by hour
-    ],
-)
-def test_a_selection_without_a_boolean_subset_per_hour_is_refused_naming_it(
-    tmp_path: Path, hours: object, names: str
-) -> None:
+def test_a_selection_with_no_subset_hour_is_refused_in_one_line(tmp_path: Path) -> None:
     path = tmp_path / "selection.json"
-    path.write_text(json.dumps({"hours": hours}))
-    with pytest.raises(SystemExit, match=re.escape(names)) as refusal:
-        read_hours(path)
-    assert str(path) in str(refusal.value)
-
-
-@pytest.mark.parametrize(
-    ("text", "problem"),
-    [
-        (None, "cannot read"),  # no file at all
-        (f"{HOUR}\n{OTHER}\n", "not JSON"),  # hours.txt passed by mistake
-        (json.dumps([{"hours": {}}]), "not an object"),
-        (json.dumps({"hours": {}}), "no hours"),  # the subset legs would be done with 0 requests
-        (json.dumps({"hours": {HOUR: {"subset": False}}}), "no hour with subset: true"),
-    ],
-)
-def test_a_selection_that_cannot_drive_the_legs_is_refused_in_one_line(
-    tmp_path: Path, text: str | None, problem: str
-) -> None:
-    path = tmp_path / "selection.json"
-    if text is not None:
-        path.write_text(text)
+    path.write_text(json.dumps({"hours": {HOUR: {"subset": False}}}))  # the legs would send nothing
     with pytest.raises(SystemExit) as refusal:
         read_hours(path)
     message = str(refusal.value)
-    assert message.startswith(f"{path}: ") and problem in message and "\n" not in message
+    assert message == f"{path}: no hour with subset: true"
+
+
+def test_a_structurally_bad_selection_is_refused_by_the_shared_reader(tmp_path: Path) -> None:
+    path = tmp_path / "selection.json"
+    path.write_text(json.dumps({"hours": {HOUR: {"subset": "false"}}}))  # a hand edit, truthy
+    with pytest.raises(SystemExit, match=re.escape(f"{path}: `hours` entry {HOUR}: subset")):
+        read_hours(path)
 
 
 def test_two_shazam_legs_share_one_throttle(tmp_path: Path, shazam) -> None:
