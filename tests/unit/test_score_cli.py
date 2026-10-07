@@ -32,9 +32,11 @@ from tests.unit.test_score import (
     RECORDS,
     SHAZAM,
     STAGE,
+    UNLOGGED,
     _found,
     _hit,
     _hour,
+    _local,
 )
 
 SNAPSHOT = "rotation"
@@ -247,7 +249,9 @@ def test_a_leg_without_records_is_scored_with_everything_uncovered(data: Path) -
 
 
 @pytest.mark.parametrize(
-    "flag", ["--plays", "--out", "--near-misses", "--selection", "--archive-dir", "--store"]
+    "flag",
+    ["--plays", "--out", "--near-misses", "--false-positives", "--selection", "--archive-dir"]
+    + ["--store"],
 )
 def test_a_path_inside_the_checkout_or_relative_is_refused_before_anything_is_read(
     data: Path, flag: str
@@ -624,7 +628,7 @@ def inputs(data: Path) -> dict[str, Path]:
     }
 
 
-@pytest.mark.parametrize("output", ["--out", "--near-misses"])
+@pytest.mark.parametrize("output", ["--out", "--near-misses", "--false-positives"])
 @pytest.mark.parametrize("role", ["plays", "selection", "shazam store", "olaf store", "pool.db"])
 @pytest.mark.parametrize("alias", ["path", "symlink", "hardlink"])
 def test_an_output_that_is_an_input_is_refused_before_anything_is_written(
@@ -786,3 +790,232 @@ def test_a_failed_write_leaves_the_previous_score_file_whole(
         run_cli(data)
 
     assert (data / "score" / "score.json").read_bytes() == previous
+
+
+FP_QUEUE = "score/false_positives.csv"
+FP_HEADER = (
+    "leg,recognizer,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
+    "reference_artists,preflag,verdict"
+)
+LIKELY = "likely-unlogged-correct"
+
+
+def false_positives(
+    shazam: list[Emission],
+    olaf: list[Emission] | None = None,
+    references: dict[str, tuple[str, ...]] | None = None,
+) -> list[dict[str, Any]]:
+    """The false-positive queue for one 12 s leg, Shazam and (when given) Olaf, against RECORDS."""
+    plays = plays_from(RECORDS)
+    legs = {"12s/shazam": score.LegScore(cast(Any, None), attribute(plays, shazam), [])}
+    if olaf is not None:
+        verdicts = attribute(plays, olaf, references)
+        legs["12s/olaf"] = score.LegScore(cast(Any, None), verdicts, [])
+    return score.false_positive_rows(plays, legs, references)
+
+
+def unlogged(at: float, ref_start_s: float | None = None, hour: str = HOUR) -> Emission:
+    """A Shazam answer for a song no play names; ``ref_start_s`` is its match offset, if any."""
+    extra = {} if ref_start_s is None else {"query_offset_s": 0.0, "ref_start_s": ref_start_s}
+    return _hit(UNLOGGED, at, hour, **extra)
+
+
+def test_a_run_of_wrong_emissions_is_one_row_with_its_first_and_last_position() -> None:
+    hits = [unlogged(at) for at in (750.0, 765.0, 780.0)] + [_hit(PRATT, 795.0), unlogged(810.0)]
+
+    rows = false_positives(hits)
+
+    assert [(r["address"], r["last_address"], r["emissions"]) for r in rows] == [
+        (f"{HOUR}#750+12@128k", f"{HOUR}#780+12@128k", 3),
+        (f"{HOUR}#810+12@128k", f"{HOUR}#810+12@128k", 1),
+    ]
+    assert (rows[0]["leg"], rows[0]["recognizer"], rows[0]["hour_key"]) == (
+        "12s/shazam",
+        SHAZAM,
+        HOUR,
+    )
+    assert (rows[0]["start"], rows[0]["end"], rows[0]["verdict"]) == ("0:12:30", "0:13:12", "")
+    assert (rows[0]["artist"], rows[0]["song"], rows[0]["album"]) == UNLOGGED
+
+
+def test_a_run_the_near_miss_queue_holds_is_not_repeated() -> None:
+    near = ("Juana Molina", "Otra Cancion", "DOGA")  # shares the artist with a play in its window
+
+    rows = false_positives([_hit(near, 195.0), unlogged(750.0)])
+
+    assert [r["song"] for r in rows] == [UNLOGGED[1]]
+
+
+# Two emissions 15 s apart whose song-start estimates differ by ``drift``: a reference position that
+# does not advance with the wall clock differs by the whole 15 s step.
+STEADY = [
+    pytest.param(0.0, LIKELY, id="identical estimates"),
+    pytest.param(7.5, LIKELY, id="at the tolerance, half a grid step"),
+    pytest.param(-7.5, LIKELY, id="at the tolerance, the other way"),
+    pytest.param(7.6, "", id="just past the tolerance"),
+    pytest.param(-7.6, "", id="just past it, the other way"),
+    pytest.param(15.0, "", id="a reference position that stands still"),
+]
+
+
+@pytest.mark.parametrize(("drift", "preflag"), STEADY)
+def test_a_steady_song_start_across_the_run_is_preflagged(drift: float, preflag: str) -> None:
+    [row] = false_positives([unlogged(750.0, 100.0), unlogged(765.0, 115.0 - drift)])
+
+    assert row["preflag"] == preflag
+
+
+def test_the_estimate_is_judged_across_the_whole_run() -> None:
+    steady = [unlogged(750.0, 100.0), unlogged(765.0, 115.0), unlogged(780.0, 130.0)]
+    drifting = [*steady[:2], unlogged(780.0, 100.0)]
+
+    assert false_positives(steady)[0]["preflag"] == LIKELY
+    assert false_positives(drifting)[0]["preflag"] == ""
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param([unlogged(750.0, 100.0)], id="a single emission"),
+        pytest.param([unlogged(750.0), unlogged(765.0)], id="Shazam answers with null offsets"),
+        pytest.param([unlogged(750.0, 100.0), unlogged(765.0)], id="one with offsets, one without"),
+    ],
+)
+def test_fewer_than_two_emissions_with_offsets_cannot_be_steady(run: list[Emission]) -> None:
+    assert false_positives(run)[0]["preflag"] == ""
+
+
+def other(track: tuple[str, str, str], at: float, hour: str = HOUR) -> Emission:
+    """An Olaf answer at ``at`` that names its reference by ``STAGE``."""
+    emission = _local(track[0], at, STAGE)
+    found = {**emission.found, "song": track[1], "album": track[2]}
+    address = ClipAddress(hour, int(at), 12)
+    return Emission((address.key, OLAF), address, cast(Any, found))
+
+
+UNLOGGED_REMASTER = (UNLOGGED[0], f"{UNLOGGED[1]} (Remastered)", UNLOGGED[2])
+AGREEMENT = [
+    pytest.param(UNLOGGED, 765.0, HOUR, LIKELY, id="the same song inside the run's span"),
+    pytest.param(UNLOGGED_REMASTER, 750.0, HOUR, LIKELY, id="equal under names.fuzzy"),
+    pytest.param(UNLOGGED, 735.0, HOUR, "", id="before the run"),
+    pytest.param(UNLOGGED, 780.0, HOUR, "", id="after the run's last capture ends"),
+    pytest.param(UNLOGGED, 765.0, OTHER, "", id="in another hour"),
+    pytest.param((UNLOGGED[0], "Another Song", ""), 765.0, HOUR, "", id="another title"),
+    pytest.param(("Hermanos Gutiérrez", UNLOGGED[1], ""), 765.0, HOUR, "", id="another artist"),
+]
+
+
+@pytest.mark.parametrize(("track", "at", "hour", "preflag"), AGREEMENT)
+def test_the_other_recognizer_naming_the_same_song_in_the_runs_span_is_preflagged(
+    track: tuple[str, str, str], at: float, hour: str, preflag: str
+) -> None:
+    rows = false_positives([unlogged(750.0), unlogged(765.0)], [other(track, at, hour)])
+
+    assert [r["preflag"] for r in rows if r["recognizer"] == SHAZAM] == [preflag]
+
+
+def test_each_recognizers_run_is_flagged_by_the_other() -> None:
+    rows = false_positives([unlogged(750.0)], [other(UNLOGGED, 750.0)])
+
+    assert {r["leg"]: r["preflag"] for r in rows} == {"12s/shazam": LIKELY, "12s/olaf": LIKELY}
+
+
+def test_a_shazam_answer_naming_the_album_artist_agrees_with_an_olaf_reference_tag() -> None:
+    credited = ("Stereolab & Duo Tag", UNLOGGED[1], UNLOGGED[2])
+    references: dict[str, tuple[str, ...]] = {STAGE: ("Stereolab & Duo Tag", "Stereolab")}
+
+    flagged = false_positives([unlogged(750.0)], [other(credited, 750.0)], references)
+    bare = false_positives([unlogged(750.0)], [other(credited, 750.0)])
+
+    assert [r["preflag"] for r in flagged if r["recognizer"] == SHAZAM] == [LIKELY]
+    assert [r["preflag"] for r in bare if r["recognizer"] == SHAZAM] == [""]
+    assert [r["reference_artists"] for r in flagged if r["recognizer"] == OLAF] == [
+        "Stereolab & Duo Tag | Stereolab"
+    ]
+
+
+def test_a_run_is_not_flagged_by_a_different_capture_length() -> None:
+    plays = plays_from(RECORDS)
+    verdicts = attribute(plays, [unlogged(750.0)])
+    short = ClipAddress(HOUR, 750, 6)
+    answer = Emission((short.key, OLAF), short, cast(Any, _found(UNLOGGED, 750.0, source="local")))
+    legs = {
+        "12s/shazam": score.LegScore(cast(Any, None), verdicts, []),
+        "6s/olaf": score.LegScore(cast(Any, None), attribute(plays, [answer]), []),
+    }
+
+    rows = score.false_positive_rows(plays, legs, None)
+
+    assert {r["leg"]: r["preflag"] for r in rows} == {"12s/shazam": "", "6s/olaf": ""}
+
+
+def test_the_cli_writes_the_false_positive_queue_beside_the_score_file(data: Path) -> None:
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED, offset_s=100.0)
+    add_shazam(data, ClipAddress(HOUR, 765, 12), UNLOGGED, offset_s=115.0)
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)  # a near miss: the other queue's
+
+    run_cli(data)
+
+    path = data / FP_QUEUE
+    assert path.read_text(encoding="utf-8-sig").splitlines()[0] == FP_HEADER
+    [row] = read_queue(path)
+    assert (row["emissions"], row["song"], row["preflag"], row["verdict"]) == (
+        "2",
+        "French Disko",
+        LIKELY,
+        "",
+    )
+    assert [r["song"] for r in read_queue(data / QUEUE)] == ["Otra Canción"]
+
+
+def test_the_false_positive_queue_follows_out_and_its_own_flag(data: Path) -> None:
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    out = data / "elsewhere" / "shazam-only.json"
+
+    run_cli(data, "--out", str(out))
+    run_cli(data, "--out", str(out), "--false-positives", str(data / "fp.csv"))
+
+    assert [r["leg"] for r in read_queue(out.parent / "false_positives.csv")] == ["12s/shazam"]
+    assert [r["leg"] for r in read_queue(data / "fp.csv")] == ["12s/shazam"]
+
+
+def test_a_false_positive_queue_with_a_verdict_is_never_overwritten_and_nothing_is_written(
+    data: Path,
+) -> None:
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    run_cli(data)
+    queue = data / FP_QUEUE
+    filled = fill_verdict(queue, "unlogged-correct")
+    near = (data / QUEUE).read_bytes()
+    (data / "score" / "score.json").unlink()
+
+    with pytest.raises(SystemExit, match=r"false_positives\.csv.*verdict"):
+        run_cli(data)
+
+    assert queue.read_bytes() == filled
+    assert (data / QUEUE).read_bytes() == near
+    assert not (data / "score" / "score.json").exists()
+
+
+def test_a_filled_false_positive_queue_stops_the_run_before_the_near_miss_queue_is_rewritten(
+    data: Path,
+) -> None:
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    run_cli(data)
+    fill_verdict(data / FP_QUEUE, "talk")
+    (data / QUEUE).unlink()
+
+    with pytest.raises(SystemExit, match=r"false_positives\.csv"):
+        run_cli(data)
+
+    assert not (data / QUEUE).exists()
+
+
+def test_the_two_queues_may_not_share_a_path(data: Path) -> None:
+    shared = data / "score" / "both.csv"
+
+    with pytest.raises(SystemExit, match="same"):
+        run_cli(data, "--near-misses", str(shared), "--false-positives", str(shared))
+
+    assert not (data / "score").exists()
