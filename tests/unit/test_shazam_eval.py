@@ -28,6 +28,7 @@ import pytest
 from evaluation.clips import ClipAddress, ClipError
 from evaluation.shazam_eval import (
     MAX_FAILURE_STREAK,
+    MAX_RETRIES,
     CountingClient,
     ResultStore,
     ShazamOutcome,
@@ -369,6 +370,54 @@ def test_a_clock_stepped_back_across_midnight_keeps_the_later_days_stop(
     assert stepped_back.slept == []  # refused at once, not after sleeping into the later day
 
 
+def _iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+@pytest.mark.parametrize("ahead", [21.0, 3600.0, 90 * 86400.0])
+def test_a_future_dated_last_is_refused_with_one_error_and_no_sleep(
+    tmp_path: Path, ahead: float
+) -> None:
+    state = tmp_path / "throttle.json"
+    clock = _clock_at("2026-10-06T20:00:00")
+    with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
+        asyncio.run(throttle.acquire())
+    last = clock()
+    clock.now -= ahead  # a clock stepped back, or a state file written by one running ahead
+    with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
+        with pytest.raises(ValueError, match="future") as refused:
+            asyncio.run(throttle.acquire())
+    for expected in (str(state), _iso(last), _iso(clock())):
+        assert expected in str(refused.value)
+    assert clock.slept == []
+    assert json.loads(state.read_text())["count"] == 1  # nothing was counted
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "slept", "logged"),
+    [
+        (5.0, 15.0, False),  # an ordinary restart: the rest of the interval
+        (0.0, 20.0, False),  # exactly the interval is not long
+        (-5.0, 25.0, True),  # last is slightly ahead: longer than the interval
+        (-20.0, 40.0, True),  # the most that is not refused
+    ],
+)
+def test_a_wait_longer_than_the_interval_is_logged_before_sleeping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, elapsed: float, slept: float, logged: bool
+) -> None:
+    state = tmp_path / "throttle.json"
+    clock = _clock_at("2026-10-06T20:00:00")
+    with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
+        asyncio.run(throttle.acquire())
+        clock.slept.clear()
+        clock.now += elapsed
+        with caplog.at_level("WARNING"):
+            asyncio.run(throttle.acquire())
+    assert clock.slept == [slept]
+    assert bool(caplog.records) is logged
+    assert (str(state) in caplog.text) is logged
+
+
 def test_resume_skips_scoring_outcomes_and_retries_errors(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
@@ -376,8 +425,9 @@ def test_resume_skips_scoring_outcomes_and_retries_errors(
         [_json(200, JUANA_MOLINA), _json(503, {}), _json(200, NO_MATCH), _json(200, NO_MATCH)]
     )
     server.append(fake)
-    _run(tmp_path, tone, fake, 3)
-    store, _, client, _ = _run(tmp_path, tone, fake, 3)
+    clock = _clock_at("2026-10-06T20:00:00")  # shared: a restart's clock never runs behind the file
+    _run(tmp_path, tone, fake, 3, clock=clock)
+    store, _, client, _ = _run(tmp_path, tone, fake, 3, clock=clock)
     assert client.requests == 1  # only the 503 address is retried
     kinds = [(r["address"], r["kind"]) for r in store.records()]
     second = str(_addresses(3)[1])
@@ -490,6 +540,92 @@ def test_never_tried_addresses_go_before_retries_so_a_bad_stretch_cannot_stall_t
     day_two = [r["address"] for r in store.records()][MAX_FAILURE_STREAK:]
     expected = _addresses(n)[MAX_FAILURE_STREAK:] + _addresses(n)[:MAX_FAILURE_STREAK]
     assert (stop, day_two) == ("done", [str(a) for a in expected])
+
+
+def _later(clock: FakeClock, days: int = 1) -> FakeClock:
+    clock.now += days * 86400  # the next UTC day, so a stop or the cap does not carry over
+    return clock
+
+
+def test_an_address_is_retried_at_most_max_retries_times_then_reported_and_not_queried(
+    tmp_path: Path, tone: Path, server: list[FakeShazam], caplog: pytest.LogCaptureFixture
+) -> None:
+    attempts = 1 + MAX_RETRIES
+    fake = FakeShazam([_json(503, {})] * attempts + [_json(200, NO_MATCH)])
+    server.append(fake)
+    clock = _clock_at("2026-10-06T20:00:00")
+    for _ in range(attempts):
+        store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
+        assert (stop, client.requests) == ("done", 1)
+    assert store.history()[2] == {(str(_addresses(1)[0]), recognizer_identity(12))}
+    with caplog.at_level("WARNING"):
+        _, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
+    assert (stop, client.requests, len(fake.requests)) == ("done", 0, attempts)
+    assert str(_addresses(1)[0]) in caplog.text  # reported, so a person can look
+
+
+def test_an_exhausted_address_does_not_block_the_others(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    fake = FakeShazam([_json(503, {})] * (1 + MAX_RETRIES) + [_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    clock = _clock_at("2026-10-06T20:00:00")
+    for _ in range(1 + MAX_RETRIES):
+        _run(tmp_path, tone, fake, 1, clock=clock)
+    store, _, client, stop = _run(tmp_path, tone, fake, 3, clock=clock)
+    assert (stop, client.requests) == ("done", 2)
+    assert [r["address"] for r in store.records()][-2:] == [str(a) for a in _addresses(3)[1:]]
+
+
+@pytest.mark.parametrize("status", [429, 403])
+def test_a_stop_status_is_the_load_or_the_policy_not_the_addresss_fault(
+    tmp_path: Path, tone: Path, server: list[FakeShazam], status: int
+) -> None:
+    fake = FakeShazam([_json(status, {})] * (1 + MAX_RETRIES) + [_json(200, NO_MATCH)])
+    server.append(fake)
+    clock = _clock_at("2026-10-06T20:00:00")
+    for _ in range(1 + MAX_RETRIES):
+        _run(tmp_path, tone, fake, 1, clock=_later(clock))
+    store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=_later(clock))
+    assert (stop, client.requests) == ("done", 1)
+    assert store.history()[2] == set()
+
+
+def test_the_history_is_the_one_source_of_scored_tried_and_exhausted(tmp_path: Path) -> None:
+    store = ResultStore(tmp_path / "shazam.jsonl")
+    who = recognizer_identity(12)
+    fail = [(503, "server_error"), (200, "decode_error")]
+    many = 2 * (1 + MAX_RETRIES)
+    rows = [
+        ("scored", 200, "matched"),
+        ("rescored", *fail[0]),  # failed once, then scored: never exhausted
+        ("rescored", 200, "no_match"),
+        *[("flaky", *fail[i % 2]) for i in range(MAX_RETRIES)],  # one short of exhausted
+        *[("dead", *fail[i % 2]) for i in range(1 + MAX_RETRIES)],  # first failure + the retries
+        *[("loaded", 429, "rate_limited")] * many,  # a stop status is not the address's fault
+        *[("denied", 403, "server_error")] * many,
+    ]
+    for address, status, kind in rows:
+        store.append(address, who, ShazamOutcome(status, kind))
+    scored, tried, exhausted = store.history()
+    assert scored == {("scored", who), ("rescored", who)}
+    assert tried == {(a, who) for a in ("scored", "rescored", "flaky", "dead", "loaded", "denied")}
+    assert exhausted == {("dead", who)}
+
+
+def test_a_403_stops_the_day_as_forbidden_after_one_request(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    fake = FakeShazam([_json(403, {"error": "forbidden"})] + [_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    clock = _clock_at("2026-10-06T20:00:00")
+    store, throttle, client, stop = _run(tmp_path, tone, fake, 3, clock=clock)
+    assert (stop, client.requests, len(fake.requests)) == ("forbidden", 1, 1)
+    assert [(r["status"], r["kind"]) for r in store.records()] == [(403, "server_error")]
+    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] == "forbidden"
+    # The stop persists with its own reason: a rerun the same day sends nothing.
+    _, _, rerun, again = _run(tmp_path, tone, fake, 3, clock=clock)
+    assert (again, rerun.requests, len(fake.requests)) == ("forbidden", 0, 1)
 
 
 def test_a_scoring_outcome_resets_the_failure_streak(

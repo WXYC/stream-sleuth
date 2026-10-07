@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from evaluation.shazam_eval import Throttle, ThrottleBusyError, hour_addresses, main
+from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, hour_addresses, main
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
 from tests.unit.test_shazam_eval import HTML_429, FakeShazam, _json
@@ -100,6 +100,28 @@ def test_a_429_stops_the_cli_for_the_day(tmp_path: Path) -> None:
     assert [r["kind"] for r in _records(tmp_path / "shazam.jsonl")] == ["matched", "rate_limited"]
     assert len(fake.requests) == 2
     assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] == "rate_limited"
+
+
+def test_the_end_summary_lists_addresses_that_are_out_of_retries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _make_hour(tmp_path / "archive", HOUR, 20)  # one clip: 0 s
+    fake = FakeShazam([_json(503, {})] * (1 + MAX_RETRIES))
+    argv = [*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)]
+    try:
+        for _ in range(MAX_RETRIES):
+            assert main(argv) == 0
+        assert "out of retries" not in caplog.text
+        with caplog.at_level("WARNING"):
+            assert main(argv) == 0  # the last allowed retry
+            caplog.clear()
+            assert main(argv) == 0  # nothing left to query
+    finally:
+        fake.close()
+    assert len(fake.requests) == 1 + MAX_RETRIES
+    messages = [r.getMessage() for r in caplog.records]
+    summary = [m for m in messages if "out of retries and not queried" in m]
+    assert len(summary) == 1 and f"{HOUR}#0+12@128k" in summary[0]
 
 
 def test_missing_and_unreadable_hours_are_logged_and_skipped_without_a_request(
