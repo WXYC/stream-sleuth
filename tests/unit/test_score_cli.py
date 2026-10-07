@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -1039,7 +1040,7 @@ def test_a_run_that_grew_after_it_was_labeled_is_logged_and_not_applied(
 
     [grown] = [r.getMessage() for r in caplog.records if "grown" in r.getMessage()]
     assert "false_positives.csv" in grown and "row 2" in grown
-    assert "765" in grown and "780" in grown and "2" in grown and "3" in grown
+    assert re.search(r"2 emissions; now \S+, 3\); ignored", grown)
     assert (data / FP_QUEUE).read_bytes() == filled
     leg = read_score(data)["legs"]["12s/shazam"]
     assert leg["adjudicated_runs"] == 0
@@ -1061,3 +1062,38 @@ def test_an_unchanged_run_still_applies_whatever_a_spreadsheet_made_of_its_exten
     run_cli(data)
 
     assert read_score(data)["legs"]["12s/shazam"]["adjudicated_runs"] == 1
+
+
+def test_a_run_that_filled_a_gap_in_its_middle_is_not_applied(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first and last addresses are unchanged; only the count tells the run has grown."""
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    add_shazam(data, ClipAddress(HOUR, 780, 12), UNLOGGED)
+    run_cli(data)
+    filled = fill_verdict(data / FP_QUEUE, "unlogged-correct")
+    add_shazam(data, ClipAddress(HOUR, 765, 12), UNLOGGED)
+    caplog.set_level("WARNING")
+
+    run_cli(data)
+
+    [grown] = [r.getMessage() for r in caplog.records if "grown" in r.getMessage()]
+    assert re.search(r"2 emissions; now \S+, 3\); ignored", grown)
+    assert (data / FP_QUEUE).read_bytes() == filled
+    assert read_score(data)["legs"]["12s/shazam"]["adjudicated_runs"] == 0
+
+
+@pytest.mark.parametrize("emissions", ["2.9", "2.5", "1.99", "two", ""])
+def test_an_emissions_cell_that_is_not_the_whole_count_is_a_mismatch_never_truncated(
+    data: Path, caplog: pytest.LogCaptureFixture, emissions: str
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    fill_verdict(data / FP_QUEUE, "unlogged-correct")
+    set_cells(data / FP_QUEUE, "12s/shazam", emissions=emissions)
+    caplog.set_level("WARNING")
+
+    run_cli(data)
+
+    assert any("grown or shrunk" in r.getMessage() for r in caplog.records)
+    assert read_score(data)["legs"]["12s/shazam"]["adjudicated_runs"] == 0
