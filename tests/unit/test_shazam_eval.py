@@ -25,11 +25,13 @@ from pathlib import Path
 import aiohttp
 import pytest
 
+from evaluation import shazam_eval
 from evaluation.clips import ClipAddress, ClipError
 from evaluation.shazam_eval import (
     MAX_FAILURE_STREAK,
     MAX_RETRIES,
     CountingClient,
+    FutureStateError,
     ResultStore,
     ShazamOutcome,
     Throttle,
@@ -385,7 +387,7 @@ def test_a_future_dated_last_is_refused_with_one_error_and_no_sleep(
     last = clock()
     clock.now -= ahead  # a clock stepped back, or a state file written by one running ahead
     with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
-        with pytest.raises(ValueError, match="future") as refused:
+        with pytest.raises(FutureStateError, match="future") as refused:
             asyncio.run(throttle.acquire())
     for expected in (str(state), _iso(last), _iso(clock())):
         assert expected in str(refused.value)
@@ -547,8 +549,8 @@ def _later(clock: FakeClock, days: int = 1) -> FakeClock:
     return clock
 
 
-def test_an_address_is_retried_at_most_max_retries_times_then_reported_and_not_queried(
-    tmp_path: Path, tone: Path, server: list[FakeShazam], caplog: pytest.LogCaptureFixture
+def test_an_address_is_retried_at_most_max_retries_times_then_not_queried(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     attempts = 1 + MAX_RETRIES
     fake = FakeShazam([_json(503, {})] * attempts + [_json(200, NO_MATCH)])
@@ -558,10 +560,8 @@ def test_an_address_is_retried_at_most_max_retries_times_then_reported_and_not_q
         store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
         assert (stop, client.requests) == ("done", 1)
     assert store.history()[2] == {(str(_addresses(1)[0]), recognizer_identity(12))}
-    with caplog.at_level("WARNING"):
-        _, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
+    _, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
     assert (stop, client.requests, len(fake.requests)) == ("done", 0, attempts)
-    assert str(_addresses(1)[0]) in caplog.text  # reported, so a person can look
 
 
 def test_an_exhausted_address_does_not_block_the_others(
@@ -591,7 +591,7 @@ def test_a_stop_status_is_the_load_or_the_policy_not_the_addresss_fault(
     assert store.history()[2] == set()
 
 
-def test_the_history_is_the_one_source_of_scored_tried_and_exhausted(tmp_path: Path) -> None:
+def test_the_history_is_the_one_source_of_scored_last_status_and_exhausted(tmp_path: Path) -> None:
     store = ResultStore(tmp_path / "shazam.jsonl")
     who = recognizer_identity(12)
     fail = [(503, "server_error"), (200, "decode_error")]
@@ -607,9 +607,19 @@ def test_the_history_is_the_one_source_of_scored_tried_and_exhausted(tmp_path: P
     ]
     for address, status, kind in rows:
         store.append(address, who, ShazamOutcome(status, kind))
-    scored, tried, exhausted = store.history()
+    scored, last, exhausted = store.history()
     assert scored == {("scored", who), ("rescored", who)}
-    assert tried == {(a, who) for a in ("scored", "rescored", "flaky", "dead", "loaded", "denied")}
+    assert last == {
+        (a, who): s
+        for a, s in (
+            ("scored", 200),
+            ("rescored", 200),
+            ("flaky", fail[(MAX_RETRIES - 1) % 2][0]),
+            ("dead", fail[MAX_RETRIES % 2][0]),
+            ("loaded", 429),
+            ("denied", 403),
+        )
+    }
     assert exhausted == {("dead", who)}
 
 
@@ -692,6 +702,146 @@ def test_a_request_is_counted_before_it_is_sent(
         asyncio.run(t.acquire())
     assert clock.slept == [15.0]  # the unsent request was counted and its time kept
     assert json.loads((tmp_path / "throttle.json").read_text())["count"] == 2
+
+
+def _go(
+    tmp_path: Path,
+    tone: Path,
+    fake: FakeShazam,
+    addresses: list[ClipAddress],
+    store: ResultStore | None = None,
+    *,
+    clock: FakeClock | None = None,
+) -> tuple[ResultStore, CountingClient, str]:
+    """``run`` over exactly ``addresses`` (``_run`` always builds a prefix of the grid)."""
+    clock = clock or _clock_at("2026-10-06T20:00:00")
+    store = store or ResultStore(tmp_path / "shazam.jsonl")
+
+    @contextmanager
+    def open_clip(address: ClipAddress) -> Iterator[Path]:
+        yield tone
+
+    with Throttle(
+        tmp_path / "throttle.json", 500, 20.0, clock=clock, sleep=clock.sleep
+    ) as throttle:
+        client = CountingClient(throttle, base_url=fake.url)
+        return store, client, asyncio.run(run(addresses, open_clip, store, client))
+
+
+def test_a_repeated_address_is_queried_and_stored_once(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    a, b, _ = _addresses(3)
+    fake = FakeShazam([_json(200, NO_MATCH), _json(200, JUANA_MOLINA), _json(200, NO_MATCH)])
+    server.append(fake)
+    store, client, stop = _go(tmp_path, tone, fake, [a, b, a])
+    assert (stop, client.requests, len(fake.requests)) == ("done", 2, 2)
+    assert [r["address"] for r in store.records()] == [str(a), str(b)]  # first position kept
+
+
+class _NoUnionSet(set):
+    """A set that fails the test if ``run`` builds ``scored | exhausted`` once per address."""
+
+    def __or__(self, other: object) -> set:
+        raise AssertionError("the pending filter rebuilds a union per address")
+
+
+def test_the_pending_filter_builds_no_union_per_address(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    class Store(ResultStore):
+        def history(self):
+            scored, last, exhausted = super().history()
+            return _NoUnionSet(scored), last, _NoUnionSet(exhausted)
+
+    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    _, client, stop = _go(tmp_path, tone, fake, _addresses(2), Store(tmp_path / "shazam.jsonl"))
+    assert (stop, client.requests) == ("done", 2)
+
+
+def test_an_address_whose_last_answer_was_a_stop_status_goes_after_the_other_retries(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    denied, flaky, slow = _addresses(3)  # grid order puts the denied address first
+    who = recognizer_identity(12)
+    store = ResultStore(tmp_path / "shazam.jsonl")
+    store.append(str(flaky), who, ShazamOutcome(503, "server_error"))
+    store.append(str(denied), who, ShazamOutcome(403, "server_error"))  # the day's first request
+    store.append(str(slow), who, ShazamOutcome(503, "server_error"))
+    fake = FakeShazam([_json(200, NO_MATCH)] * 3)
+    server.append(fake)
+    store, _, stop = _go(tmp_path, tone, fake, [denied, flaky, slow], store)
+    assert stop == "done"
+    assert [r["address"] for r in store.records()][3:] == [str(a) for a in (flaky, slow, denied)]
+
+
+def test_a_stop_status_that_was_later_answered_otherwise_no_longer_trails(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    first, second = _addresses(2)
+    who = recognizer_identity(12)
+    store = ResultStore(tmp_path / "shazam.jsonl")
+    store.append(str(first), who, ShazamOutcome(403, "server_error"))
+    store.append(str(first), who, ShazamOutcome(503, "server_error"))  # the last word
+    store.append(str(second), who, ShazamOutcome(503, "server_error"))
+    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    store, _, _ = _go(tmp_path, tone, fake, [first, second], store)
+    assert [r["address"] for r in store.records()][3:] == [str(first), str(second)]
+
+
+def test_a_refused_state_logs_the_summary_and_exits_non_zero_with_one_message(
+    tmp_path: Path,
+    tone: Path,
+    server: list[FakeShazam],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeShazam([])
+    server.append(fake)
+    addresses = _addresses(2)
+    monkeypatch.setattr(shazam_eval, "hour_addresses", lambda *a: addresses)
+
+    @contextmanager
+    def cut(address: ClipAddress, hour_path: Path, work_dir: Path) -> Iterator[Path]:
+        yield tone
+
+    monkeypatch.setattr(shazam_eval, "cut", cut)
+    who = recognizer_identity(12)
+    store, state = tmp_path / "shazam.jsonl", tmp_path / "throttle.json"
+    results = ResultStore(store)
+    for _ in range(1 + MAX_RETRIES):  # one address is already out of retries
+        results.append(str(addresses[1]), who, ShazamOutcome(503, "server_error"))
+    now = datetime.now(timezone.utc)
+    state.write_text(
+        json.dumps(
+            {
+                "day": now.date().isoformat(),
+                "count": 1,
+                "last": now.timestamp() + 3600,
+                "stopped": False,
+            }
+        )
+    )
+    hours = tmp_path / "hours.txt"
+    hours.write_text(HOUR + "\n")
+    argv = [
+        *("--hours", str(hours), "--archive-dir", str(tmp_path), "--base-url", fake.url),
+        *("--work-dir", str(tmp_path / "work"), "--store", str(store), "--state", str(state)),
+    ]
+    with caplog.at_level("INFO"):
+        assert shazam_eval.main(argv) == 1
+    assert fake.requests == []
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "stopped: refused after 0 requests" in text
+    assert "out of retries and not queried" in text and str(addresses[1]) in text
+    refusals = [r.getMessage() for r in caplog.records if "future" in r.getMessage()]
+    assert len(refusals) == 1 and "\n" not in refusals[0] and str(state) in refusals[0]
+    # What to do: wait or fix the clock; deleting the state file is not the fix.
+    assert "wait" in refusals[0] and "clock" in refusals[0]
+    assert "deleting" in refusals[0] and "resets" in refusals[0]
+    assert json.loads(state.read_text())["count"] == 1
 
 
 def test_external_api_is_declared_excluded_and_opted_out_of_ci_sync() -> None:

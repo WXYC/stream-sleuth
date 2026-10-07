@@ -317,3 +317,21 @@ def test_hour_duration_raises_when_ffmpeg_reports_no_audio(tmp_path, monkeypatch
 def test_hour_duration_raises_for_a_missing_hour(tmp_path):
     with pytest.raises(clips.ClipError):
         clips.hour_duration(tmp_path / "absent.mp3")
+
+
+def test_a_repeated_hour_key_is_gridded_once_with_one_warning_naming_it(
+    tmp_path, monkeypatch, caplog
+):
+    other = "2026/08/12/202608121700.mp3"
+    decoded: list[str] = []
+
+    def measure(path):
+        decoded.append(path.name)
+        return 3600.0
+
+    monkeypatch.setattr(clips, "hour_duration", measure)
+    with caplog.at_level("WARNING"):
+        addresses = clips.hour_addresses([HOUR, other, HOUR, HOUR], tmp_path, 12, "128k")
+    assert addresses == clips.grid(HOUR, 12, hour_s=3600.0) + clips.grid(other, 12, hour_s=3600.0)
+    assert len(decoded) == 2  # the repeat is not decoded again
+    assert [HOUR in r.getMessage() for r in caplog.records] == [True]

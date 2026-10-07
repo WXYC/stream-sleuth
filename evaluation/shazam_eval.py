@@ -121,6 +121,10 @@ class DayStoppedError(Exception):
     """The throttle refuses any more requests today; ``args[0]`` says why."""
 
 
+class FutureStateError(ValueError):
+    """The throttle state's last request is further ahead of the clock than one interval."""
+
+
 class ThrottleBusyError(Exception):
     """Another process holds the throttle state file's lock."""
 
@@ -129,8 +133,12 @@ class Throttle:
     """At most ``rate_per_day`` requests per UTC day, ``min_interval_s`` apart, persisted to ``state_path``.
 
     The state file records the UTC day, the requests sent that day, the time of
-    the last one, and whether a 429 stopped the day, so a restarted process
-    honors all four. ``state_path`` is refused if it is relative or inside the
+    the last one, and the reason a stop gave for the day (``stop_for_day``: a 429
+    or 403 status, or the failure streak), so a restarted process honors all four.
+    ``acquire()`` raises ``DayStoppedError`` once the day is stopped or at its cap,
+    and ``FutureStateError`` for a last request more than one interval ahead of the
+    clock, which it never sleeps on and which deleting the file would only hide.
+    ``state_path`` is refused if it is relative or inside the
     checkout (``DataPathError``); its directory must exist. One process per state
     file: opening takes a non-blocking exclusive ``flock`` on ``<state_path>.lock``
     and holds it until ``close()`` (or process exit), and a second opener gets
@@ -205,8 +213,10 @@ class Throttle:
             last, now = state["last"], self.clock()
             wait = 0.0 if last is None else last + self.min_interval_s - now
             if wait > 2 * self.min_interval_s:  # last is more than an interval ahead of now
-                raise ValueError(
-                    f"{self.state_path}: last {_utc(last)} is in the future of now {_utc(now)}"
+                raise FutureStateError(
+                    f"{self.state_path}: last {_utc(last)} is in the future of now {_utc(now)}; "
+                    "wait until the clock passes it, or correct the clock; deleting the state "
+                    "file resets the day's count and clears any stop, so it is not the fix"
                 )
             if wait <= 0:
                 break
@@ -280,21 +290,22 @@ class ResultStore:
         except OSError:  # missing or empty
             return False
 
-    def history(self) -> tuple[set[Key], set[Key], set[Key]]:
-        """The scored, tried, and exhausted keys: the one tally that ``run`` and the report share.
+    def history(self) -> tuple[set[Key], dict[Key, int], set[Key]]:
+        """The scored keys, each tried key's latest status, and the exhausted keys: the one tally
+        that ``run`` and the report share.
 
         A key is exhausted after a first failure and ``MAX_RETRIES`` failed retries, where a
         failure is a non-scoring outcome that is not a day-stopping status.
         """
-        scored, tried, failures = set[Key](), set[Key](), Counter[Key]()
+        scored, last, failures = set[Key](), dict[Key, int](), Counter[Key]()
         for r in self.records():
             key = (r["address"], r["recognizer"])
-            tried.add(key)
+            last[key] = r["status"]
             if r["kind"] in SCORING_KINDS:
                 scored.add(key)
             elif r["status"] not in STOP_REASONS:
                 failures[key] += 1
-        return scored, tried, {key for key, n in failures.items() if n > MAX_RETRIES}
+        return scored, last, {key for key, n in failures.items() if n > MAX_RETRIES}
 
     def append(self, address: str, recognizer: str, outcome: ShazamOutcome) -> None:
         record = {
@@ -314,23 +325,23 @@ async def run(
     store: ResultStore,
     client: CountingClient,
 ) -> str:
-    """Query every unscored address in order, except those out of retries (logged, not queried).
+    """Query every unscored address once, in order, except those out of retries (not queried).
 
     Returns ``done``, ``rate_limited``, ``forbidden`` (a 403), ``daily_cap``, or
     ``failure_streak`` (after ``MAX_FAILURE_STREAK`` non-scoring outcomes in a row);
     all but ``done`` and ``daily_cap`` stop the day like a 429.
     """
-    scored, tried, exhausted = store.history()
+    scored, last, exhausted = store.history()
 
     def key(address: ClipAddress) -> Key:
         return (str(address), recognizer_identity(address.length_s))
 
-    for k in exhausted:
-        log.warning("not querying %s (%s): out of retries", *k)
-    pending = [a for a in addresses if key(a) not in scored | exhausted]
-    # Never-tried addresses first, so a stretch that always fails is retried only after
-    # them and cannot trip the failure streak at the same place every day.
-    pending.sort(key=lambda a: key(a) in tried)  # stable: grid order within each group
+    by_key = {key(a): a for a in addresses}  # a repeated address is queried once, where first seen
+    pending = [a for k, a in by_key.items() if k not in scored and k not in exhausted]
+    # Never-tried addresses first, so a stretch that always fails is retried only after them
+    # and cannot trip the failure streak at the same place every day; then retries, and last
+    # those whose latest answer stopped the day, so one address cannot lead every day's queue.
+    pending.sort(key=lambda a: (key(a) in last, last.get(key(a)) in STOP_REASONS))  # stable
     streak = 0
     for address in pending:
         shazam = Shazam(http_client=client, segment_duration_seconds=address.length_s)
@@ -391,18 +402,22 @@ def main(argv: list[str] | None = None) -> int:
         addresses = hour_addresses(
             args.hours.read_text().split(), args.archive_dir, args.length, args.profile
         )
-        stop = asyncio.run(
-            run(
-                addresses,
-                lambda a: cut(a, args.archive_dir / a.hour_key, work_dir),
-                store,
-                client,
+        try:
+            stop = asyncio.run(
+                run(
+                    addresses,
+                    lambda a: cut(a, args.archive_dir / a.hour_key, work_dir),
+                    store,
+                    client,
+                )
             )
-        )
+        except FutureStateError as refusal:  # still log the summary below
+            log.error("%s", refusal)
+            stop = "refused"
     log.info("stopped: %s after %d requests", stop, client.requests)
     if exhausted := sorted(store.history()[2]):
         log.warning("out of retries and not queried: %s", exhausted)
-    return 0
+    return int(stop == "refused")
 
 
 if __name__ == "__main__":
