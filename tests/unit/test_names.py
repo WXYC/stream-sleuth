@@ -549,6 +549,14 @@ def test_title_keys(artist: str | None, title: str | None, keys: list[tuple[str,
         ("Jessica Pratt feat. Juana Molina", ["jessica pratt"]),
         ("Jessica Pratt (with Juana Molina)", ["jessica pratt"]),
         ("Stereolab（ステレオラブ）", ["stereolab"]),
+        # The split runs after the cruft rules: a credit swallows a separator after it.
+        ("Jessica Pratt feat. Juana Molina & Cat Power", ["jessica pratt"]),
+        ("Jessica Pratt featuring Juana Molina and Cat Power", ["jessica pratt"]),
+        # A separator is inside a clause only when the clause is balanced: a name may end in
+        # closers.
+        ("Sunn O))) & Boris", ["sunn o boris", "boris|sunn o"]),
+        ("Boris & Sunn O)))", ["boris sunn o", "boris|sunn o"]),
+        ("Hibiscus (Juana Molina & Cat Power)", ["hibiscus"]),
         # A dotted initialism is one word on each side of a separator.
         ("R.E.M. + A.R. Kane", ["rem ar kane", "ar kane|rem"]),
     ],
@@ -600,6 +608,11 @@ def test_artist_keys(artist: str | None, keys: list[str]) -> None:
         ("Cass McCombs Chris Cohen", "Cass McCombs & Chris Cohen", "fuzzy"),
         # A last-name-first tag is not a reordered credit.
         ("Chris Cohen", "Cohen, Chris", None),
+        # An unbalanced closer is part of a name, not a clause: both orders join.
+        ("Sunn O))) & Boris", "Boris & Sunn O)))", "fuzzy"),
+        ("Boris & Sunn O)))", "Sunn O))) and Boris", "fuzzy"),
+        # A credit swallows a separator after it, so these name one artist and join no reorder.
+        ("Cass McCombs feat. Chris Cohen & Jessica Pratt", "Jessica Pratt & Cass McCombs", None),
     ],
 )
 def test_title_tier_joins_a_co_credit_in_another_order(
