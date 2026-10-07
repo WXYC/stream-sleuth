@@ -61,6 +61,10 @@ _CRUFT = re.compile(
     re.IGNORECASE,
 )
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
+# A bracketed clause with one of these whole words names a different recording, so the fuzzy key keeps it.
+VERSION_QUALIFIERS = frozenset(
+    "live remix mix demo edit version acoustic instrumental session rehearsal".split()
+)
 
 
 def parse_add_time(text: str) -> datetime:
@@ -107,11 +111,19 @@ def fuzzy(s: str | None) -> str:
 
     ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
     full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
-    Letters and digits of every script outside brackets survive (a Japanese or
-    Cyrillic name keeps a real key); a name that is all brackets keys to "" and never
-    joins on this tier. Underscores and punctuation separate.
+    A clause with a :data:`VERSION_QUALIFIERS` word is kept, its words in the key, so
+    "Back, Baby (Live)" never joins the studio "Back, Baby". Letters and digits of every
+    script outside brackets survive (a Japanese or Cyrillic name keeps a real key); a
+    name that is all brackets keys to "" and never joins on this tier. Underscores and
+    punctuation separate.
     """
-    return " ".join(re.sub(r"[\W_]+", " ", _BRACKETED.sub(" ", fold(album_key(s)))).split())
+
+    def drop_unless_version(m: re.Match[str]) -> str:
+        return m.group() if VERSION_QUALIFIERS.intersection(re.findall(r"\w+", m.group())) else " "
+
+    return " ".join(
+        re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, fold(album_key(s)))).split()
+    )
 
 
 Key = tuple[str, str]
