@@ -864,6 +864,7 @@ def test_a_cli_on_another_shazamio_version_refuses_before_the_lock_or_any_reques
     with pytest.raises(SystemExit) as refusal:
         entry(argv)
     assert refusal.value.code not in (0, None)
+    assert "9.9.9" in str(refusal.value)  # the version guard refused, not a later check
     assert fake.requests == []
     assert list(tmp_path.glob("throttle.json*")) == []  # no state file and no <state>.lock
     assert not (tmp_path / "data").exists()
