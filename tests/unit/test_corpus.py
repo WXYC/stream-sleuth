@@ -1375,12 +1375,14 @@ def plays_main(tmp_path: Path, pool_db: Path, *selector: str) -> list[dict[str, 
 
 
 def test_plays_from_a_selection_carry_each_hours_group_band_and_subset(
-    tmp_path: Path, pool_db: Path
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     out = tmp_path / "frozen"
     run_select(tmp_path, pool_db, out)
     plays = plays_main(tmp_path, pool_db, "--selection", str(out / "selection.json"))
     assert any(p["carryover"] for p in plays)
+    # Unchanged inputs: the recomputed counts (carryover plays excluded) match the frozen ones.
+    assert "ranking basis" not in caplog.text
     stamped = {(p["hour_key"], p["group"], p["band"], p["subset"]) for p in plays}
     assert stamped == {
         (HOURS[0], "canonical-high", "daytime", True),
