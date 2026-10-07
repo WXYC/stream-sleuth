@@ -414,7 +414,9 @@ class Selection:
     from an unused show and slot, so its place went to the next best hour from the
     other contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
     could not be found at all; the one-per-show and per-slot caps are never relaxed
-    to fill one.
+    to fill one. A ``subset/<group>`` shortfall (added by :func:`choose_subset`) is
+    neither: it counts four-hour-subset slots of that group left empty, never filled
+    from another group, and says nothing about the corpus itself.
     """
 
     hours: dict[str, tuple[str, str]] = field(default_factory=dict)
