@@ -320,6 +320,36 @@ def test_the_tag_lookup_turns_null_tags_into_empty_strings(db):
     assert pool.tag_lookup(db)(stage) == {"artist": "", "song": "", "album": "", "label": ""}
 
 
+@pytest.mark.parametrize(
+    ("artist", "album_artist", "expected"),
+    [
+        (None, "Juana Molina", "Juana Molina"),
+        ("", "Juana Molina", "Juana Molina"),
+        ("Jessica Pratt", "Juana Molina", "Jessica Pratt"),
+        ("Jessica Pratt", None, "Jessica Pratt"),
+        (None, None, ""),
+        ("", "", ""),
+        (None, "", ""),
+    ],
+    ids=[
+        "null-artist-falls-back",
+        "empty-artist-falls-back",
+        "artist-wins",
+        "artist-only",
+        "both-null",
+        "both-empty",
+        "null-and-empty",
+    ],
+)
+def test_the_tag_lookup_falls_back_to_the_album_artist_when_the_artist_tag_is_empty(
+    db, artist, album_artist, expected
+):
+    # PoolIndex joins a play on either tag, so a file with only an album_artist is in the pool.
+    stage = _record(db, "rotation/Heavy/doga/01.mp3", artist=artist, album_artist=album_artist)
+
+    assert pool.tag_lookup(db)(stage)["artist"] == expected
+
+
 @pytest.mark.parametrize("case", ["failed", "unknown"])
 def test_the_tag_lookup_gives_a_reference_it_cannot_vouch_for_no_song(db, case):
     # A failed file may still be in the index; a hit on it must be a miss, never its sha1.
