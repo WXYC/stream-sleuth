@@ -37,7 +37,8 @@ OTHER = "2026/08/12/202608121700.mp3"
 HOURS = {"all": [HOUR, OTHER], "subset": [HOUR]}
 
 Setup = namedtuple("Setup", "store client fake")
-FREE = namedtuple("usage", "total used free")(0, 0, 1 << 40)
+Usage = namedtuple("Usage", "total used free")
+FREE = Usage(0, 0, 1 << 40)
 
 
 @pytest.fixture(autouse=True)
