@@ -223,3 +223,113 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
 def test_qualifiers(names: tuple[str, str], play: set[str], pool: set[str]) -> None:
     assert norm.qualifiers(*names) == play
     assert norm.named_qualifiers(*names) == pool
+
+
+@pytest.mark.parametrize(
+    ("artist", "title", "keys"),
+    [
+        (
+            "Jessica Pratt",
+            "Back, Baby",
+            [("exact", ("jessica pratt", "back, baby")), ("fuzzy", ("jessica pratt", "back baby"))],
+        ),
+        # Cruft goes on the exact key too; a diacritic folds on both.
+        (
+            "Hermanos Gutiérrez",
+            "Sol (feat. Someone)",
+            [("exact", ("hermanos gutierrez", "sol")), ("fuzzy", ("hermanos gutierrez", "sol"))],
+        ),
+        # A key with an empty part is left out, and only that tier's.
+        ("Juana Molina", "（ザ・ワーム）", [("exact", ("juana molina", "（ザ・ワーム）"))]),
+        (
+            "Juana Molina",
+            "(Live)",
+            [("exact", ("juana molina", "(live)")), ("fuzzy", ("juana molina", "live"))],
+        ),
+        ("Juana Molina", "", []),
+        ("", "la paradoja", []),
+        (None, None, []),
+    ],
+)
+def test_title_keys(artist: str | None, title: str | None, keys: list[tuple[str, tuple[str, str]]]):
+    assert norm.title_keys(artist, title) == keys
+
+
+@pytest.mark.parametrize(
+    ("play", "recording", "tier"),
+    [
+        # The same spelling joins on the exact key; punctuation and case alone, on the fuzzy.
+        (("Jessica Pratt", "x", "Back, Baby"), ("Jessica Pratt", "y", "Back, Baby"), "exact"),
+        (("jessica pratt", "x", "back baby!"), ("Jessica Pratt", "y", "Back, Baby"), "fuzzy"),
+        (("Jessica Pratt", "x", "Back, Baby"), ("Jessica Pratt", "y", "Other"), None),
+        (("Jessica Pratt", "x", "Back, Baby"), ("Juana Molina", "y", "Back, Baby"), None),
+        # Featuring and edition clauses drop out on either side.
+        (
+            ("Jessica Pratt", "x", "Back, Baby (feat. Someone)"),
+            ("Jessica Pratt", "y", "Back, Baby"),
+            "exact",
+        ),
+        (
+            ("Jessica Pratt", "x", "Back, Baby"),
+            ("Jessica Pratt", "y", "Back, Baby (Remastered 2011 Version)"),
+            "exact",
+        ),
+        (
+            ("Jessica Pratt", "Edits (Deluxe Version)", "Back, Baby"),
+            ("Jessica Pratt", "Edits", "Back, Baby"),
+            "exact",
+        ),
+        # A version the play names, in its title or its album, must be named by the recording.
+        (("Jessica Pratt", "x", "Back, Baby (Live)"), ("Jessica Pratt", "y", "Back, Baby"), None),
+        (
+            ("Jessica Pratt", "Edits [Live]", "Back, Baby"),
+            ("Jessica Pratt", "y", "Back, Baby"),
+            None,
+        ),
+        (
+            ("Jessica Pratt", "x", "Back, Baby (Live)"),
+            ("Jessica Pratt", "y", "Back, Baby (Live)"),
+            "exact",
+        ),
+        (
+            ("Jessica Pratt", "x", "Back, Baby (Live)"),
+            ("Jessica Pratt", "Live at KEXP", "Back, Baby"),
+            None,
+        ),
+        (
+            ("Jessica Pratt", "x", "Back, Baby (Live)"),
+            ("Jessica Pratt", "Live at KEXP", "Back, Baby (Live)"),
+            "exact",
+        ),
+        # ...but the recording may name more than the play does.
+        (("Jessica Pratt", "x", "Back, Baby"), ("Jessica Pratt", "y", "Back, Baby (Live)"), None),
+        # The fuzzy key stems a qualifier, so "(Remixed)" meets "(Remix)".
+        (
+            ("Jessica Pratt", "x", "Back, Baby (Remixed)"),
+            ("Jessica Pratt", "y", "Back, Baby (Remix)"),
+            "fuzzy",
+        ),
+        # An empty part never joins, on either side.
+        (("Jessica Pratt", "x", ""), ("Jessica Pratt", "y", ""), None),
+        (("", "x", "Back, Baby"), ("", "y", "Back, Baby"), None),
+        (("Jessica Pratt", "x", "Back, Baby"), ("", "y", "Back, Baby"), None),
+        (("Jessica Pratt", "x", "Back, Baby"), (None, "y", None), None),
+    ],
+)
+def test_title_tier(
+    play: tuple[str, str, str], recording: tuple[str | None, str, str | None], tier: str | None
+) -> None:
+    artist, album, title = recording
+    assert norm.title_tier(*play, [artist], album, title) == tier
+
+
+def test_title_tier_joins_either_of_two_artist_names() -> None:
+    play = ("Stereolab", "x", "Brakhage")
+    artists = ["Stereolab（ステレオラブ）", "Various Artists"]
+    assert norm.title_tier(*play, artists, "Dots and Loops", "Brakhage") == "fuzzy"
+    assert (
+        norm.title_tier("Various Artists", "x", "Brakhage", artists, "Dots", "Brakhage") == "exact"
+    )
+    assert norm.title_tier("Juana Molina", "x", "Brakhage", artists, "Dots", "Brakhage") is None
+    assert norm.title_tier(*play, [None, ""], "Dots and Loops", "Brakhage") is None
+    assert norm.title_tier(*play, [], "Dots and Loops", "Brakhage") is None

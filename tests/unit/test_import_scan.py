@@ -6,6 +6,7 @@ org's test-patterns doc asks for) and only then run over the real tree.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -120,7 +121,13 @@ def test_real_tree_has_no_s3_write_or_presign_names():
     ],
 )
 @pytest.mark.parametrize(
-    "relative", ["evaluation/run.py", "evaluation/shazam_eval.py", "stream_sleuth/loop.py"]
+    "relative",
+    [
+        "evaluation/run.py",
+        "evaluation/shazam_eval.py",
+        "evaluation/names.py",
+        "stream_sleuth/loop.py",
+    ],
 )
 def test_station_scan_flags_a_wxyc_module_imported_by_station_neutral_code(
     tmp_path, source, relative
@@ -163,3 +170,18 @@ def test_station_scan_does_not_flag_other_evaluation_modules(tmp_path):
 
 def test_real_tree_keeps_the_wxyc_modules_out_of_station_neutral_code():
     assert scan_for_station_imports(REPO_ROOT) == []
+
+
+def test_names_imports_no_station_module():
+    """``names.py`` is the join's station-neutral half: it must not reach the WXYC modules."""
+    tree = ast.parse((REPO_ROOT / "evaluation" / "names.py").read_text())
+    imported = {
+        name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for name in (
+            [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+        )
+    }
+
+    assert not [m for m in imported if m.startswith(("evaluation.corpus", "evaluation.archive"))]
