@@ -16,14 +16,17 @@ import pytest
 from evaluation import score
 from evaluation.clips import ClipAddress, grid
 from evaluation.run import Emission, Leg, read_results
-from evaluation.score import Play, attribute, load_emissions, plays_from, score_plays
+from evaluation.score import attribute, load_emissions, plays_from, score_plays
 from evaluation.shazam_eval import ResultStore
 from stream_sleuth.recognizers.base import EvalIdentification
+from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 HOUR = "2026/08/12/202608121600.mp3"
 EMPTY = "2026/08/12/202608121700.mp3"  # gridded, never queried
 SHORT = "2026/08/12/202608121800.mp3"  # decodes to 1,800 s
+OTHER = "2026/08/12/202608121900.mp3"  # outside the leg's hours
 SHAZAM = "shazam@0.8.1, segment=12"
+OLAF = olaf_identity("rotation")
 LEG = Leg("12s", 12, "128k", "all")
 PADS = {"canonical": 180.0, "etl": 220.0}
 
@@ -60,6 +63,11 @@ def _hour(
                 "reorder_flag": False,
                 "play_order_status": "single_writer",
                 "carryover": t < 0,
+                "in_pool": True,
+                "pool_match_tier": "exact",
+                "group": "canonical-high",
+                "band": "daytime",
+                "subset": False,
                 **extra,
             }  # fmt: skip
         )
@@ -69,14 +77,14 @@ def _hour(
 # Windows: carryover [0, 300], 1 [0, 780], 2 [420, 1080], 3 [720, 1680], 4 [1320, 2580],
 # 5 [2220, 3600]. Play 4's show is reorder-flagged and play 5's play order is unreliable: neither
 # changes attribution, which reads windows and logged intervals only. Play 4's interval runs
-# through a talk break (2,100 s to 2,400 s) in which nothing is logged.
+# through a talk break (2,100 s to 2,400 s) in which nothing is logged. Play 3 is out of the pool.
 RECORDS = _hour(
     HOUR,
     "canonical",
     (100, -200.0, HERMANOS, {}),
     (1, 120.0, MOLINA, {}),
     (2, 600.0, PRATT, {}),
-    (3, 900.0, PRATT, {}),  # the same song twice in a row
+    (3, 900.0, PRATT, {"in_pool": False, "pool_match_tier": None}),  # the same song twice
     (4, 1500.0, CHUQUI, {"reorder_flag": True}),
     (5, 2400.0, ELLINGTON, {"play_order_status": "unreliable", "reorder_flag": None}),
 )
@@ -90,9 +98,9 @@ def _found(track: tuple[str, str, str], at: float, **extra: Any) -> EvalIdentifi
     return {**found, **extra}  # type: ignore[typeddict-item]
 
 
-def _hit(track: tuple[str, str, str], at: float, **extra: Any) -> Emission:
+def _hit(track: tuple[str, str, str], at: float, hour: str = HOUR, **extra: Any) -> Emission:
     """A 12 s Shazam emission at grid offset ``at``, as ``read_results`` would return it."""
-    address = ClipAddress(HOUR, int(at), 12)
+    address = ClipAddress(hour, int(at), 12)
     return Emission((address.key, SHAZAM), address, _found(track, at, **extra))
 
 
@@ -126,6 +134,11 @@ def _hit(track: tuple[str, str, str], at: float, **extra: Any) -> Emission:
             id="a version the play does not name is wrong",
         ),
         pytest.param(("REM", "Drive", ""), 750.0, None, False, id="not this hour's song"),
+        pytest.param(PRATT, 420.0, 2, True, id="at the window's start, which is inside it"),
+        pytest.param(CHUQUI, 1320.0, 4, True, id="at the other window's start"),
+        pytest.param(CHUQUI, 2580.0, 4, True, id="at the window's end, which is inside it"),
+        pytest.param(CHUQUI, 1500.0, 4, False, id="at the logged start, inside the interval"),
+        pytest.param(CHUQUI, 2400.0, 4, True, id="at the logged end, outside the interval"),
     ],
 )
 def test_attribution(
@@ -176,6 +189,34 @@ def test_precision_and_distinct_song_precision() -> None:
     assert score.distinct_precision(verdicts) == pytest.approx(4 / 5)
 
 
+@pytest.mark.parametrize(
+    ("hits", "plain", "distinct"),
+    [
+        pytest.param(
+            [_hit(MOLINA, 195.0), _hit(("JUANA MOLINA", "La Paradoja", "DOGA"), 210.0), _hit(UNLOGGED, 2205.0)],
+            2 / 3, 1 / 2, id="the loop's key: artist and song, case-folded with lower()",
+        ),
+        pytest.param(
+            [_hit(MOLINA, 195.0), _hit(MOLINA, 990.0)], 1 / 2, 1.0,
+            id="a run is correct when any of it is, though one emission is past the window",
+        ),
+        pytest.param(
+            [_hit(ELLINGTON, 3585.0), _hit(ELLINGTON, 0.0, hour=EMPTY)], 1 / 2, 1 / 2,
+            id="a run ends at the hour's end",
+        ),
+        pytest.param(
+            [_hit(PRATT, 450.0), _hit(UNLOGGED, 2205.0), _hit(PRATT, 750.0)], 2 / 3, 1 / 2,
+            id="runs are read in at order, not input order",
+        ),
+    ],
+)  # fmt: skip
+def test_distinct_song_runs(hits: list[Emission], plain: float, distinct: float) -> None:
+    verdicts = attribute(plays_from(RECORDS), hits)
+    assert (score.precision(verdicts), score.distinct_precision(verdicts)) == pytest.approx(
+        (plain, distinct)
+    )
+
+
 def test_precision_of_nothing_is_none() -> None:
     assert (score.precision([]), score.distinct_precision([]), score.recall([])) == (
         None,
@@ -197,12 +238,39 @@ def test_recall_time_to_first_identification_and_lag() -> None:
         5: False,
     }
     assert score.recall(rows) == pytest.approx(4 / 5)
-    # Play 2 started at 435 s by both offset-bearing hits; it was first heard at 450 s, logged at 600 s.
-    assert (by_id[2].ttfi_s, by_id[2].lag_s) == (15.0, 165.0)
+    # Play 2 started at 435 s by its earliest offset-bearing hit; first heard at 450 s, logged at 600 s.
+    assert (by_id[2].first_s, by_id[2].ttfi_s, by_id[2].lag_s) == (450.0, 15.0, 165.0)
     # Play 4 started at 1,380 + 2 - 32 = 1,350 s, and was logged at 1,500 s.
-    assert (by_id[4].ttfi_s, by_id[4].lag_s) == (30.0, 150.0)
+    assert (by_id[4].first_s, by_id[4].ttfi_s, by_id[4].lag_s) == (1380.0, 30.0, 150.0)
     # No hit on play 1 carries offsets (a Shazam answer with a null offset_s): no lag, no time.
-    assert (by_id[1].ttfi_s, by_id[1].lag_s) == (None, None)
+    assert (by_id[1].first_s, by_id[1].ttfi_s, by_id[1].lag_s) == (195.0, None, None)
+
+
+@pytest.mark.parametrize(
+    ("hits", "first", "ttfi", "lag"),
+    [
+        pytest.param(
+            [_hit(MOLINA, 150.0, query_offset_s=0.0, ref_start_s=30.0),
+             _hit(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=60.0),
+             _hit(MOLINA, 450.0, query_offset_s=0.0, ref_start_s=90.0)],
+            150.0, 30.0, 80.0, id="the earliest clip with offsets sets the start, not the median",
+        ),
+        pytest.param(
+            [_hit(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=180.0), _hit(MOLINA, 135.0)],
+            135.0, 15.0, 80.0, id="an earlier offset-less answer is the first identification only",
+        ),
+        pytest.param(
+            [_hit(MOLINA, 150.0, query_offset_s=10.0, ref_start_s=0.0)], 150.0, 0.0, 40.0,
+            id="a song that starts inside the first clip is identified at once, never before",
+        ),
+    ],
+)  # fmt: skip
+def test_the_song_start_is_the_earliest_offset_bearing_clips(
+    hits: list[Emission], first: float, ttfi: float, lag: float
+) -> None:
+    plays = plays_from(_hour(HOUR, "canonical", (1, 200.0, MOLINA, {})))
+    [row] = score_plays(plays, attribute(plays, hits), covered=set(plays))
+    assert (row.first_s, row.ttfi_s, row.lag_s) == (first, ttfi, lag)
 
 
 def test_recall_counts_covered_plays_only() -> None:
@@ -213,26 +281,33 @@ def test_recall_counts_covered_plays_only() -> None:
     assert {r.play.play_id: r.ttfi_s for r in rows}[2] is None  # timed only when covered
 
 
-def _rows(era: str, lags: list[float]) -> list[score.PlayScore]:
-    play = Play(HOUR, 1, 0.0, 600.0, 0.0, 780.0, "", "", "", era, False)
-    return [score.PlayScore(play, True, True, None, lag) for lag in lags]
+def _rows(era: str, lags: list[float | None]) -> list[score.PlayScore]:
+    [play] = plays_from(_hour(HOUR, era, (1, 0.0, MOLINA, {})))
+    return [score.PlayScore(play, True, True, None, None, lag) for lag in lags]
 
 
 @pytest.mark.parametrize(
     ("lags", "pad"),
     [
-        pytest.param([10.0] * 19, None, id="19 samples: insufficient data"),
+        pytest.param([10.0] * 19, score.Pad(180.0, 19, None), id="19 samples: insufficient data"),
         pytest.param(
-            [float(n) for n in range(-10, 10)], 9.0, id="20 samples: nearest-rank p95 of |lag|"
+            [float(n) for n in range(-10, 10)], score.Pad(180.0, 20, 9.0),
+            id="20 samples under the default: the default stands",
         ),
-        pytest.param([float(n) for n in range(1, 101)], 95.0, id="nearest rank covers 95 of 100"),
-        pytest.param([700.0] * 25, 600.0, id="capped at 600 s"),
+        pytest.param(
+            [3.0 * n for n in range(1, 101)], score.Pad(285.0, 100, 285.0),
+            id="over the default: the pad covers p95 of |lag|",
+        ),
+        pytest.param(
+            [float(n) for n in range(190, 211)], score.Pad(209.0, 21, 209.0),
+            id="nearest rank: the 20th of 21, not the 19th",
+        ),
+        pytest.param([700.0] * 25, score.Pad(600.0, 25, 700.0), id="capped at 600 s"),
     ],
-)
-def test_pad_per_era(lags: list[float], pad: float | None) -> None:
-    rows = _rows("canonical", lags) + _rows("etl", [5.0] * 3) + _rows("canonical", [])
-    rows.append(score.PlayScore(rows[0].play, True, True, None, None))  # no offsets: not a sample
-    assert score.pads(rows) == {"canonical": pad, "etl": None}
+)  # fmt: skip
+def test_pad_per_era(lags: list[float], pad: score.Pad) -> None:
+    rows = _rows("canonical", [*lags, None]) + _rows("etl", [250.0] * 20)  # None: no offsets
+    assert score.pads(rows) == {"canonical": pad, "etl": score.Pad(250.0, 20, 250.0)}
 
 
 def _store_line(address: str, kind: str, track: tuple[str, str, str] = MOLINA, **extra: Any) -> str:
@@ -249,23 +324,39 @@ def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
     short = _hour(SHORT, "etl", (7, 300.0, MOLINA, {}), (8, 1200.0, PRATT, {}))
     records = RECORDS + _hour(EMPTY, "canonical", (6, 60.0, CHUQUI, {})) + short
     addresses = grid(HOUR, 12) + grid(EMPTY, 12) + grid(SHORT, 12, hour_s=1800.0)
-    lines = [
-        _store_line(a.key, "no_match")
-        for a in addresses
-        if a.hour_key == SHORT or (a.hour_key == HOUR and a.offset_s not in (195, 2700))
+    # SHORT's records run to 3,585 s, but past 1,785 s they are not in its decoded grid.
+    lines = [_store_line(a.key, "no_match") for a in grid(SHORT, 12)]
+    lines += [
+        _store_line(a.key, "no_match") for a in grid(HOUR, 12) if a.offset_s not in (195, 2700)
     ]
     lines += [
         _store_line(f"{HOUR}#2700+12@128k", "server_error", status=503),  # in play 5's window only
         _store_line(f"{HOUR}#195+12@128k", "matched"),
         _store_line(f"{HOUR}#195+12@128k", "matched"),  # a repeat: counted once
         _store_line(f"{HOUR}#195+12@320k", "matched"),  # another leg
+        _store_line(
+            f"{HOUR}#195+12@128k",
+            "matched",
+            CHUQUI,
+            recognizer=OLAF,
+            confidence=40.0,
+            query_offset_s=0.0,
+            ref_start_s=0.0,
+            ref_key="ab" * 20,
+        ),  # another recognizer
+        _store_line(f"{OTHER}#195+12@128k", "matched"),  # an hour outside the leg
     ]
     path = tmp_path / "results.jsonl"
     path.write_text("".join(lines), encoding="utf-8")
-    results = read_results([ResultStore(path)], {SHAZAM})
+    results = read_results([ResultStore(path)], {SHAZAM, OLAF})
 
     leg = score.score_leg(
-        plays_from(records), results, SHAZAM, LEG, [HOUR, EMPTY, SHORT], addresses
+        plays_from(records + _hour(OTHER, "canonical", (9, 60.0, MOLINA, {}))),
+        results,
+        SHAZAM,
+        LEG,
+        [HOUR, EMPTY, SHORT],
+        addresses,
     )
 
     assert leg.coverage == score.Coverage(
@@ -282,7 +373,23 @@ def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
     assert [(v.emission.found["at"], v.play.play_id if v.play else None) for v in leg.verdicts] == [
         (195.0, 1)
     ]
-    assert score.recall(leg.plays) == pytest.approx(1 / 5)  # the uncovered plays are not misses
+    # The uncovered plays are not misses, and play 3 is out of the pool.
+    assert (leg.recall, leg.in_pool_recall) == pytest.approx((1 / 5, 1 / 4))
+
+
+@pytest.mark.parametrize(
+    ("offset", "uncovered"),
+    [(2205, {4}), (2220, {4, 5}), (2580, {4, 5}), (2595, {5})],
+)
+def test_an_address_on_a_window_edge_gates_that_play(
+    tmp_path: Path, offset: int, uncovered: set[int]
+) -> None:
+    lines = [_store_line(a.key, "no_match") for a in grid(HOUR, 12) if a.offset_s != offset]
+    path = tmp_path / "results.jsonl"
+    path.write_text("".join(lines), encoding="utf-8")
+    results = read_results([ResultStore(path)], {SHAZAM})
+    leg = score.score_leg(plays_from(RECORDS), results, SHAZAM, LEG, [HOUR], grid(HOUR, 12))
+    assert {r.play.play_id for r in leg.plays if not r.covered} == uncovered
 
 
 def test_a_leg_with_no_grid_leaves_every_play_uncovered(tmp_path: Path) -> None:
@@ -319,9 +426,10 @@ def test_an_emissions_file_scores_as_the_same_emissions_in_memory(tmp_path: Path
     assert attribute(plays, loaded) == attribute(plays, HITS)
 
 
-def _emissions_file(tmp_path: Path, *records: dict) -> Path:
+def _emissions_file(tmp_path: Path, *records: dict | str) -> Path:
+    """An emissions file of ``records`` after a blank line; a str is written as the line itself."""
     path = tmp_path / "emissions.jsonl"
-    lines = [json.dumps(r, ensure_ascii=False) for r in records]
+    lines = [r if isinstance(r, str) else json.dumps(r, ensure_ascii=False) for r in records]
     path.write_text("\n".join(lines[:1] + [""] + lines[1:]) + "\n", encoding="utf-8")
     return path
 
@@ -342,16 +450,28 @@ def _line(offset: float, /, **changes: Any) -> dict:
         ({"address": f"{HOUR}#200+12@128k"}, "not on the 15 s grid"),
         ({"address": f"{HOUR}#195+12"}, "not a clip address"),
         ({"at": 180.0}, "not its address's offset"),
+        ({"at": False}, "at False is not a number"),
+        ({"address": 195}, "address 195 is not a string"),
+        ({"artist": None}, r"no artist\b"),
+        ('{"address": "' + HOUR, "not JSON"),  # a line torn mid-append
+        ("null", "not a JSON object"),
+        ("[1, 2]", "not a JSON object"),
     ],
 )
-def test_a_record_without_a_valid_address_at_or_source_raises_naming_its_line(
-    tmp_path: Path, changes: dict, problem: str
+def test_a_malformed_record_raises_naming_its_line(
+    tmp_path: Path, changes: dict | str, problem: str
 ) -> None:
-    path = _emissions_file(tmp_path, _line(150.0), _line(195.0, **changes))
+    second = changes if isinstance(changes, str) else _line(195.0, **changes)
+    path = _emissions_file(tmp_path, _line(150.0), second)
     with pytest.raises(ValueError, match=rf"emissions\.jsonl:3: .*{problem}"):
         load_emissions(path, SHAZAM)
 
 
-def test_an_emissions_file_spans_hours(tmp_path: Path) -> None:
-    path = _emissions_file(tmp_path, _line(150.0), _line(195.0, address=f"{EMPTY}#195+12@128k"))
-    assert [e.address.hour_key for e in load_emissions(path, SHAZAM)] == [HOUR, EMPTY]
+def test_an_emissions_file_spans_hours_and_capture_lengths(tmp_path: Path) -> None:
+    """A replay of the 6 s / 12 s cadence mixes capture lengths in one file; ``attribute`` keeps
+    every emission, since only ``score_leg`` (the grid path) selects a capture length."""
+    six = _line(150.0, address=f"{HOUR}#150+6@128k")
+    path = _emissions_file(tmp_path, six, _line(195.0, address=f"{EMPTY}#195+12@128k"))
+    loaded = load_emissions(path, SHAZAM)
+    assert [str(e.address) for e in loaded] == [f"{HOUR}#150+6@128k", f"{EMPTY}#195+12@128k"]
+    assert len(attribute(plays_from(RECORDS), loaded)) == 2

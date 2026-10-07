@@ -6,9 +6,11 @@ writes; it never reads a flowsheet, a database, or station config, and never imp
 :mod:`evaluation.corpus` or :mod:`evaluation.archive` (the station import scan enforces it).
 
 Both inputs become :class:`evaluation.run.Emission` (store key, parsed address, identification)
-before attribution, so attribution and every figure run on one code path. An emission is
-**correct** when :func:`evaluation.names.title_tier` is not None for it and a candidate play, a play whose window holds the emission's ``at``, by the in-pool join's rules: the
-play stands where the join's play does and the emission where its pool file does. Among correct
+before :func:`attribute`, so attribution, precision, and per-play scores run on one code path;
+only coverage differs (:func:`score_leg` computes a grid leg's, and the replay reports its own).
+An emission is **correct** when :func:`evaluation.names.title_tier` is not None for it and a
+candidate play, a play whose window holds the emission's ``at``, under the in-pool join's rules:
+the play stands where the join's play does and the emission where its pool file does. Among correct
 candidates it goes to the play whose logged interval holds ``at``, else the earliest; a correct
 emission outside that interval is also a **neighbor** match. A play's logged interval runs from
 its ``t_offset_s`` to the next play's in its hour, the last to 3,600 s.
@@ -22,13 +24,12 @@ from __future__ import annotations
 
 import json
 import math
-import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from evaluation import names
 from evaluation.clips import ClipAddress, grid
@@ -54,7 +55,13 @@ class Play(NamedTuple):
     album: str | None
     title: str | None
     era: str
+    pad_s: float
     carryover: bool
+    in_pool: bool | None
+    pool_match_tier: str | None
+    group: str | None
+    band: str
+    subset: bool
 
 
 class Verdict(NamedTuple):
@@ -66,16 +73,29 @@ class Verdict(NamedTuple):
 
 
 class PlayScore(NamedTuple):
-    """One scored play. ``ttfi_s`` (covered plays only) is its first correct emission's ``at``
-    less the song's start, ``lag_s`` its logged offset less the song's start; both are None when
-    none of its emissions carries ``query_offset_s`` and ``ref_start_s``. The start is the median
-    of those emissions' ``at + query_offset_s - ref_start_s``."""
+    """One scored play. ``first_s`` is its first correct emission's ``at``; ``ttfi_s`` (covered
+    plays only) is ``first_s`` less the song's start, never below 0, and ``lag_s`` the logged
+    offset less the song's start. The start is ``at + query_offset_s - ref_start_s`` of the
+    play's earliest correct emission that carries both offsets, as Phase 1 measured the lag
+    that set the pads; a Shazam answer with a null offset is skipped, and with none left both
+    are None (``first_s`` and ``t_offset_s`` still give an approximate time)."""
 
     play: Play
     covered: bool
     identified: bool
+    first_s: float | None
     ttfi_s: float | None
     lag_s: float | None
+
+
+class Pad(NamedTuple):
+    """An era's pad: the default (its plays' ``pad_s``) unless the nearest-rank 95th-percentile
+    absolute lag exceeds it, then that, capped at 600 s. ``p95_s`` is None (insufficient data,
+    the default stands) below 20 lag samples."""
+
+    pad_s: float
+    samples: int
+    p95_s: float | None
 
 
 @dataclass(frozen=True)
@@ -96,8 +116,17 @@ class LegScore:
     verdicts: list[Verdict]
     plays: list[PlayScore]
 
+    @property
+    def recall(self) -> float | None:
+        return recall(self.plays)
+
+    @property
+    def in_pool_recall(self) -> float | None:
+        return recall([r for r in self.plays if r.play.in_pool])
+
 
 _RECORD_FIELDS = [f for f in Play._fields if f != "logged_end_s"]
+_REQUIRED = ("address", "at", "source", "artist", "song", "album", "label")
 
 
 def plays_from(records: Iterable[dict[str, Any]]) -> list[Play]:
@@ -122,9 +151,10 @@ def read_plays(path: Path) -> list[Play]:
 def load_emissions(path: Path, recognizer: str) -> list[Emission]:
     """A replay's emissions file (UTF-8 JSONL, as ``JsonlOutput`` writes it), keyed under ``recognizer``.
 
-    Every record must carry ``address`` (a canonical clip address, which names the hour), ``at``
-    (that address's grid offset), and ``source``, or ``ValueError`` names the line: a defaulted
-    ``at`` would attribute the emission to the hour's first play. ``emitted_at`` is a wall-clock
+    Every record must be a JSON object carrying ``address`` (a canonical clip address, which names
+    the hour), ``at`` (that address's grid offset), ``source``, and the wire keys, or
+    ``ValueError`` names the line: a defaulted ``at`` would attribute the emission to the hour's
+    first play. ``emitted_at`` is a wall-clock
     stamp, not an hour offset, and is dropped with ``address``, so ``found`` holds what a stored
     answer's would.
     """
@@ -132,17 +162,28 @@ def load_emissions(path: Path, recognizer: str) -> list[Emission]:
     for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
-        found = json.loads(line)
         try:
-            if missing := [f for f in ("address", "at", "source") if f not in found]:
+            found = json.loads(line)
+        except ValueError as e:
+            raise ValueError(f"{path}:{n}: not JSON: {e}") from e
+        try:
+            if not isinstance(found, dict):
+                raise ValueError("the line is not a JSON object")
+            if missing := [f for f in _REQUIRED if f not in found]:
                 raise ValueError(f"the record has no {' or '.join(missing)}")
+            if not isinstance(found["address"], str):
+                raise ValueError(f"address {found['address']!r} is not a string")
+            if type(found["at"]) not in (int, float):
+                raise ValueError(f"at {found['at']!r} is not a number")
             address = ClipAddress.parse(found.pop("address"))
             if found["at"] != address.offset_s:
                 raise ValueError(f"at {found['at']} is not its address's offset")
         except ValueError as e:
             raise ValueError(f"{path}:{n}: {e}") from e
         found.pop("emitted_at", None)
-        emissions.append(Emission((address.key, recognizer), address, found))
+        emissions.append(
+            Emission((address.key, recognizer), address, cast(EvalIdentification, found))
+        )
     return emissions
 
 
@@ -176,8 +217,10 @@ def precision(verdicts: Sequence[Verdict]) -> float | None:
 
 
 def distinct_precision(verdicts: Sequence[Verdict]) -> float | None:
-    """Precision over runs of consecutive identical emissions (same hour, artist, and song), as
-    the loop, which emits only on change, would show them; a run is correct when any of it is."""
+    """Precision over runs of consecutive identical emissions, as the loop, which emits only on
+    change, would show them; a run is correct when any of it is. Identical is ``loop.step``'s
+    key, ``(artist.lower(), song.lower())``, within one hour: the replay drives each hour
+    with a fresh loop, so a song across the top of the hour starts a second run."""
     runs: list[list[Verdict]] = []
     for v in verdicts:
         if runs and _song(runs[-1][-1]) == _song(v):
@@ -188,7 +231,8 @@ def distinct_precision(verdicts: Sequence[Verdict]) -> float | None:
 
 
 def _song(v: Verdict) -> tuple[str, str, str]:
-    return v.emission.address.hour_key, v.emission.found["artist"], v.emission.found["song"]
+    f = v.emission.found
+    return v.emission.address.hour_key, f["artist"].lower(), f["song"].lower()
 
 
 def score_plays(
@@ -203,18 +247,17 @@ def score_plays(
     for p in plays:
         if p.carryover:
             continue
-        hits = found[p]
-        starts = [
-            h["at"] + h["query_offset_s"] - h["ref_start_s"]
-            for h in hits
-            if "query_offset_s" in h and "ref_start_s" in h
-        ]
-        start = statistics.median(starts) if starts else None
+        hits = sorted(found[p], key=lambda h: h["at"])
+        first = hits[0]["at"] if hits else None
+        timed = [h for h in hits if "query_offset_s" in h and "ref_start_s" in h]
+        start = (
+            timed[0]["at"] + timed[0]["query_offset_s"] - timed[0]["ref_start_s"] if timed else None
+        )
         ttfi = None
-        if start is not None and p in covered:
-            ttfi = max(0.0, min(h["at"] for h in hits) - start)
+        if first is not None and start is not None and p in covered:
+            ttfi = max(0.0, first - start)
         lag = None if start is None else p.t_offset_s - start
-        rows.append(PlayScore(p, p in covered, bool(hits), ttfi, lag))
+        rows.append(PlayScore(p, p in covered, bool(hits), first, ttfi, lag))
     return rows
 
 
@@ -224,18 +267,21 @@ def recall(rows: Sequence[PlayScore]) -> float | None:
     return sum(r.identified for r in covered) / len(covered) if covered else None
 
 
-def pads(rows: Iterable[PlayScore]) -> dict[str, float | None]:
-    """Per era, the pad that covers the nearest-rank 95th-percentile absolute lag, capped at
-    600 s; None (insufficient data) below 20 lag samples."""
+def pads(rows: Iterable[PlayScore]) -> dict[str, Pad]:
+    """Each era's :class:`Pad` from its plays' lags."""
     lags: defaultdict[str, list[float]] = defaultdict(list)
+    default: dict[str, float] = {}
     for r in rows:
+        default.setdefault(r.play.era, r.play.pad_s)
         lags[r.play.era] += [] if r.lag_s is None else [abs(r.lag_s)]
-    return {
-        era: min(MAX_PAD_S, sorted(v)[math.ceil(0.95 * len(v)) - 1])
-        if len(v) >= MIN_LAG_SAMPLES
-        else None
-        for era, v in lags.items()
-    }
+    result = {}
+    for era, v in lags.items():
+        if len(v) < MIN_LAG_SAMPLES:
+            result[era] = Pad(default[era], len(v), None)
+            continue
+        p95 = sorted(v)[math.ceil(0.95 * len(v)) - 1]
+        result[era] = Pad(max(default[era], min(MAX_PAD_S, p95)), len(v), p95)
+    return result
 
 
 def score_leg(
@@ -247,6 +293,10 @@ def score_leg(
     addresses: Sequence[ClipAddress],
 ) -> LegScore:
     """Score one leg (``recognizer`` at ``leg``'s capture length and profile) over ``hours``.
+
+    This is the grid path, over ``read_results``'s stores; a replay file mixes capture lengths
+    (the 6 s / 12 s cadence), so it is scored with :func:`attribute`, the precisions, and
+    :func:`score_plays` over the replay's own covered plays, never here.
 
     ``addresses`` is the leg's grid as ``clips.hour_addresses`` returns it: each hour's clips that
     fit its decoded length, nothing for a skipped hour. A play is uncovered when a grid address
