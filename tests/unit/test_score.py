@@ -15,7 +15,7 @@ import pytest
 
 from evaluation import score
 from evaluation.clips import ClipAddress, grid
-from evaluation.run import Emission, Leg, read_results
+from evaluation.run import Emission, Leg, Results, read_results
 from evaluation.score import attribute, load_emissions, plays_from, score_plays
 from evaluation.shazam_eval import ResultStore
 from stream_sleuth.recognizers.base import EvalIdentification
@@ -539,3 +539,68 @@ def test_an_emissions_file_spans_hours_and_capture_lengths(tmp_path: Path) -> No
     loaded = load_emissions(path, SHAZAM)
     assert [str(e.address) for e in loaded] == [f"{HOUR}#150+6@128k", f"{EMPTY}#195+12@128k"]
     assert len(attribute(plays_from(RECORDS), loaded)) == 2
+
+
+COCREDIT = "Juana Molina & Chuquimamani-Condori"
+STAGE = "a" * 40
+REFERENCES = {STAGE: (COCREDIT, "Juana Molina")}
+
+
+def _local(artist: str, at: float, ref_key: str = STAGE, **extra: Any) -> Emission:
+    """A 12 s Olaf emission as ``read_results`` would return it: it names its reference by stage id."""
+    track = (artist, MOLINA[1], MOLINA[2])
+    found = _found(track, at, source="local", confidence=40.0, ref_key=ref_key, **extra)
+    address = ClipAddress(HOUR, int(at), 12)
+    return Emission((address.key, OLAF), address, found)
+
+
+def _molina_plays(artist: str = "Juana Molina") -> list[score.Play]:
+    return plays_from(_hour(HOUR, "canonical", (1, 120.0, (artist, MOLINA[1], MOLINA[2]), {})))
+
+
+@pytest.mark.parametrize(
+    ("play_artist", "ref_key", "references", "scored"),
+    [
+        pytest.param("Juana Molina", STAGE, REFERENCES, True, id="joins through the album artist"),
+        pytest.param(COCREDIT, STAGE, REFERENCES, True, id="joins through the artist"),
+        pytest.param("Jessica Pratt", STAGE, REFERENCES, False, id="another artist is still wrong"),
+        pytest.param("Juana Molina", STAGE, None, False, id="no names mapping: as before"),
+        pytest.param("Juana Molina", "b" * 40, REFERENCES, False, id="a ref_key not in it"),
+    ],
+)
+def test_an_olaf_match_on_a_co_credited_file_is_correct_by_either_artist_tag(
+    play_artist: str,
+    ref_key: str,
+    references: dict[str, tuple[str, ...]] | None,
+    scored: bool,
+) -> None:
+    emission = _local(COCREDIT, 195.0, ref_key)
+    [verdict] = attribute(_molina_plays(play_artist), [emission], references)
+    assert (verdict.play is not None) is scored
+
+
+def test_a_shazam_co_credit_stays_wrong_whatever_the_names_mapping_holds() -> None:
+    """Shazam names one artist string and no reference: its co-credit is a near miss (#93)."""
+    shazam = _hit((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
+    [verdict] = attribute(_molina_plays(), [shazam], REFERENCES)
+    assert verdict.play is None
+
+
+@pytest.mark.parametrize(("references", "play_id"), [(REFERENCES, 1), (None, None)])
+def test_a_leg_scores_an_olaf_co_credit_with_the_names_mapping(
+    references: dict[str, tuple[str, ...]] | None, play_id: int | None
+) -> None:
+    emission = _local(COCREDIT, 195.0)
+    results = Results([emission], {emission.key}, {})
+
+    leg = score.score_leg(
+        _molina_plays(),
+        results,
+        OLAF,
+        Leg("12s", 12, "128k", "all"),
+        [HOUR],
+        grid(HOUR, 12),
+        references,  # fmt: skip
+    )
+
+    assert [v.play.play_id if v.play else None for v in leg.verdicts] == [play_id]

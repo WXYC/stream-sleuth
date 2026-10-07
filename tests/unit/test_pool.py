@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -356,3 +357,33 @@ def test_the_tag_lookup_gives_a_reference_it_cannot_vouch_for_no_song(db, case):
     )
 
     assert pool.tag_lookup(db)(stage)["song"] == ""
+
+
+def test_reference_artists_lists_each_indexed_files_distinct_non_empty_artist_names(db):
+    both = _record(db, "rotation/Heavy/a.mp3", artist="Juana Molina & Chuquimamani-Condori", album_artist="Juana Molina")  # fmt: skip
+    same = _record(db, "rotation/Heavy/b.mp3", artist="Jessica Pratt", album_artist="Jessica Pratt")  # fmt: skip
+    only_album_artist = _record(db, "rotation/Heavy/c.mp3", artist=None, album_artist="Hermanos Gutiérrez")  # fmt: skip
+    only_artist = _record(db, "rotation/Heavy/d.mp3", artist="Stereolab", album_artist="")
+    untagged = _record(db, "rotation/Heavy/e.mp3", artist=None, album_artist=None)
+    _record(db, "rotation/Heavy/f.mp3", status="failed")
+
+    assert pool.reference_artists(db) == {
+        both: ("Juana Molina & Chuquimamani-Condori", "Juana Molina"),
+        same: ("Jessica Pratt",),
+        only_album_artist: ("Hermanos Gutiérrez",),
+        only_artist: ("Stereolab",),
+        untagged: (),
+    }
+
+
+def test_open_read_only_reads_a_pool_db_and_never_writes_or_creates_one(db, tmp_path):
+    stage = _record(db, "rotation/Heavy/doga/01.mp3")
+    db.close()
+
+    with closing(pool.open_read_only(tmp_path / "pool.db")) as ro:
+        assert pool.reference_artists(ro) == {stage: ("Juana Molina",)}
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            ro.execute("DELETE FROM files")
+    with pytest.raises(sqlite3.OperationalError):
+        pool.open_read_only(tmp_path / "absent.db")
+    assert not (tmp_path / "absent.db").exists()

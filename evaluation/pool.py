@@ -21,7 +21,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -197,6 +197,26 @@ def tag_lookup(db: sqlite3.Connection) -> Callable[[str], Identification]:
         return {"artist": artist, "song": song, "album": album, "label": ""}
 
     return lookup
+
+
+def open_read_only(path: Path) -> sqlite3.Connection:
+    """Open an existing ``pool.db`` read-only: it never creates, migrates, or writes one."""
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def reference_artists(db: sqlite3.Connection) -> Mapping[str, tuple[str, ...]]:
+    """Map each indexed file's stage id to its distinct non-empty ``artist`` and ``album_artist`` tags.
+
+    These are the names ``PoolIndex`` joins a play on, so a scorer that passes them all to
+    :func:`evaluation.names.title_tier` judges a match on a file as the join does, where
+    :func:`tag_lookup` names one artist. A file with neither tag maps to ``()``.
+    """
+    return {
+        stage: tuple(dict.fromkeys(name for name in (artist, album_artist) if name))
+        for stage, artist, album_artist in db.execute(
+            "SELECT stage_id, artist, album_artist FROM files WHERE status = 'indexed'"
+        )
+    }
 
 
 def _record(
