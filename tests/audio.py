@@ -24,7 +24,7 @@ _HAS_DURATION = re.compile(r"[=:](?:d|duration)=")
 
 
 def render(path: Path, *segments: Segment, args: Sequence[str] = ()) -> Path:
-    """Render ``segments`` (default: one 440 Hz sine) to ``path`` with ffmpeg and return ``path``.
+    """Render ``segments`` to ``path`` with ffmpeg and return ``path``.
 
     A bare number is that many seconds of ``SINE``. Raises ``ValueError`` for no segments or a
     source that sets its own duration, and ``CalledProcessError`` if ffmpeg fails.
