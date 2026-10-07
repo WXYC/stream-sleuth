@@ -190,8 +190,9 @@ class Throttle:
         """
         while True:
             state = self._state()
-            if state["stopped"]:
-                raise DayStoppedError("rate_limited")
+            if state["stopped"]:  # the reason, or True from a state file written before reasons
+                stopped = state["stopped"]
+                raise DayStoppedError(stopped if isinstance(stopped, str) else "rate_limited")
             if state["count"] >= self.rate_per_day:
                 raise DayStoppedError("daily_cap")
             last = state["last"]
@@ -201,8 +202,9 @@ class Throttle:
             await self.sleep(wait)
         self._save({**state, "count": state["count"] + 1, "last": self.clock()})
 
-    def stop_for_day(self) -> None:
-        self._save({**self._state(), "stopped": True})
+    def stop_for_day(self, reason: str = "rate_limited") -> None:
+        """Refuse every request until the next UTC day; ``acquire()`` raises with ``reason``."""
+        self._save({**self._state(), "stopped": reason})
 
 
 class CountingClient(HTTPClientInterface):
@@ -294,12 +296,20 @@ async def run(
     Returns ``done``, ``rate_limited``, ``daily_cap``, or ``failure_streak`` (after
     ``MAX_FAILURE_STREAK`` non-scoring outcomes in a row, which stops the day like a 429).
     """
-    scored = store.scored()
+    records = store.records()
+    scored = {(r["address"], r["recognizer"]) for r in records if r["kind"] in SCORING_KINDS}
+    tried = {(r["address"], r["recognizer"]) for r in records}
+
+    def key(address: ClipAddress) -> tuple[str, str]:
+        return (str(address), recognizer_identity(address.length_s))
+
+    pending = [a for a in addresses if key(a) not in scored]
+    # Never-tried addresses first, so a stretch that always fails is retried only after
+    # them and cannot trip the failure streak at the same place every day.
+    pending.sort(key=lambda a: key(a) in tried)  # stable: grid order within each group
     streak = 0
-    for address in addresses:
+    for address in pending:
         identity = recognizer_identity(address.length_s)
-        if (str(address), identity) in scored:
-            continue
         shazam = Shazam(http_client=client, segment_duration_seconds=address.length_s)
         try:
             with open_clip(address) as clip:
@@ -321,7 +331,7 @@ async def run(
         streak = 0 if outcome.kind in SCORING_KINDS else streak + 1
         if streak >= MAX_FAILURE_STREAK:
             log.warning("%d non-scoring outcomes in a row; stopping for the day", streak)
-            client.throttle.stop_for_day()
+            client.throttle.stop_for_day("failure_streak")
             return "failure_streak"
     return "done"
 

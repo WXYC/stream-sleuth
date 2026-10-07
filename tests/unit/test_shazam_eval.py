@@ -229,7 +229,9 @@ def test_each_response_is_one_request_and_one_stored_outcome(
     assert record["address"] == str(_addresses(1)[0])
     assert record["recognizer"] == recognizer_identity(12)
     assert clock.slept == ([] if stops else [20.0])
-    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] is stops
+    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] == (
+        "rate_limited" if stops else False
+    )
 
 
 def test_matched_offset_is_extracted_from_the_wire(
@@ -280,7 +282,7 @@ def test_a_429_stop_is_persisted_before_its_record(
     monkeypatch.setattr(ResultStore, "append", crash)
     with pytest.raises(SimulatedCrashError):
         _run(tmp_path, tone, fake, 1)
-    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] is True
+    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] == "rate_limited"
 
 
 def test_the_daily_cap_counts_requests_across_restarts(
@@ -472,9 +474,22 @@ def test_a_streak_of_non_scoring_outcomes_stops_the_day(
     server.append(fake)
     store, throttle, client, stop = _run(tmp_path, tone, fake, n)
     assert (stop, client.requests) == ("failure_streak", MAX_FAILURE_STREAK)
-    # The stop persists, so a rerun the same day sends nothing.
+    # The stop persists with its own reason, so a rerun the same day sends nothing.
     _, _, rerun, again = _run(tmp_path, tone, fake, n)
-    assert (again, rerun.requests) == ("rate_limited", 0)
+    assert (again, rerun.requests) == ("failure_streak", 0)
+
+
+def test_never_tried_addresses_go_before_retries_so_a_bad_stretch_cannot_stall_the_leg(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    n = MAX_FAILURE_STREAK + 3
+    fake = FakeShazam([_json(503, {})] * MAX_FAILURE_STREAK + [_json(200, NO_MATCH)] * n)
+    server.append(fake)
+    _run(tmp_path, tone, fake, n)  # day one: the first 20 fail and the streak stops the day
+    store, _, _, stop = _run(tmp_path, tone, fake, n, clock=_clock_at("2026-10-07T20:00:00"))
+    day_two = [r["address"] for r in store.records()][MAX_FAILURE_STREAK:]
+    expected = _addresses(n)[MAX_FAILURE_STREAK:] + _addresses(n)[:MAX_FAILURE_STREAK]
+    assert (stop, day_two) == ("done", [str(a) for a in expected])
 
 
 def test_a_scoring_outcome_resets_the_failure_streak(
