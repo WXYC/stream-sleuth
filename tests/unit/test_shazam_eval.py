@@ -776,6 +776,23 @@ def test_an_address_whose_last_answer_was_a_stop_status_goes_after_the_other_ret
     assert [r["address"] for r in store.records()][3:] == [str(a) for a in (flaky, slow, denied)]
 
 
+def test_stop_status_addresses_go_least_recently_tried_first(
+    tmp_path: Path, tone: Path, server: list[FakeShazam]
+) -> None:
+    # An address that is denied every day must not lead the stop-status tier every day.
+    always, once = _addresses(2)  # grid order puts the always-denied address first
+    who = recognizer_identity(12)
+    store = ResultStore(tmp_path / "shazam.jsonl")
+    store.append(str(always), who, ShazamOutcome(403, "server_error"))
+    store.append(str(once), who, ShazamOutcome(403, "server_error"))
+    store.append(str(always), who, ShazamOutcome(403, "server_error"))  # denied again, later
+    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    store, _, stop = _go(tmp_path, tone, fake, [always, once], store)
+    assert stop == "done"
+    assert [r["address"] for r in store.records()][3:] == [str(once), str(always)]
+
+
 def test_a_stop_status_that_was_later_answered_otherwise_no_longer_trails(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
