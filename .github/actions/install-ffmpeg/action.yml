@@ -1,53 +1,51 @@
 name: Install ffmpeg
 description: >-
   Installs ffmpeg from apt without depending on the mirror for packages it has
-  already fetched. The downloaded .deb files are cached (keyed on the runner
-  image's OS, with a prefix fallback to older debs), and the install is a bounded
-  retry loop with apt retries and connection timeouts, so a stuck mirror fails
-  fast instead of holding the runner to the job's timeout. The caller sets the
-  step's own timeout-minutes as the outer bound.
+  already fetched. `apt-get update` and `apt-get install` each run in a bounded
+  retry loop (three attempts under `timeout`), and the downloaded .deb files are
+  cached, keyed on the runner image's OS and the candidate ffmpeg version, so a
+  stuck mirror fails fast and a cache hit never downloads from it. The cache is
+  saved right after the install, before any later step can touch it. The caller
+  sets the step's own timeout-minutes as the outer bound: worst case is 3 x 30 s
+  for update plus 3 x 60 s for install.
 runs:
   using: composite
   steps:
-    # A user-owned directory, so the cache can read it and write it back. The
-    # image OS (not the weekly image version) keeps the key stable; an Ubuntu
-    # bump falls back to the older debs and apt fetches only what changed.
     # ImageOS is set in the runner's environment, which a composite action's
-    # `env` context does not see, so it is read in a shell and passed on.
-    - id: image
+    # `env` context does not see, so it is read in a shell and passed on. The
+    # image OS (not the weekly image version) keeps the key stable; an Ubuntu
+    # bump falls back to older debs and apt fetches only what changed.
+    - id: update
       shell: bash
       run: |
-        mkdir -p "$HOME/.cache/apt-archives/partial"
+        set -euo pipefail
+        source "$GITHUB_ACTION_PATH/apt-retry.sh"
+        apt_retry 30 update
+        # The candidate version goes in the cache key, so a new Ubuntu ffmpeg
+        # update saves a fresh entry instead of leaving the first one frozen.
+        version="$(apt-cache policy ffmpeg | awk '/Candidate:/ {print $2}' | tr -c 'A-Za-z0-9._+~\n-' '_')"
         echo "os=${ImageOS:?runner did not set ImageOS}" >> "$GITHUB_OUTPUT"
-    - uses: actions/cache@v6
+        echo "version=${version:?apt-cache policy reported no ffmpeg candidate}" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
       with:
         path: ~/.cache/apt-archives
-        key: apt-debs-${{ runner.os }}-${{ steps.image.outputs.os }}-ffmpeg
+        key: apt-debs-${{ runner.os }}-${{ steps.update.outputs.os }}-ffmpeg-${{ steps.update.outputs.version }}
         restore-keys: |
-          apt-debs-${{ runner.os }}-${{ steps.image.outputs.os }}-
+          apt-debs-${{ runner.os }}-${{ steps.update.outputs.os }}-ffmpeg-
           apt-debs-${{ runner.os }}-
     - shell: bash
       run: |
         set -euo pipefail
-        archives="$HOME/.cache/apt-archives"
-        apt_opts=(
-          -o Acquire::Retries=3
-          -o Acquire::http::Timeout=30
-          -o Acquire::https::Timeout=30
-          -o "Dir::Cache::Archives=$archives"
-          -o APT::Keep-Downloaded-Packages=true
-          -o APT::Sandbox::User=root
-        )
-        sudo apt-get "${apt_opts[@]}" update
-        for attempt in 1 2 3; do
-          if sudo timeout 90 apt-get "${apt_opts[@]}" install -y --no-install-recommends ffmpeg; then
-            break
-          fi
-          echo "apt-get install attempt $attempt failed or timed out" >&2
-          if [ "$attempt" -eq 3 ]; then
-            exit 1
-          fi
-          sudo dpkg --configure -a
-        done
+        source "$GITHUB_ACTION_PATH/apt-retry.sh"
+        mkdir -p "$archives/partial"
+        apt_retry 60 install -y --no-install-recommends ffmpeg
         # apt ran as root; give the directory back so the cache can save it.
         sudo chown -R "$(id -u):$(id -g)" "$archives"
+    # Saved here, before any later step of the job can write to the directory.
+    # An exact-key hit is already stored (entries are immutable), so skip it.
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/apt-archives
+        key: ${{ steps.restore.outputs.cache-primary-key }}
