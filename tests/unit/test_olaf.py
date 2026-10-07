@@ -347,11 +347,26 @@ def test_querying_a_snapshot_without_an_index_is_an_error_and_creates_nothing(
     assert sorted(tmp_path.rglob("*")) == before
 
 
+_MISCASED_HOME = Path(str(Path.home()).swapcase())
+_FIRMLINKED_HOME = Path("/System/Volumes/Data" + str(Path.home()))
+
 REFUSED_HOMES = [
     pytest.param("snap", "absolute", id="relative"),
     pytest.param(".", "absolute", id="dot"),
     pytest.param("~/snap", "absolute", id="literal-tilde"),
     pytest.param(str(Path.home()), "home directory", id="real-home"),
+    pytest.param(
+        str(_MISCASED_HOME),
+        "home directory",
+        id="miscased-home",
+        marks=pytest.mark.skipif(not _MISCASED_HOME.exists(), reason="case-sensitive filesystem"),
+    ),
+    pytest.param(
+        str(_FIRMLINKED_HOME),
+        "home directory",
+        id="firmlinked-home",
+        marks=pytest.mark.skipif(not _FIRMLINKED_HOME.exists(), reason="no macOS data firmlink"),
+    ),
     pytest.param(str(CHECKOUT), "inside the checkout", id="checkout"),
     pytest.param(str(CHECKOUT / "snap"), "inside the checkout", id="in-checkout"),
     pytest.param(str(CHECKOUT / "tests" / ".." / "snap"), "inside the checkout", id="dotdot"),
