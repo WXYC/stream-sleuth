@@ -180,14 +180,17 @@ def tag_lookup(db: sqlite3.Connection) -> Callable[[str], Identification]:
     """Return a ``stage_id -> Identification`` lookup over ``db``'s indexed files.
 
     ``title`` becomes ``song``, every NULL tag ``""``, and ``label`` is always ``""``
-    (``pool.db`` has no label column). An untagged reference has an empty ``song``,
+    (``pool.db`` has no label column). ``artist`` is the ``artist`` tag, else the
+    ``album_artist`` tag, else ``""``: ``PoolIndex`` joins a play on either tag, so a file
+    with only an ``album_artist`` is in the pool and must not be emitted with no artist.
+    An untagged reference has an empty ``song``,
     which ``step()`` treats as a miss, as it does a stage id that is not an indexed
     row (a failed file Olaf may still hold): a hit is never filed under its sha1.
     """
 
     def lookup(stage: str) -> Identification:
         row = db.execute(
-            "SELECT artist, title, album FROM files WHERE stage_id = ? AND status = 'indexed'",
+            "SELECT COALESCE(NULLIF(artist, ''), album_artist), title, album FROM files WHERE stage_id = ? AND status = 'indexed'",
             (stage,),
         ).fetchone()
         artist, song, album = (value or "" for value in row or (None,) * 3)
