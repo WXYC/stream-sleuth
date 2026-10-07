@@ -80,7 +80,7 @@ jobs:
       - uses: actions/checkout@v6
       # One shared, bounded install (.github/actions/install-ffmpeg) so the two jobs cannot drift.
       - uses: ./.github/actions/install-ffmpeg
-        timeout-minutes: 4
+        timeout-minutes: 5
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
@@ -100,7 +100,7 @@ jobs:
       - uses: actions/checkout@v6
       # One shared, bounded install (.github/actions/install-ffmpeg) so the two jobs cannot drift.
       - uses: ./.github/actions/install-ffmpeg
-        timeout-minutes: 4
+        timeout-minutes: 5
       - id: olaf-cache
         uses: actions/cache@v6
         with:
