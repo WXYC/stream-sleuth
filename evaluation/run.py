@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError, cut, hour_addresses
-from evaluation.olaf_snapshot import RESULTS, checked_snapshot_dir, snapshot_lock
+from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir, snapshot_lock
 from evaluation.pool import open_pool_db, tag_lookup
 from evaluation.shazam_eval import (
     SCORING_KINDS,
@@ -382,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         for leg in LEGS
         if (not args.legs or leg.name in args.legs) and use & set(leg.recognizers)
     ]
+    if not legs:
+        parser.error("no leg is selected: --only and --legs name no leg in common")
     # A run with no Shazam leg touches nothing of Shazam's: no pin check, budget, state, or lock.
     use_shazam = "shazam" in use and any("shazam" in leg.recognizers for leg in legs)
     use_olaf = "olaf" in use and any("olaf" in leg.recognizers for leg in legs)
@@ -402,24 +404,30 @@ def main(argv: list[str] | None = None) -> int:
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
-    with ExitStack() as stack:  # held until every leg has run
-        shazam = olaf = client = None
-        if use_shazam:
-            throttle = stack.enter_context(Throttle(state, *budget))
-            client = CountingClient(throttle, base_url=args.base_url)
-            shazam = (store, client)
-        if use_olaf:
-            home = checked_snapshot_dir(args.snapshot)
-            if not (home / "pool.db").is_file():
-                raise SystemExit(f"{home}: no snapshot here; build it first")
-            stack.enter_context(snapshot_lock(home))
+    report: dict[str, str] = {}
+    client = None
+    with ExitStack() as stack:  # the snapshot's lock and pool.db, held through every leg
+        olaf = None
+        if use_olaf:  # refused before the Shazam lock is taken, in one line
+            try:
+                home = checked_snapshot_dir(args.snapshot)
+                if not (home / "pool.db").is_file():
+                    raise SystemExit(f"{home}: no snapshot here; build it first")
+                stack.enter_context(snapshot_lock(home))
+            except SnapshotError as refusal:
+                raise SystemExit(str(refusal)) from None
             db = stack.enter_context(closing(open_pool_db(home / "pool.db")))
             recognizer = OlafRecognizer(
                 home, min_match_count=args.min_match_count, lookup=tag_lookup(db)
             )
             identity = olaf_identity(args.snapshot, args.min_match_count)
             olaf = (ResultStore(home / RESULTS), recognizer.recognize, identity)
-        report = run_legs(legs, hours, archive_dir, work_dir, shazam=shazam, olaf=olaf)
+        if use_shazam:  # the throttle's lock is released as soon as the Shazam legs end
+            with Throttle(state, *budget) as throttle:
+                client = CountingClient(throttle, base_url=args.base_url)
+                report = run_legs(legs, hours, archive_dir, work_dir, shazam=(store, client))
+        if olaf:
+            report |= run_legs(legs, hours, archive_dir, work_dir, olaf=olaf)
     for name, reason in report.items():
         log.info("%s: %s", name, reason)
     if client:
