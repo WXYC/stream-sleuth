@@ -129,6 +129,21 @@ def test_two_shazam_legs_share_one_throttle(tmp_path: Path, shazam) -> None:
     }
 
 
+def test_the_320k_leg_queries_the_hours_the_128k_leg_already_scored(tmp_path: Path, shazam) -> None:
+    setup = shazam([json_response(200, NO_MATCH)] * 4)
+    one_hour = {"all": [HOUR], "subset": [HOUR]}
+    report = run_legs(legs("12s", "12s-320k-subset"), one_hour, tmp_path, tmp_path, *setup[:2])
+    assert report == {"12s": "done", "12s-320k-subset": "done"}
+    # One recognizer identity for both; only the address's profile keeps them apart.
+    assert [r["address"] for r in setup.store.records()] == [
+        f"{HOUR}#0+12@128k",
+        f"{HOUR}#15+12@128k",
+        f"{HOUR}#0+12@320k",
+        f"{HOUR}#15+12@320k",
+    ]
+    assert {r["recognizer"] for r in setup.store.records()} == {recognizer_identity(12)}
+
+
 def test_a_leg_that_is_stopped_stops_the_next_leg_before_it_sends_anything(
     tmp_path: Path, shazam, monkeypatch: pytest.MonkeyPatch
 ) -> None:

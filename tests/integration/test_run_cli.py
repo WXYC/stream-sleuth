@@ -76,10 +76,10 @@ def test_a_run_below_five_gib_free_refuses_before_any_request(
     with pytest.raises(SystemExit, match="free"):
         main(["--base-url", fake.url])
     assert fake.requests == []
-    assert not (data / "shazam" / "throttle.json").exists()
+    assert not (data / "shazam" / "throttle.json.lock").exists()  # refused before the lock
 
 
-@pytest.mark.parametrize("flag", ["--store", "--state", "--work-dir"])
+@pytest.mark.parametrize("flag", ["--store", "--state", "--work-dir", "--archive-dir"])
 def test_a_path_in_the_checkout_is_refused_before_any_request(
     data: Path, fake: FakeShazam, flag: str
 ) -> None:

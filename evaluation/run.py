@@ -52,7 +52,8 @@ class Leg:
 
 
 # The study's Shazam query budget, in the order the legs run: 12 s on the full corpus, then
-# 6 s, 20 s, and 12 s @320k on the four-hour subset.
+# 6 s, 20 s, and 12 s @320k on the four-hour subset. The two 12 s legs file results under one
+# recognizer identity; only the address's @profile tells them apart, so a reader keys on it.
 LEGS = (
     Leg("12s", 12, "128k", "all"),
     Leg("6s-subset", 6, "128k", "subset"),
