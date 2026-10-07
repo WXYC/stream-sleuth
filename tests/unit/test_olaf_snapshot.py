@@ -10,9 +10,9 @@ import pytest
 from moto import mock_aws
 
 from evaluation import pool
-from evaluation.olaf_snapshot import build_snapshot
+from evaluation.olaf_snapshot import RESULTS, SnapshotError, build_snapshot, snapshot_lock
 from stream_sleuth.paths import CHECKOUT, DataPathError
-from stream_sleuth.recognizers.olaf import OlafRecognizer
+from stream_sleuth.recognizers.olaf import OlafRecognizer, snapshot_dir
 from tests.unit.test_s3_readonly import seed_objects
 
 ENDPOINT = "https://pool.example.test"
@@ -80,3 +80,34 @@ def test_a_data_directory_inside_the_checkout_is_refused_before_anything_is_made
 
     assert not (CHECKOUT / "scratch").exists()
     assert stored == []
+
+
+def test_a_build_is_refused_once_the_snapshot_has_results(tmp_path, stored):
+    objects = pool.inventory(["rotation/"])
+    build_snapshot("rotation", objects)
+    (tmp_path / "data" / "olaf" / "rotation" / RESULTS).write_text("{}\n")
+
+    with pytest.raises(SnapshotError, match="results"):
+        build_snapshot("rotation", objects)
+
+    assert len(stored) == 2  # the refused build stored nothing
+
+
+def test_a_name_differing_only_in_case_from_an_existing_snapshot_is_refused(tmp_path, stored):
+    objects = pool.inventory(["rotation/"])
+    build_snapshot("rotation", objects)
+
+    with pytest.raises(SnapshotError, match="rotation"):
+        build_snapshot("Rotation", objects)
+
+    assert [p.name for p in (tmp_path / "data" / "olaf").iterdir()] == ["rotation"]
+    assert len(stored) == 2
+
+
+def test_two_builds_of_one_snapshot_cannot_overlap(stored):
+    objects = pool.inventory(["rotation/"])
+    with snapshot_lock(snapshot_dir("rotation")):
+        with pytest.raises(SnapshotError, match="another"):
+            build_snapshot("rotation", objects)
+        assert stored == []
+    assert build_snapshot("rotation", objects) == {"indexed": 2}

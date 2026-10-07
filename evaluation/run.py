@@ -1,12 +1,15 @@
-"""Run every leg of the study, one after another, under one daily Shazam budget.
+"""Run every leg of the study over both recognizers, one after another.
 
-Station-neutral. A leg is one capture length and codec profile over one hour set; every
-leg's hours come from ``selection.json`` (written by ``corpus select``), never from this
-module. Each Shazam leg goes through :func:`evaluation.shazam_eval.run` inside one
-``Throttle``, one ``CountingClient``, and one state file, so all legs share one daily
-budget; a leg that stops the day (anything but ``done``) starts no later Shazam leg, and
-the report says so. Resume, retries, and stop reasons are ``shazam_eval``'s; this module
-adds none of its own.
+Station-neutral. A leg is one capture length and codec profile over one hour set, run by
+the recognizers it names; every leg's hours come from ``selection.json`` (written by
+``corpus select``), never from this module. Each Shazam leg goes through
+:func:`evaluation.shazam_eval.run` inside one ``Throttle``, one ``CountingClient``, and one
+state file, so all legs share one daily budget; a leg that stops the day (anything but
+``done``) starts no later Shazam leg, and the report says so. Resume, retries, and stop
+reasons are ``shazam_eval``'s; this module adds none of its own. The Olaf legs query a
+snapshot and file their results beside it in ``results.jsonl``, under an identity that
+carries the commit, snapshot, and match floor. Olaf is free and deterministic, so its
+results are never retried, and a day that stops Shazam does not stop it.
 
 Every path a run writes is checked with ``require_outside_checkout`` and defaults from
 ``data_dir()``; the run refuses to start with less than 5 GiB free.
@@ -21,20 +24,23 @@ import logging
 import shutil
 import sys
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from collections.abc import Set as AbstractSet
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
-from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, cut, hour_addresses
+from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError, cut, hour_addresses
+from evaluation.olaf_snapshot import RESULTS, checked_snapshot_dir, snapshot_lock
+from evaluation.pool import open_pool_db, tag_lookup
 from evaluation.shazam_eval import (
     SCORING_KINDS,
     CountingClient,
     FutureStateError,
     Key,
     ResultStore,
+    ShazamOutcome,
     Throttle,
     budget_from_env,
     recognizer_identity,
@@ -43,7 +49,7 @@ from evaluation.shazam_eval import (
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification, IdentificationSource
-from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
+from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT, OlafRecognizer
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
@@ -51,6 +57,9 @@ log = logging.getLogger(__name__)
 MIN_FREE_BYTES = 5 << 30
 # The recognizer identity's prefix -> the emission's source.
 SOURCES: dict[str, IdentificationSource] = {"shazam": "shazam", "olaf": "local"}
+
+OpenClip = Callable[[ClipAddress], AbstractContextManager[Path]]
+Recognize = Callable[[str], EvalIdentification | None]
 
 
 class Emission(NamedTuple):
@@ -83,23 +92,77 @@ class _Snapshot(ResultStore):
 
 @dataclass(frozen=True)
 class Leg:
-    """One capture length and codec profile over the ``all`` or ``subset`` hours."""
+    """One capture length and codec profile over the ``all`` or ``subset`` hours, per recognizer."""
 
     name: str
     length_s: int
     profile: str
     hours: str
+    recognizers: tuple[str, ...]
 
 
-# The study's Shazam query budget, in the order the legs run: 12 s on the full corpus, then
-# 6 s, 20 s, and 12 s @320k on the four-hour subset. The two 12 s legs file results under one
-# recognizer identity; only the address's @profile tells them apart, so a reader keys on it.
+# The study's query budget. Shazam runs 12 s on the full corpus, then 6 s, 20 s, and 12 s @320k
+# on the four-hour subset, in that order. Olaf is free, so it runs every length on the full
+# corpus and 12 s @320k on the subset (plan 5.2). The two 12 s Shazam legs file results under
+# one recognizer identity; only the address's @profile tells them apart, so a reader keys on it.
 LEGS = (
-    Leg("12s", 12, "128k", "all"),
-    Leg("6s-subset", 6, "128k", "subset"),
-    Leg("20s-subset", 20, "128k", "subset"),
-    Leg("12s-320k-subset", 12, "320k", "subset"),
+    Leg("12s", 12, "128k", "all", ("shazam", "olaf")),
+    Leg("6s", 6, "128k", "all", ("olaf",)),
+    Leg("20s", 20, "128k", "all", ("olaf",)),
+    Leg("6s-subset", 6, "128k", "subset", ("shazam",)),
+    Leg("20s-subset", 20, "128k", "subset", ("shazam",)),
+    Leg("12s-320k-subset", 12, "320k", "subset", ("shazam", "olaf")),
 )
+
+
+@dataclass(frozen=True)
+class OlafOutcome(ShazamOutcome):
+    """An Olaf answer in the Shazam store's record shape, plus what only Olaf reports.
+
+    The inherited ``status`` is 0, meaning the subprocess answered, and ``offset_s`` is always
+    null (Olaf reports ``query_offset_s`` and ``ref_start_s``); neither says anything about HTTP.
+    """
+
+    confidence: float | None = None
+    ref_key: str = ""
+    query_offset_s: float | None = None
+    ref_start_s: float | None = None
+
+
+def _olaf_outcome(found: EvalIdentification | None) -> OlafOutcome:
+    if found is None:
+        return OlafOutcome(0, "no_match")
+    return OlafOutcome(
+        0, "matched", found["artist"], found["song"], found["album"], found["label"],
+        confidence=found["confidence"], ref_key=found["ref_key"],
+        query_offset_s=found["query_offset_s"], ref_start_s=found["ref_start_s"],
+    )  # fmt: skip
+
+
+def run_olaf(
+    addresses: Iterable[ClipAddress],
+    open_clip: OpenClip,
+    store: ResultStore,
+    recognize: Recognize,
+    identity: str,
+) -> str:
+    """Query every address with no record under ``identity``; a stored answer is never retried.
+
+    An ``OlafError`` propagates: a broken index fails every query, so the run aborts, and
+    the failing address has no record.
+    """
+    _, latest, _ = store.history()
+    for address in addresses:
+        if (str(address), identity) in latest:
+            continue
+        try:
+            with open_clip(address) as clip:
+                found = recognize(str(clip))
+        except ClipError as exc:  # no clip, so no query and nothing stored
+            log.warning("skipped %s: %s", address, exc)
+            continue
+        store.append(str(address), identity, _olaf_outcome(found))
+    return "done"
 
 
 def run_legs(
@@ -107,31 +170,40 @@ def run_legs(
     hours: dict[str, list[str]],
     archive_dir: Path,
     work_dir: Path,
-    store: ResultStore,
-    client: CountingClient,
+    *,
+    shazam: tuple[ResultStore, CountingClient] | None = None,
+    olaf: tuple[ResultStore, Recognize, str] | None = None,
 ) -> dict[str, str]:
-    """Run each leg in turn; the report maps its name to ``done`` or the reason it stopped.
+    """Run each leg's recognizers in turn; the report maps ``<leg>/<recognizer>`` to how it ended.
 
-    ``refused`` means the throttle refused a future-dated state (``FutureStateError``,
-    logged). A leg after one that stopped is ``not started``: it decodes and sends nothing.
+    A Shazam leg ends ``done`` or with the reason it stopped, or ``refused`` when the throttle
+    refused a future-dated state (``FutureStateError``, logged). A Shazam leg after one that
+    stopped is ``not started``: it decodes and sends nothing. Olaf legs are not stopped by any
+    of that, since they spend no budget: they run, in leg order, regardless.
     """
 
-    def open_clip(a: ClipAddress) -> AbstractContextManager[Path]:
-        return cut(a, archive_dir / a.hour_key, work_dir)
+    def inputs(leg: Leg, wav: bool) -> tuple[list[ClipAddress], OpenClip]:
+        addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
+        return addresses, lambda a: cut(a, archive_dir / a.hour_key, work_dir, wav=wav)
 
     report: dict[str, str] = {}
-    stopped = False  # one leg that ends the day ends it for the rest
+    stopped = False  # one Shazam leg that ends the day ends the day for the rest
     for leg in legs:
-        if stopped:
-            report[leg.name] = "not started"
-            continue
-        addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
-        try:
-            report[leg.name] = asyncio.run(run_shazam(addresses, open_clip, store, client))
-        except FutureStateError as refusal:
-            log.error("%s", refusal)
-            report[leg.name] = "refused"
-        stopped = report[leg.name] != "done"
+        if shazam and "shazam" in leg.recognizers:
+            tag = f"{leg.name}/shazam"
+            if stopped:
+                report[tag] = "not started"
+            else:
+                addresses, open_clip = inputs(leg, wav=False)
+                try:
+                    report[tag] = asyncio.run(run_shazam(addresses, open_clip, *shazam))
+                except FutureStateError as refusal:
+                    log.error("%s", refusal)
+                    report[tag] = "refused"
+                stopped = report[tag] != "done"
+        if olaf and "olaf" in leg.recognizers:
+            addresses, open_clip = inputs(leg, wav=True)
+            report[f"{leg.name}/olaf"] = run_olaf(addresses, open_clip, *olaf)
     return report
 
 
@@ -295,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-dir", type=Path, help="where clips are cut; default: <data>/clips")
     parser.add_argument("--store", type=Path, help="default: <data>/shazam/results.jsonl")
     parser.add_argument("--state", type=Path, help="default: <data>/shazam/throttle.json")
+    parser.add_argument("--snapshot", help="the Olaf snapshot to query; required for Olaf legs")
+    parser.add_argument("--min-match-count", type=int, default=DEFAULT_MIN_MATCH_COUNT)
+    parser.add_argument("--only", choices=sorted(SOURCES), help="run one recognizer's legs")
     parser.add_argument(
         "--legs", nargs="+", choices=[leg.name for leg in LEGS], help="default: all"
     )
@@ -303,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     require_pinned_shazamio()
     budget = budget_from_env()  # refused here, before any path is created
+    use = {args.only} if args.only else set(SOURCES)
+    if "olaf" in use and not args.snapshot:
+        parser.error("--snapshot is required for Olaf legs; pass --only shazam to skip them")
     data = data_dir()
     work_dir = require_outside_checkout(args.work_dir or data / "clips")
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")
@@ -312,15 +390,31 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (work_dir, store.path.parent, state.parent):
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
-    with Throttle(state, *budget) as throttle:  # held until every leg has run
-        client = CountingClient(throttle, base_url=args.base_url)
+    with ExitStack() as stack:  # held until every leg has run
+        shazam = olaf = client = None
+        if "shazam" in use:
+            throttle = stack.enter_context(Throttle(state, *budget))
+            client = CountingClient(throttle, base_url=args.base_url)
+            shazam = (store, client)
+        if "olaf" in use:
+            home = checked_snapshot_dir(args.snapshot)
+            if not (home / "pool.db").is_file():
+                raise SystemExit(f"{home}: no snapshot here; build it first")
+            stack.enter_context(snapshot_lock(home))
+            db = stack.enter_context(closing(open_pool_db(home / "pool.db")))
+            recognizer = OlafRecognizer(
+                home, min_match_count=args.min_match_count, lookup=tag_lookup(db)
+            )
+            identity = olaf_identity(args.snapshot, args.min_match_count)
+            olaf = (ResultStore(home / RESULTS), recognizer.recognize, identity)
         legs = [leg for leg in LEGS if not args.legs or leg.name in args.legs]
-        report = run_legs(legs, hours, archive_dir, work_dir, store, client)
+        report = run_legs(legs, hours, archive_dir, work_dir, shazam=shazam, olaf=olaf)
     for name, reason in report.items():
         log.info("%s: %s", name, reason)
-    log.info("%d requests", client.requests)
-    if exhausted := sorted(store.history()[2]):
-        log.warning("out of retries and not queried: %s", exhausted)
+    if client:
+        log.info("%d requests", client.requests)
+        if exhausted := sorted(store.history()[2]):
+            log.warning("out of retries and not queried: %s", exhausted)
     return int("refused" in report.values())
 
 
