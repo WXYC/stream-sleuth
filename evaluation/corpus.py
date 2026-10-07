@@ -45,6 +45,7 @@ _CRUFT = re.compile(
     r"\s*[\(\[](?:feat|ft|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
+_BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 
 
 def parse_add_time(text: str) -> datetime:
@@ -87,12 +88,15 @@ def album_key(s: str | None) -> str:
 
 
 def fuzzy(s: str | None) -> str:
-    """The fuzzy-tier key: ``fold(album_key(s))`` with each run of non-word characters as one space.
+    """The fuzzy-tier key: ``fold(album_key(s))`` less bracketed clauses, non-word runs as a space.
 
-    Letters and digits of every script survive (a Japanese or Cyrillic name keeps a
-    real key); underscores and punctuation separate.
+    ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
+    full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
+    Letters and digits of every script outside brackets survive (a Japanese or
+    Cyrillic name keeps a real key); a name that is all brackets keys to "" and never
+    joins on this tier. Underscores and punctuation separate.
     """
-    return " ".join(re.sub(r"[\W_]+", " ", fold(album_key(s))).split())
+    return " ".join(re.sub(r"[\W_]+", " ", _BRACKETED.sub(" ", fold(album_key(s)))).split())
 
 
 Key = tuple[str, str]
@@ -268,13 +272,15 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
             }  # fmt: skip
             lines.append(json.dumps(record, ensure_ascii=False) + "\n")
         log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
-    # Built in full first, so a bad key leaves no partial file.
-    with open(out, "x", encoding="utf-8") as f:
-        try:
+    # Built in full first, so a bad key leaves no partial file. An existing ``out``
+    # raises before the guard; the guard covers close, whose final flush can fail too.
+    f = open(out, "x", encoding="utf-8")
+    try:
+        with f:
             f.writelines(lines)
-        except BaseException:
-            out.unlink()  # the file this call created, never an earlier one
-            raise
+    except BaseException:
+        out.unlink()  # the file this call created, never an earlier one
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
