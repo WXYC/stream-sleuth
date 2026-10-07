@@ -94,10 +94,21 @@ def run_legs(
     return report
 
 
-def selected_hours(selection: Path, subset_only: bool) -> list[str]:
-    """The hour keys of ``selection.json``: every hour, or only those with ``subset: true``."""
-    hours = json.loads(selection.read_text(encoding="utf-8"))["hours"]
-    return [key for key, label in hours.items() if label["subset"] or not subset_only]
+def read_hours(selection: Path) -> dict[str, list[str]]:
+    """The hour keys of ``selection.json``, read once: ``all`` of them, and the ``subset``.
+
+    ``hours`` must be an object keyed by hour (so every key is a string), and each hour's
+    ``subset`` a JSON boolean; anything else, such as a hand-edited ``"false"``, which
+    would be truthy, refuses the run with one line naming the file and the hour.
+    """
+    hours = json.loads(selection.read_text(encoding="utf-8")).get("hours")
+    if not isinstance(hours, dict):
+        raise SystemExit(f"{selection}: hours must be an object keyed by hour")
+    for key, label in hours.items():
+        subset = label.get("subset") if isinstance(label, dict) else None
+        if not isinstance(subset, bool):
+            raise SystemExit(f"{selection}: hour {key}: subset must be true or false")
+    return {"all": list(hours), "subset": [key for key, label in hours.items() if label["subset"]]}
 
 
 def preflight(path: Path) -> None:
@@ -125,8 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")
     store = ResultStore(args.store or data / "shazam" / "results.jsonl")
     state = require_outside_checkout(args.state or data / "shazam" / "throttle.json")
-    selection = args.selection or data / "selection.json"
-    hours = {"all": selected_hours(selection, False), "subset": selected_hours(selection, True)}
+    hours = read_hours(args.selection or data / "selection.json")
     for directory in (work_dir, store.path.parent, state.parent):
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
