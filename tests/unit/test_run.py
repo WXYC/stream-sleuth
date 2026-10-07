@@ -7,6 +7,8 @@ replaced, so no test needs ffmpeg either.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections import namedtuple
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -16,10 +18,12 @@ import pytest
 
 from evaluation import run as run_mod
 from evaluation.clips import ClipAddress
-from evaluation.run import LEGS, preflight, run_legs, selected_hours
+from evaluation.run import LEGS, main, preflight, run_legs, selected_hours
 from evaluation.shazam_eval import (
+    MAX_RETRIES,
     CountingClient,
     ResultStore,
+    ShazamOutcome,
     Throttle,
     budget_from_env,
     recognizer_identity,
@@ -138,6 +142,81 @@ def test_a_daily_cap_also_stops_the_later_legs(tmp_path: Path, shazam) -> None:
         report = run_legs(legs("12s", "6s-subset"), HOURS, tmp_path, tmp_path, setup.store, client)
     assert report == {"12s": "daily_cap", "6s-subset": "not started"}
     assert len(setup.fake.requests) == 3
+
+
+def test_a_future_dated_throttle_state_is_reported_as_the_leg_refused(
+    tmp_path: Path, shazam
+) -> None:
+    setup = shazam([json_response(200, NO_MATCH)])
+    ahead = clock_at("2026-10-06T21:00:00").now  # an hour ahead of the throttle's clock
+    state = {"day": "2026-10-06", "count": 0, "last": ahead, "stopped": False}
+    (tmp_path / "throttle.json").write_text(json.dumps(state))
+    report = run_legs(legs("12s", "6s-subset"), HOURS, tmp_path, tmp_path, *setup[:2])
+    assert report == {"12s": "refused", "6s-subset": "not started"}
+    assert setup.fake.requests == []
+
+
+@pytest.fixture
+def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A data directory whose selection.json labels HOUR subset and OTHER not."""
+    data = tmp_path / "data"
+    (data / "shazam").mkdir(parents=True)
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(data))
+    monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "0")
+    labels = {HOUR: {"subset": True}, OTHER: {"subset": False}}
+    (data / "selection.json").write_text(json.dumps({"hours": labels}))
+    return data
+
+
+def test_the_cli_reports_every_leg_and_exits_non_zero_on_a_refused_state(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = {"day": "2026-10-06", "count": 0, "last": time.time() + 3600, "stopped": False}
+    (data / "shazam" / "throttle.json").write_text(json.dumps(state))
+    fake = FakeShazam([])
+    try:
+        with caplog.at_level(logging.INFO):
+            assert main(["--legs", "12s", "6s-subset", "--base-url", fake.url]) == 1
+    finally:
+        fake.close()
+    assert "is in the future" in caplog.text
+    assert "12s: refused" in caplog.text
+    assert "6s-subset: not started" in caplog.text
+    assert fake.requests == []
+
+
+def test_the_cli_takes_its_daily_cap_from_the_environment(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "1")
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 2)
+    try:
+        with caplog.at_level(logging.INFO):
+            assert main(["--legs", "12s", "6s-subset", "--base-url", fake.url]) == 0
+    finally:
+        fake.close()
+    assert len(fake.requests) == 1
+    assert "12s: daily_cap" in caplog.text
+    assert "6s-subset: not started" in caplog.text
+    assert "1 requests" in caplog.text
+
+
+def test_the_cli_ends_with_the_out_of_retries_summary(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ResultStore(data / "shazam" / "results.jsonl")
+    tired = f"{HOUR}#0+6@128k"
+    for _ in range(MAX_RETRIES + 1):
+        store.append(tired, recognizer_identity(6), ShazamOutcome(503, "server_error"))
+    fake = FakeShazam([json_response(200, NO_MATCH)])
+    try:
+        with caplog.at_level(logging.INFO):
+            assert main(["--legs", "6s-subset", "--base-url", fake.url]) == 0
+    finally:
+        fake.close()
+    assert len(fake.requests) == 1  # the other clip; the tired one is not queried
+    assert "out of retries and not queried" in caplog.text
+    assert tired in caplog.text
 
 
 def test_preflight_refuses_below_five_gib(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

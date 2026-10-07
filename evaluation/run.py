@@ -26,7 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from evaluation.clips import ClipAddress, cut, hour_addresses
-from evaluation.shazam_eval import CountingClient, ResultStore, Throttle, budget_from_env
+from evaluation.shazam_eval import (
+    CountingClient,
+    FutureStateError,
+    ResultStore,
+    Throttle,
+    budget_from_env,
+)
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
 
@@ -65,7 +71,8 @@ def run_legs(
 ) -> dict[str, str]:
     """Run each leg in turn; the report maps its name to ``done`` or the reason it stopped.
 
-    A leg after one that stopped is ``not started``: it decodes and sends nothing.
+    ``refused`` means the throttle refused a future-dated state (``FutureStateError``,
+    logged). A leg after one that stopped is ``not started``: it decodes and sends nothing.
     """
 
     def open_clip(a: ClipAddress) -> AbstractContextManager[Path]:
@@ -78,7 +85,11 @@ def run_legs(
             report[leg.name] = "not started"
             continue
         addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
-        report[leg.name] = asyncio.run(run_shazam(addresses, open_clip, store, client))
+        try:
+            report[leg.name] = asyncio.run(run_shazam(addresses, open_clip, store, client))
+        except FutureStateError as refusal:
+            log.error("%s", refusal)
+            report[leg.name] = "refused"
         stopped = report[leg.name] != "done"
     return report
 
@@ -125,7 +136,10 @@ def main(argv: list[str] | None = None) -> int:
         report = run_legs(legs, hours, archive_dir, work_dir, store, client)
     for name, reason in report.items():
         log.info("%s: %s", name, reason)
-    return 0
+    log.info("%d requests", client.requests)
+    if exhausted := sorted(store.history()[2]):
+        log.warning("out of retries and not queried: %s", exhausted)
+    return int("refused" in report.values())
 
 
 if __name__ == "__main__":
