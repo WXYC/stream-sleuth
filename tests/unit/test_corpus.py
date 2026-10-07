@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import io
+import itertools
 import json
 import logging
 import sqlite3
@@ -289,23 +290,55 @@ def test_version_qualified_plays_do_not_join_the_studio_title(
     assert corpus.PoolIndex.load(pool_db).tier("Jessica Pratt", "Other", title) == tier
 
 
-@pytest.mark.parametrize("artist", [a for a, *_ in POOL if a] + ["jessica pratt", "Stereolab"])
-@pytest.mark.parametrize(
-    "title",
-    [t or "" for _, _, t, _ in POOL]
-    + ["BACK BABY", "Back, Baby (Live)", "Brakhage (feat. Someone)", "Brakhage [Remixed]", ""],
-)
-def test_the_title_tier_is_names_title_tier(pool_db: Path, artist: str, title: str) -> None:
-    """The join's title tier and the shared predicate agree for every pool file, so a scorer
-    calling the predicate stands where the join does."""
-    files = sqlite3.connect(f"{pool_db.as_uri()}?mode=ro", uri=True)
-    rows = files.execute("SELECT artist, album_artist, album, title FROM files").fetchall()
-    files.close()
-    expected = any(
-        names.title_tier(artist, "Other", title, [a, aa], album, t) for a, aa, album, t in rows
-    )
+# (artist, album_artist, album, title): files that name a version in their album, in brackets
+# or after a dash in their title, and files credited to two names.
+AGREEMENT_POOL: list[tuple[str, str | None, str, str]] = [
+    ("Jessica Pratt", None, "Live at KEXP", "Back, Baby"),
+    ("Jessica Pratt", None, "On Your Own Love Again", "Back, Baby (Live)"),
+    ("Jessica Pratt", None, "Bootleg", "Back, Baby - Demo"),
+    ("Juana Molina", "Various Artists", "DOGA", "la paradoja"),
+    ("Stereolab（ステレオラブ）", "Stereolab", "Dots and Loops", "Brakhage"),
+    ("Hermanos Gutiérrez", None, "Session 9", "Hijo del Sol"),
+]
 
-    assert (corpus.PoolIndex.load(pool_db).tier(artist, "Other", title) == "title") == expected
+
+def test_the_title_tier_is_names_title_tier(tmp_path: Path) -> None:
+    """The join's title tier and the shared predicate agree over files that name versions and
+    files with an album artist, so a scorer calling the predicate stands where the join does.
+    The play's album matches no pool album, so no album tier masks the title tier."""
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    for i, (artist, album_artist, album, title) in enumerate(AGREEMENT_POOL):
+        db.execute(
+            "INSERT INTO files (key, stage_id, prefix, format, size, artist, album_artist, album,"
+            " title, status) VALUES (?, ?, 'rotation/', 'mp3', 1, ?, ?, ?, ?, 'indexed')",
+            (f"rotation/{i}.mp3", f"{i:040x}", artist, album_artist, album, title),
+        )
+    db.commit()
+    db.close()
+    index = corpus.PoolIndex.load(path)
+    artists = [
+        "Jessica Pratt",
+        "Juana Molina",
+        "Various Artists",
+        "Stereolab",
+        "Hermanos Gutiérrez",
+    ]
+    albums = ["Other", "Other [Live]", "Other (Demo)", "Other (Remixed)"]
+    titles = ["Back, Baby", "Back, Baby (Live)", "Back, Baby - Demo", "Back, Baby - Live"]
+    titles += ["BACK BABY", "la paradoja", "Brakhage", "Hijo del Sol", "Hijo del Sol (Session)"]
+
+    seen = set()
+    for artist, album, title in itertools.product(artists, albums, titles):
+        expected = any(
+            names.title_tier(artist, album, title, (a, aa), file_album, file_title)
+            for a, aa, file_album, file_title in AGREEMENT_POOL
+        )
+        assert (index.tier(artist, album, title) == "title") == expected, (artist, album, title)
+        seen.add(expected)
+
+    assert seen == {True, False}
 
 
 def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Path:
