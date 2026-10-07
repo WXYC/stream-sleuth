@@ -67,9 +67,25 @@ def _utc(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
+# The stored recognizer identity names this version, never the installed one: a new version is a
+# new identity, so the whole corpus would be queried again. Change it with the owner's go-ahead;
+# it must equal uv.lock's (a test checks).
+SHAZAMIO_VERSION = "0.8.1"
+
+
 def recognizer_identity(segment_s: int) -> str:
-    """The store's recognizer key: the shazamio version and the fingerprinted length."""
-    return f"shazam@{version('shazamio')}, segment={segment_s}"
+    """The store's recognizer key: the pinned shazamio version and the fingerprinted length."""
+    return f"shazam@{SHAZAMIO_VERSION}, segment={segment_s}"
+
+
+def require_pinned_shazamio() -> None:
+    """Exit before any lock, decode, or request unless the installed shazamio is the pinned one."""
+    if (installed := version("shazamio")) != SHAZAMIO_VERSION:
+        raise SystemExit(
+            f"shazamio {installed} is installed but the identity is pinned to {SHAZAMIO_VERSION}: a new "
+            "version is a new identity that re-queries every address; change SHAZAMIO_VERSION "
+            "deliberately, with the owner's go-ahead"
+        )
 
 
 @dataclass(frozen=True)
@@ -110,10 +126,7 @@ def _match(status: int, body: dict[str, Any]) -> ShazamOutcome:
         return ShazamOutcome(status, "no_match")
     offset = (body.get("matches") or [{}])[0].get("offset")
     return ShazamOutcome(
-        status,
-        "matched",
-        offset_s=float(offset) if offset is not None else None,
-        **fields,
+        status, "matched", offset_s=float(offset) if offset is not None else None, **fields
     )
 
 
@@ -403,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)  # tests only
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    require_pinned_shazamio()
     # Every path this run writes is checked before a request, a mkdir, or a decode.
     work_dir = require_outside_checkout(args.work_dir or data_dir() / "clips")
     store = ResultStore(args.store or data_dir() / "shazam" / "results.jsonl")
