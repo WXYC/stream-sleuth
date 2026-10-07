@@ -19,6 +19,7 @@ import pytest
 
 from evaluation import corpus
 from evaluation.pool import SCHEMA
+from evaluation.run import read_hours
 from stream_sleuth import paths
 from stream_sleuth.paths import CHECKOUT, DataPathError
 
@@ -1307,6 +1308,17 @@ def test_select_writes_the_frozen_hours_and_the_subset(tmp_path: Path, pool_db: 
     }
     assert record["shortfalls"]["subset/canonical-low"] == 1
     assert record["shortfalls"]["canonical-high/overnight"] == 3
+
+
+def test_the_leg_runner_reads_what_select_writes(tmp_path: Path, pool_db: Path) -> None:
+    # selection.json is a contract between this station module and the neutral run.py,
+    # which parses it on its own; this is the one test that holds both sides to it.
+    out = tmp_path / "frozen"
+    assert run_select(tmp_path, pool_db, out) == 0
+    assert read_hours(out / "selection.json") == {
+        "all": (out / "hours.txt").read_text().split(),
+        "subset": (out / "subset.txt").read_text().split(),
+    }
 
 
 def test_select_refuses_to_overwrite_and_leaves_every_file_untouched(
