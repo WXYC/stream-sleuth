@@ -25,8 +25,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress
 from stream_sleuth.paths import require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification, IdentificationSource
-from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
-from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 if TYPE_CHECKING:
     from evaluation.shazam_eval import ShazamOutcome
@@ -195,15 +193,20 @@ def to_identification(record: dict[str, Any]) -> Emission | None:
     return Emission((record["address"], record["recognizer"]), address, found)
 
 
-def study_identities(
-    snapshot: str | None, min_match_count: int = DEFAULT_MIN_MATCH_COUNT
-) -> set[str]:
+def study_identities(snapshot: str | None, min_match_count: int | None = None) -> set[str]:
     """Every recognizer identity one study scores: each Shazam segment length and the Olaf snapshot.
 
     With no ``snapshot`` there is no Olaf identity, for a run that scores Shazam alone. The Shazam
     identities name the pinned shazamio version (``SHAZAMIO_VERSION``), so they match the stored
     records; :func:`read_results` still warns about records under any other identity.
     """
+    # Imported here, not at module level: ``shazam_eval`` imports this module, and the Olaf module
+    # reads ``stream_sleuth.config`` (the loop settings) when it is imported.
+    from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
+    from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+
+    if min_match_count is None:
+        min_match_count = DEFAULT_MIN_MATCH_COUNT
     identities = {recognizer_identity(n) for n in CAPTURE_LENGTHS_S}
     return identities | {olaf_identity(snapshot, min_match_count)} if snapshot else identities
 

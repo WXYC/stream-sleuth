@@ -9,7 +9,7 @@ day, and the stop is persisted, so a restart that day sends nothing. A state fil
 last request is more than the interval in the future is refused, never slept on. One
 process holds a throttle state file at a time, enforced with a lock. Only ``matched``
 and ``no_match`` are scoring outcomes; ``server_error`` and ``decode_error`` are stored
-too and retried by a later run, at most ``MAX_RETRIES`` times per address, after which
+too and retried by a later run, at most ``MAX_RETRIES`` (in ``evaluation.results``) times per address, after which
 the address is reported and not queried. The store is a JSONL file the harness only
 ever appends to.
 
