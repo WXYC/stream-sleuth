@@ -46,6 +46,7 @@ from shazamio import Shazam
 from shazamio.interfaces.client import HTTPClientInterface
 
 from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
+from evaluation.envvars import env_number
 from stream_sleuth.paths import data_dir, require_outside_checkout
 from stream_sleuth.recognizers.shazam import parse
 
@@ -393,10 +394,14 @@ async def run(
 
 
 def budget_from_env() -> tuple[int, float]:
-    """The account's daily request budget and request spacing: the one place both settings are read."""
+    """The account's daily request budget and request spacing: the one place both settings are read.
+
+    The rate must be a positive integer and the interval a finite number of seconds, zero
+    allowed (no spacing, the daily cap still binds); otherwise the run is refused by name.
+    """
     return (
-        int(os.environ.get("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500")),
-        float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
+        env_number("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500", int, 1, "a positive integer"),
+        env_number("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20", float, 0.0, "a finite number >= 0"),
     )
 
 
@@ -417,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     require_pinned_shazamio()
+    budget = budget_from_env()  # refused here, before any path is created
     # Every path this run writes is checked before a request, a mkdir, or a decode.
     work_dir = require_outside_checkout(args.work_dir or data_dir() / "clips")
     store = ResultStore(args.store or data_dir() / "shazam" / "results.jsonl")
@@ -424,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (work_dir, store.path.parent, state_path.parent):
         directory.mkdir(parents=True, exist_ok=True)
     # Held until the run ends, before any decode: a second run on this state is refused.
-    with Throttle(state_path, *budget_from_env()) as throttle:
+    with Throttle(state_path, *budget) as throttle:
         client = CountingClient(throttle, base_url=args.base_url)
         addresses = hour_addresses(
             args.hours.read_text().split(), args.archive_dir, args.length, args.profile
