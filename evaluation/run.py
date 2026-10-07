@@ -29,11 +29,12 @@ from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple
 
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError, cut, hour_addresses
 from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir, snapshot_lock
 from evaluation.pool import open_pool_db, tag_lookup
+from evaluation.selection import fail, load_selection
 from evaluation.shazam_eval import (
     SCORING_KINDS,
     CountingClient,
@@ -210,35 +211,14 @@ def run_legs(
 def read_hours(selection: Path) -> dict[str, list[str]]:
     """The hour keys of ``selection.json``, read once: ``all`` of them, and the ``subset``.
 
-    The file must be a JSON object whose ``hours`` is a non-empty object keyed by hour (so
-    every key is a string), each hour's ``subset`` a JSON boolean, and at least one hour in
-    the subset, or the subset legs would report ``done`` having sent nothing. Anything else,
-    such as a hand-edited ``"false"``, which would be truthy, or ``hours.txt`` passed by
-    mistake, refuses the run with one line naming the file (and the hour, when one is at fault).
+    :func:`~evaluation.selection.load_selection` checks the structure (a hand-edited
+    ``"false"`` would be truthy, and ``hours.txt`` passed by mistake is not JSON); this adds
+    at least one hour in the subset, or the subset legs would report ``done`` having sent
+    nothing. Anything wrong refuses the run with one line naming the file.
     """
-
-    def fail(problem: str) -> NoReturn:
-        raise SystemExit(f"{selection}: {problem}")
-
-    try:
-        record = json.loads(selection.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as e:
-        fail(f"cannot read: {e}")
-    except json.JSONDecodeError as e:
-        fail(f"not JSON ({e}); pass the selection.json that `select` wrote")
-    if not isinstance(record, dict):
-        fail("not an object")
-    hours = record.get("hours")
-    if not isinstance(hours, dict):
-        fail("hours must be an object keyed by hour")
-    if not hours:
-        fail("no hours")
-    for key, label in hours.items():
-        subset = label.get("subset") if isinstance(label, dict) else None
-        if not isinstance(subset, bool):
-            fail(f"hour {key}: subset must be true or false")
+    hours = load_selection(selection)["hours"]
     if not (chosen := [key for key, label in hours.items() if label["subset"]]):
-        fail("no hour with subset: true")
+        fail(selection, "no hour with subset: true")
     return {"all": list(hours), "subset": chosen}
 
 

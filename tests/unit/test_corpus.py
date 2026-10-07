@@ -1614,16 +1614,13 @@ GOOD = {"group": "contrast", "band": "daytime", "subset": False}
 @pytest.mark.parametrize(
     ("content", "problem"),
     [
-        pytest.param("2026/08/12/202608121400.mp3\n", "not JSON", id="not-json"),
-        pytest.param([], "not an object", id="top-level-list"),
-        pytest.param({"export": "export"}, "no `hours`", id="no-hours"),
-        pytest.param({"hours": [HOURS[0]]}, "`hours` is not an object", id="hours-list"),
-        pytest.param({"hours": {HOURS[0]: "contrast"}}, "not an object", id="entry-string"),
+        pytest.param([], "not an object", id="shared-structural-check"),  # see test_selection.py
         pytest.param({"hours": {HOURS[0]: GOOD | {"group": "high"}}}, "group", id="bad-group"),
         pytest.param({"hours": {HOURS[0]: GOOD | {"group": None}}}, "group", id="null-group"),
         pytest.param({"hours": {HOURS[0]: GOOD | {"band": "night"}}}, "band", id="bad-band"),
-        pytest.param({"hours": {HOURS[0]: GOOD | {"subset": "false"}}}, "subset", id="str-subset"),
-        pytest.param({"hours": {HOURS[0]: {"group": "contrast"}}}, "band", id="missing-band"),
+        pytest.param(
+            {"hours": {HOURS[0]: {"group": "contrast", "subset": False}}}, "band", id="missing-band"
+        ),
         pytest.param(
             {"hours": {HOURS[0]: GOOD | {"band": "evening"}}},
             f"{HOURS[0]}: band 'evening' is not the hour's own",
