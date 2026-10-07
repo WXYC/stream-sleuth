@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
 
 # A featuring or edition clause. The edition phrases of SAME_RECORDING that end in "version"
 # go wherever they sit in the clause ("2011 Deluxe Version"); the other edition words only
@@ -148,7 +147,7 @@ def title_tier(
     play_artist: str | None,
     play_album: str | None,
     play_title: str | None,
-    artists: Iterable[str | None],
+    artists: tuple[str | None, ...],
     album: str | None,
     title: str | None,
 ) -> str | None:
@@ -159,7 +158,14 @@ def title_tier(
     join when their title keys are equal and the recording names each version qualifier
     the play names in a bracketed clause of its album or title (:func:`qualifiers` against
     :func:`named_qualifiers`), so a play logged "(Live)" never meets the studio recording.
+
+    ``exact`` and ``fuzzy`` name the title keys that met. They are not ``plays.jsonl``'s
+    ``pool_match_tier``, where ``exact`` and ``fuzzy`` are album tiers and every join on the
+    title keys is ``title``. ``artists`` is a tuple of names, never a bare string, which
+    would be read a letter at a time: mypy rejects it and a caller that evades mypy gets ``TypeError``.
     """
+    if isinstance(artists, str):
+        raise TypeError("artists must be a tuple of names, not a str")
     if not qualifiers(play_album, play_title) <= named_qualifiers(album, title):
         return None
     have = {key for artist in artists for key in title_keys(artist, title)}

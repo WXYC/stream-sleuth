@@ -320,16 +320,44 @@ def test_title_tier(
     play: tuple[str, str, str], recording: tuple[str | None, str, str | None], tier: str | None
 ) -> None:
     artist, album, title = recording
-    assert norm.title_tier(*play, [artist], album, title) == tier
+    assert norm.title_tier(*play, (artist,), album, title) == tier
 
 
 def test_title_tier_joins_either_of_two_artist_names() -> None:
     play = ("Stereolab", "x", "Brakhage")
-    artists = ["Stereolab（ステレオラブ）", "Various Artists"]
+    artists = ("Stereolab（ステレオラブ）", "Various Artists")
     assert norm.title_tier(*play, artists, "Dots and Loops", "Brakhage") == "fuzzy"
     assert (
         norm.title_tier("Various Artists", "x", "Brakhage", artists, "Dots", "Brakhage") == "exact"
     )
     assert norm.title_tier("Juana Molina", "x", "Brakhage", artists, "Dots", "Brakhage") is None
-    assert norm.title_tier(*play, [None, ""], "Dots and Loops", "Brakhage") is None
-    assert norm.title_tier(*play, [], "Dots and Loops", "Brakhage") is None
+    assert norm.title_tier(*play, (None, ""), "Dots and Loops", "Brakhage") is None
+    assert norm.title_tier(*play, (), "Dots and Loops", "Brakhage") is None
+
+
+@pytest.mark.parametrize(
+    ("play_album", "play_title", "album", "title", "tier"),
+    [
+        # The recording names the play's version outside brackets, which qualifiers() cannot see:
+        # anywhere in its album, but in its title only after a spaced dash.
+        ("Edits [Live]", "Back, Baby", "Live at KEXP", "Back, Baby", "exact"),
+        ("Edits (Demo)", "Back, Baby - Demo", "Bootleg", "Back, Baby - Demo", "exact"),
+        ("Edits [Demo]", "Back, Baby", "Bootleg", "Back, Baby - Demo", None),
+        # A title's unspaced or leading word names nothing, so these stay unjoined.
+        ("Edits [Live]", "Forever", "Bootleg", "Live Forever", None),
+        ("Edits [Live]", "Back, Baby", "Bootleg", "Back, Baby-Live", None),
+    ],
+)
+def test_title_tier_reads_the_version_a_recording_names_outside_brackets(
+    play_album: str, play_title: str, album: str, title: str, tier: str | None
+) -> None:
+    assert (
+        norm.title_tier("Jessica Pratt", play_album, play_title, ("Jessica Pratt",), album, title)
+        == tier
+    )
+
+
+def test_title_tier_refuses_a_bare_string_for_artists() -> None:
+    """A str would be iterated by character: every name longer than one letter would miss."""
+    with pytest.raises(TypeError, match="artists"):
+        norm.title_tier("Jessica Pratt", "x", "Back, Baby", "Jessica Pratt", "y", "Back, Baby")  # type: ignore[arg-type]
