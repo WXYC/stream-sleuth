@@ -354,6 +354,8 @@ def test_the_title_tier_is_names_title_tier(tmp_path: Path) -> None:
         ("A.R. Kane", "AR Kane", "fuzzy"),
         ("AR Kane", "A.R. Kane", "fuzzy"),
         ("A.R. Kane", "A.R. Kane", "exact"),
+        ("R.E.M.", "REM", "fuzzy"),
+        ("REM", "R.E.M.", "fuzzy"),
         # A single initial is not an initialism.
         ("J. Mascis", "JM Mascis", None),
         ("J. Mascis", "J Mascis", "fuzzy"),
@@ -411,6 +413,14 @@ def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Pat
         # A qualifier joins its plural and past forms, on either side.
         ("Back, Baby (Remixed)", "Back, Baby (Remix)", "title"),
         ("Back, Baby (Remix)", "Back, Baby (Remixed)", "title"),
+        # A dotted qualifier is the undotted one, whichever side carries the dots.
+        ("Back, Baby (L.P. Version)", "Back, Baby (LP Version)", "title"),
+        ("Back, Baby (LP Version)", "Back, Baby (L.P. Version)", "title"),
+        ("Back, Baby (F.C.C. Edit)", "Back, Baby (FCC Edit)", "title"),
+        ("Back, Baby (FCC Edit)", "Back, Baby (F.C.C. Edit)", "title"),
+        ("Back, Baby (L.I.V.E.)", "Back, Baby (Live)", "title"),
+        ("Back, Baby (Live)", "Back, Baby (L.I.V.E.)", "title"),
+        ("Back, Baby (L.I.V.E.)", "Back, Baby", None),
         ("Back, Baby (Peel Sessions)", "Back, Baby (Peel Session)", "title"),
         ("Back, Baby (Peel Session)", "Back, Baby (Peel Sessions)", "title"),
         # A pool file naming its version outside brackets names it all the same.

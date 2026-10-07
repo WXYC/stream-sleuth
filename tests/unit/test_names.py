@@ -205,10 +205,21 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         ("No. 1", "no 1"),
         ("Disc 1.5", "disc 1 5"),
         ("v1.2", "v1 2"),
-        ("1.A.B", "1 ab"),
         ("x.com", "x com"),
         ("a.k.a.mix", "aka mix"),
         ("a.k.a", "aka"),
+        # A chain after a period that follows a digit still collapses: it is single letters.
+        ("1.A.B", "1 ab"),
+        # An underscore separates, so it never hides an initialism or joins one to a word.
+        ("_R.E.M.", "rem"),
+        ("R.E.M._", "rem"),
+        ("01_R.E.M.", "01 rem"),
+        # A letter that ends a longer word is no initial: the chain starts at a boundary.
+        ("xa.b.c", "xa bc"),
+        ("Vol.A.B", "vol ab"),
+        # Letters of any script survive fold and still collapse.
+        ("Д.Д.Т.", "ддт"),
+        ("Α.Β.", "αβ"),
         # Initials with a space between them are separate initials, as before.
         ("J. M. Barrie", "j m barrie"),
     ],
@@ -359,6 +370,33 @@ def test_title_keys(artist: str | None, title: str | None, keys: list[tuple[str,
         (("US Girls", "x", "Overtime"), ("U.S. Girls", "y", "Overtime"), "fuzzy"),
         (("A.R. Kane", "x", "Baby Milk Snatcher"), ("AR Kane", "y", "Baby Milk Snatcher"), "fuzzy"),
         (("J. Mascis", "x", "Overtime"), ("JM Mascis", "y", "Overtime"), None),
+        (("REM", "x", "Overtime"), ("R.E.M.", "y", "Overtime"), "fuzzy"),
+        (("R.E.M.", "x", "Overtime"), ("REM", "y", "Overtime"), "fuzzy"),
+        # The collapse reads version words too, so a dotted qualifier is the undotted one,
+        # whichever side carries the dots.
+        (
+            ("Jessica Pratt", "x", "Song (LP Version)"),
+            ("Jessica Pratt", "y", "Song (L.P. Version)"),
+            "fuzzy",
+        ),
+        (
+            ("Jessica Pratt", "x", "Song (L.P. Version)"),
+            ("Jessica Pratt", "y", "Song (LP Version)"),
+            "fuzzy",
+        ),
+        (
+            ("Jessica Pratt", "x", "Song (FCC Edit)"),
+            ("Jessica Pratt", "y", "Song (F.C.C. Edit)"),
+            "fuzzy",
+        ),
+        (
+            ("Jessica Pratt", "x", "Song (F.C.C. Edit)"),
+            ("Jessica Pratt", "y", "Song (FCC Edit)"),
+            "fuzzy",
+        ),
+        (("Jessica Pratt", "x", "Song (Live)"), ("Jessica Pratt", "y", "Song (L.I.V.E.)"), "fuzzy"),
+        (("Jessica Pratt", "x", "Song (L.I.V.E.)"), ("Jessica Pratt", "y", "Song (Live)"), "fuzzy"),
+        (("Jessica Pratt", "x", "Song (L.I.V.E.)"), ("Jessica Pratt", "y", "Song"), None),
         # An empty part never joins, on either side.
         (("Jessica Pratt", "x", ""), ("Jessica Pratt", "y", ""), None),
         (("", "x", "Back, Baby"), ("", "y", "Back, Baby"), None),
