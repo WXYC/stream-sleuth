@@ -1621,6 +1621,7 @@ GOOD = {"group": "contrast", "band": "daytime", "subset": False}
         pytest.param(
             {"hours": {HOURS[0]: {"group": "contrast", "subset": False}}}, "band", id="missing-band"
         ),
+        pytest.param({"hours": {}}, "`hours` is empty", id="empty-hours"),
         pytest.param(
             {"hours": {HOURS[0]: GOOD | {"band": "evening"}}},
             f"{HOURS[0]}: band 'evening' is not the hour's own",
