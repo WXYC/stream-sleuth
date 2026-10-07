@@ -210,6 +210,43 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "back, baby（feat. mix master mike）",
             "back baby",
         ),
+        # An edition word that does not lead the clause, or a full-width bracket, is still an
+        # edition clause: the fuzzy key keeps no "version" for it.
+        *(
+            (
+                f"Back, Baby ({clause})",
+                f"back, baby ({clause.lower()})",
+                f"back, baby ({clause.lower()})",
+                "back baby",
+            )
+            for clause in ("2011 Deluxe Version", "Super Deluxe Version", "Special Version")
+        ),
+        (
+            "Back, Baby（Deluxe Version）",
+            "back, baby(deluxe version)",
+            "back, baby（deluxe version）",
+            "back baby",
+        ),
+        # A "with" credit is a featuring clause, whatever words it holds.
+        (
+            "Back, Baby (with Live Skull)",
+            "back, baby (with live skull)",
+            "back, baby (with live skull)",
+            "back baby",
+        ),
+        # A qualifier is keyed by its stem, so its plural and past forms join it.
+        *(
+            (
+                f"Back, Baby ({word})",
+                f"back, baby ({word.lower()})",
+                f"back, baby ({word.lower()})",
+                key,
+            )
+            for word, key in (
+                ("Remixed", "back baby remix"),
+                ("Peel Sessions", "back baby peel session"),
+            )
+        ),
         # "Version" beside another qualifier adds nothing: "(Live Version)" keys as "(Live)".
         (
             "Back, Baby (Live Version)",
@@ -291,6 +328,28 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
             ("Jessica Pratt", "On Your Own Love Again", f"Back, Baby ({clause})", "exact", "flac")
             for clause in ("Remastered 2011 Version", "feat. Mix Master Mike", "ft. Live Skull")
         ),
+        # So do an edition clause the cruft rule cannot see, and a "with" credit.
+        (
+            "Jessica Pratt",
+            "On Your Own Love Again (2011 Deluxe Version)",
+            "Back, Baby",
+            "fuzzy",
+            "flac",
+        ),
+        (
+            "Jessica Pratt",
+            "On Your Own Love Again（Super Deluxe Version）",
+            "Back, Baby",
+            "fuzzy",
+            "flac",
+        ),
+        (
+            "Jessica Pratt",
+            "On Your Own Love Again",
+            "Back, Baby (with Live Skull)",
+            "exact",
+            "flac",
+        ),
     ],
 )
 def test_pool_index_tiers(
@@ -344,9 +403,11 @@ def test_pool_index_tiers(
             (f"Back, Baby ({clause})", "title")
             for clause in (
                 "Deluxe Version, Bonus Track Version, Remastered 2011 Version, "
-                "feat. Mix Master Mike, ft. Live Skull"
+                "feat. Mix Master Mike, ft. Live Skull, with Live Skull, 2011 Deluxe Version, "
+                "Super Deluxe Version, Special Version, Expanded Version, Anniversary Version"
             ).split(", ")
         ),
+        ("Back, Baby（Deluxe Version）", "title"),
     ],
 )
 def test_version_qualified_plays_do_not_join_the_studio_title(
@@ -384,6 +445,11 @@ def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Pat
         # "(Live Version)" is "(Live)", in either direction.
         ("Back, Baby (Live)", "Back, Baby (Live Version)", "title"),
         ("Back, Baby (Live Version)", "Back, Baby (Live)", "title"),
+        # A qualifier joins its plural and past forms, on either side.
+        ("Back, Baby (Remixed)", "Back, Baby (Remix)", "title"),
+        ("Back, Baby (Remix)", "Back, Baby (Remixed)", "title"),
+        ("Back, Baby (Peel Sessions)", "Back, Baby (Peel Session)", "title"),
+        ("Back, Baby (Peel Session)", "Back, Baby (Peel Sessions)", "title"),
         # A pool file naming its version outside brackets names it all the same.
         ("Back, Baby - Live", "Back, Baby (Live)", "title"),
         # A pool file naming the same recording still joins the bare title.
@@ -421,6 +487,10 @@ def test_an_album_tier_play_joins_the_first_file_naming_its_version(
         # A same-recording phrase names no version there either.
         ("Bootleg", "Back, Baby - Mono", "Bootleg", None),
         ("Bootleg", "Back, Baby", "Bootleg", None),
+        # A title names it only after " - ": a sibling track whose name holds the word
+        # ("Live Forever") never makes the album satisfy a qualified play.
+        ("Bootleg", "Live Forever", "Bootleg", None),
+        ("Bootleg", "Back, Baby (Live) - Mono", "Bootleg", "exact"),
     ],
 )
 def test_a_pool_file_names_its_version_outside_brackets(
@@ -438,6 +508,10 @@ def test_a_pool_file_names_its_version_outside_brackets(
         # The play side reads bracketed clauses only; the pool side reads every word.
         (("Live at KEXP", "Back, Baby"), set(), {"live"}),
         (("Bootleg", "Back, Baby - Live"), set(), {"live"}),
+        # A title's unbracketed words count only after " - "; an album's count anywhere.
+        (("Bootleg", "Live Forever"), set(), set()),
+        (("Bootleg", "Session 9 - Demo"), set(), {"demo"}),
+        (("Session 9", "Back, Baby"), set(), {"session"}),
         (("Bootleg", "Back, Baby (Live Version)"), {"live"}, {"live"}),
         (("Bootleg", "Back, Baby (Alternate Version)"), {"version"}, {"version"}),
         # A clause's lone "version" is judged within the clause, not beside the name's words.

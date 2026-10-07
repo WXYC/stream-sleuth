@@ -62,7 +62,7 @@ _CRUFT = re.compile(
     r"\s*[\(\[](?:feat|ft|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
-_FEATURING = frozenset({"feat", "ft", "featuring"})
+_FEATURING = frozenset({"feat", "ft", "featuring", "with"})
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 # A bracketed clause with one of these whole words, or its plural or past form, names a
 # different recording: a version clause, which the keys keep and every tier honors.
@@ -74,8 +74,9 @@ VERSION_QUALIFIERS = frozenset(
 # Phrases come before the bare words, so "clean version" goes whole.
 SAME_RECORDING = re.compile(
     r"\b(?:(?:radio|single|fcc|clean) edit"
-    r"|(?:album|single|mono|stereo|lp|clean|explicit|radio|original|edited|remaster(?:ed)?)"
-    r" version|(?:original|mono|stereo) mix|remaster(?:ed)?|mono|stereo|clean|explicit|edited)\b"
+    r"|(?:album|single|mono|stereo|lp|clean|explicit|radio|original|edited|remaster(?:ed)?"
+    r"|deluxe|expanded|anniversary|bonus track|special) version|(?:original|mono|stereo) mix"
+    r"|remaster(?:ed)?|mono|stereo|clean|explicit|edited)\b"
 )
 
 
@@ -151,39 +152,48 @@ def album_key(s: str | None) -> str:
 
 
 def fuzzy(s: str | None) -> str:
-    """The fuzzy-tier key: ``fold(album_key(s))`` less bracketed clauses, non-word runs as a space.
+    """The fuzzy-tier key: ``album_key(fold(s))`` less bracketed clauses, non-word runs as a space.
 
     ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
     full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
     A version clause is kept, its words less :data:`SAME_RECORDING` phrases and a generic
     "version" in the key, so "Back, Baby (Live)" never joins the studio "Back, Baby" and
-    "(Live Version)" keys as "(Live)". Letters and digits of every script outside
+    "(Live Version)" keys as "(Live)". A qualifier is keyed by its stem, so "(Remixed)"
+    keys as "(Remix)". Letters and digits of every script outside
     brackets survive (a Japanese or Cyrillic name keeps a real key); a name that is all
     brackets keys to "" and never joins on this tier. Underscores and punctuation separate.
     """
 
     def drop_unless_version(m: re.Match[str]) -> str:
-        return f" {' '.join(_version_words(m.group()))} "
+        words = (
+            _stem(w) if _stem(w) in VERSION_QUALIFIERS else w for w in _version_words(m.group())
+        )
+        return f" {' '.join(words)} "
 
     return " ".join(
-        re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, fold(album_key(s)))).split()
+        re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, album_key(fold(s)))).split()
     )
 
 
 def qualifiers(*names: str | None) -> frozenset[str]:
     """The stemmed qualifiers in the version clauses of ``names``: the recording a play names."""
-    clauses = [c for s in names for c in _BRACKETED.findall(fold(album_key(s)))]
+    clauses = [c for s in names for c in _BRACKETED.findall(album_key(fold(s)))]
     return frozenset(_stem(w) for c in clauses for w in _version_words(c)) & VERSION_QUALIFIERS
 
 
-def named_qualifiers(*names: str | None) -> frozenset[str]:
-    """The stemmed qualifiers anywhere in ``names``, bracketed or not: what a pool file has.
+def named_qualifiers(album: str | None, title: str | None) -> frozenset[str]:
+    """The stemmed qualifiers a pool file's album and title name: what a pool file has.
 
-    :func:`qualifiers` plus the qualifier words outside brackets, so a pool album "Live
-    at KEXP" or title "Back, Baby - Live" names the live recording.
+    :func:`qualifiers` plus the qualifier words outside brackets: an album's anywhere
+    ("Live at KEXP"), a title's only after a " - " ("Back, Baby - Live"), so a title like
+    "Live Forever" names nothing.
     """
-    outside = (w for s in names for w in _words(_BRACKETED.sub(" ", fold(album_key(s)))))
-    return qualifiers(*names) | (frozenset(_stem(w) for w in outside) & VERSION_QUALIFIERS)
+
+    def outside(s: str | None) -> str:
+        return _BRACKETED.sub(" ", album_key(fold(s)))
+
+    words = _words(outside(album)) + _words(outside(title).partition(" - ")[2])
+    return qualifiers(album, title) | (frozenset(_stem(w) for w in words) & VERSION_QUALIFIERS)
 
 
 Key = tuple[str, str]
