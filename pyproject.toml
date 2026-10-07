@@ -72,8 +72,10 @@ ignore_missing_imports = true
 markers = [
     "ffmpeg: needs a real ffmpeg binary on PATH",
     "olaf: needs an Olaf build (STREAM_SLEUTH_OLAF_BIN or olaf on PATH) and ffmpeg",
+    # ci-sync-skip: external_api reason: unofficial Shazam client, never called from CI
+    "external_api: contacts the real Shazam; never run by CI or by a test, only by an owner-approved manual leg",
 ]
-addopts = "-m 'not ffmpeg and not olaf'"
+addopts = "-m 'not ffmpeg and not olaf and not external_api'"
 testpaths = ["tests"]
 pythonpath = ["."]
 console_output_style = "progress"
