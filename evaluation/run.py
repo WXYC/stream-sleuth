@@ -376,27 +376,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)  # tests only
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    require_pinned_shazamio()
-    budget = budget_from_env()  # refused here, before any path is created
     use = {args.only} if args.only else set(SOURCES)
-    if "olaf" in use and not args.snapshot:
+    legs = [
+        leg
+        for leg in LEGS
+        if (not args.legs or leg.name in args.legs) and use & set(leg.recognizers)
+    ]
+    # A run with no Shazam leg touches nothing of Shazam's: no pin check, budget, state, or lock.
+    use_shazam = "shazam" in use and any("shazam" in leg.recognizers for leg in legs)
+    use_olaf = "olaf" in use and any("olaf" in leg.recognizers for leg in legs)
+    if use_shazam:
+        require_pinned_shazamio()
+        budget = budget_from_env()  # refused here, before any path is created
+    if use_olaf and not args.snapshot:
         parser.error("--snapshot is required for Olaf legs; pass --only shazam to skip them")
     data = data_dir()
     work_dir = require_outside_checkout(args.work_dir or data / "clips")
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")
-    store = ResultStore(args.store or data / "shazam" / "results.jsonl")
-    state = require_outside_checkout(args.state or data / "shazam" / "throttle.json")
+    directories = [work_dir]
+    if use_shazam:
+        store = ResultStore(args.store or data / "shazam" / "results.jsonl")
+        state = require_outside_checkout(args.state or data / "shazam" / "throttle.json")
+        directories += [store.path.parent, state.parent]
     hours = read_hours(args.selection or data / "selection.json")
-    for directory in (work_dir, store.path.parent, state.parent):
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
     with ExitStack() as stack:  # held until every leg has run
         shazam = olaf = client = None
-        if "shazam" in use:
+        if use_shazam:
             throttle = stack.enter_context(Throttle(state, *budget))
             client = CountingClient(throttle, base_url=args.base_url)
             shazam = (store, client)
-        if "olaf" in use:
+        if use_olaf:
             home = checked_snapshot_dir(args.snapshot)
             if not (home / "pool.db").is_file():
                 raise SystemExit(f"{home}: no snapshot here; build it first")
@@ -407,7 +419,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             identity = olaf_identity(args.snapshot, args.min_match_count)
             olaf = (ResultStore(home / RESULTS), recognizer.recognize, identity)
-        legs = [leg for leg in LEGS if not args.legs or leg.name in args.legs]
         report = run_legs(legs, hours, archive_dir, work_dir, shazam=shazam, olaf=olaf)
     for name, reason in report.items():
         log.info("%s: %s", name, reason)

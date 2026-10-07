@@ -107,6 +107,21 @@ def test_an_olaf_leg_files_its_results_in_the_snapshot(data: Path) -> None:
     assert list((data / "clips").iterdir()) == []
 
 
+def test_a_run_with_no_shazam_leg_touches_nothing_of_shazams(
+    data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args: object) -> None:
+        raise AssertionError("an Olaf-only run must not reach Shazam's pin or budget")
+
+    monkeypatch.setattr(run_mod, "require_pinned_shazamio", refuse)
+    monkeypatch.setattr(run_mod, "budget_from_env", refuse)
+    monkeypatch.setattr(run_mod, "Throttle", refuse)
+    open_pool_db(data / "olaf" / "rotation" / "pool.db").close()
+    for argv in (["--only", "olaf", "--legs", "12s"], ["--legs", "6s", "20s"]):
+        assert main([*argv, "--snapshot", "rotation"]) == 0
+    assert not (data / "shazam").exists()  # no state file, no lock, not even its directory
+
+
 def test_olaf_legs_need_a_built_snapshot_and_a_name(data: Path) -> None:
     with pytest.raises(SystemExit, match="no snapshot"):
         main(["--only", "olaf", "--snapshot", "rotation"])
