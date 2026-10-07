@@ -14,6 +14,7 @@ from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 from evaluation import archive
 from evaluation.s3_readonly import MissingSettingError, archive_bucket, archive_client
+from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.unit.test_s3_readonly import seed_objects
 
 BUCKET = "synthetic-archive"
@@ -290,3 +291,27 @@ def test_synthetic_archive_builds_on_the_shared_aws_isolation(request, tmp_path_
     assert "aws_isolated_env" in request.fixturenames
     config = Path(os.environ["AWS_CONFIG_FILE"])
     assert config.is_relative_to(tmp_path_factory.getbasetemp())
+
+
+class _UntouchedClient:
+    """A client that fails the test on any method call."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"client.{name} was reached")
+
+
+@pytest.mark.parametrize("call", [archive.fetch, archive.fetch_all], ids=["fetch", "fetch_all"])
+@pytest.mark.parametrize(
+    "archive_dir",
+    [CHECKOUT, CHECKOUT / "data" / "archive", Path("archive")],
+    ids=["checkout", "in-checkout", "relative"],
+)
+def test_the_writers_refuse_a_checkout_or_relative_dir_before_any_request(
+    call, archive_dir, monkeypatch
+):
+    monkeypatch.chdir(CHECKOUT)
+    keys = SUMMER_KEY if call is archive.fetch else [SUMMER_KEY]
+    with pytest.raises(DataPathError):
+        call(keys, archive_dir=archive_dir, client=_UntouchedClient(), bucket=BUCKET)
+    assert not (CHECKOUT / "data" / "archive").exists()
+    assert not (CHECKOUT / "archive").exists()

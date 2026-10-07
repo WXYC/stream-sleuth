@@ -68,7 +68,7 @@ Rules for every PR that restructures the recognizer:
 
 ## Data
 
-Audio, reference-pool listings and object keys, playlist exports, credentials, and result stores never enter the repo. Research data lives under `$STREAM_SLEUTH_DATA_DIR` (default `~/.local/share/stream-sleuth/`), outside the checkout. `data/`, `eval.env`, and `.env.eval` are in `.gitignore` as a second guard only; nothing relies on them.
+Audio, reference-pool listings and object keys, playlist exports, credentials, and result stores never enter the repo. Research data lives under `$STREAM_SLEUTH_DATA_DIR` (default `~/.local/share/stream-sleuth/`), outside the checkout. `stream_sleuth.paths.data_dir()` is the one place that setting and its default are resolved (at call time, absolute, outside the checkout, never created); do not re-derive them. The harness writers (`archive.fetch`/`fetch_all`, `pool.stream`/`open_pool_db`) call `require_outside_checkout()` before any request or write and raise `DataPathError` for a relative path or one inside the checkout; a new writer does the same. `data/`, `eval.env`, and `.env.eval` are in `.gitignore` as a second guard only; nothing relies on them.
 
 ## The `plays.jsonl` boundary
 

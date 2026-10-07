@@ -36,6 +36,7 @@ from mutagen.mp3 import EasyMP3
 from mutagen.wave import WAVE
 
 from evaluation.s3_readonly import MissingSettingError, pool_bucket, pool_client
+from stream_sleuth.paths import require_outside_checkout
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +167,8 @@ def read_tags(path: Path, fmt: str) -> dict[str, Any]:
 
 
 def open_pool_db(path: Path) -> sqlite3.Connection:
-    """Open (creating if needed) ``pool.db`` at ``path``."""
+    """Open (creating if needed) ``pool.db`` at ``path``, which must be absolute and outside the checkout."""
+    require_outside_checkout(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     db.execute(SCHEMA)
@@ -212,7 +214,10 @@ def stream(
     else there is touched. Returns counts of ``indexed``, ``failed``,
     ``already_indexed``, and ``skipped_format``, plus ``untagged``: files indexed
     this run that lack an artist or a title tag (also counted in ``indexed``).
+    ``staging_dir`` must be absolute and outside the checkout, or
+    :class:`stream_sleuth.paths.DataPathError` is raised before any request.
     """
+    require_outside_checkout(staging_dir)
     client = client or pool_client()
     bucket = bucket or pool_bucket()
     staging_dir.mkdir(parents=True, exist_ok=True)

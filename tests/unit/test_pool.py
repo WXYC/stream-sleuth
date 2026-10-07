@@ -15,6 +15,7 @@ import pytest
 from moto import mock_aws
 
 from evaluation import pool
+from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.unit.test_s3_readonly import seed_objects
 
 ENDPOINT = "https://pool.example.test"
@@ -250,3 +251,38 @@ def test_synthetic_pool_builds_on_the_shared_aws_isolation(request, tmp_path_fac
     assert "aws_isolated_env" in request.fixturenames
     config = Path(os.environ["AWS_CONFIG_FILE"])
     assert config.is_relative_to(tmp_path_factory.getbasetemp())
+
+
+class _RecordingClient:
+    """A client that fails the test on any method call."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"client.{name} was reached")
+
+
+def test_stream_refuses_a_checkout_staging_dir_before_any_request(db):
+    obj = pool.PoolObject(
+        key="rotation/Heavy/juana-molina/doga/01-la-paradoja.mp3",
+        prefix="rotation/Heavy/",
+        size=10,
+        format="mp3",
+    )
+    staging = CHECKOUT / "pool-staging"
+    with pytest.raises(DataPathError):
+        pool.stream(
+            [obj], lambda path, stage: None, db=db, staging_dir=staging, client=_RecordingClient()
+        )
+    assert not staging.exists()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [CHECKOUT / "pool.db", CHECKOUT / "nested" / "pool.db", Path("pool.db")],
+    ids=["in-checkout", "nested", "relative"],
+)
+def test_open_pool_db_refuses_a_checkout_or_relative_path_before_any_write(path, monkeypatch):
+    monkeypatch.chdir(CHECKOUT)
+    with pytest.raises(DataPathError):
+        pool.open_pool_db(path)
+    assert not (CHECKOUT / "pool.db").exists()
+    assert not (CHECKOUT / "nested").exists()
