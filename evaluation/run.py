@@ -405,7 +405,6 @@ def main(argv: list[str] | None = None) -> int:
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
     report: dict[str, str] = {}
-    client = None
     with ExitStack() as stack:  # the snapshot's lock and pool.db, held through every leg
         olaf = None
         if use_olaf:  # refused before the Shazam lock is taken, in one line
@@ -426,14 +425,17 @@ def main(argv: list[str] | None = None) -> int:
             with Throttle(state, *budget) as throttle:
                 client = CountingClient(throttle, base_url=args.base_url)
                 report = run_legs(legs, hours, archive_dir, work_dir, shazam=(store, client))
+            # Logged before any Olaf leg, so an Olaf exception cannot drop the Shazam outcome.
+            for name, reason in report.items():
+                log.info("%s: %s", name, reason)
+            log.info("%d requests", client.requests)
+            if exhausted := sorted(store.history()[2]):
+                log.warning("out of retries and not queried: %s", exhausted)
         if olaf:
-            report |= run_legs(legs, hours, archive_dir, work_dir, olaf=olaf)
-    for name, reason in report.items():
-        log.info("%s: %s", name, reason)
-    if client:
-        log.info("%d requests", client.requests)
-        if exhausted := sorted(store.history()[2]):
-            log.warning("out of retries and not queried: %s", exhausted)
+            olaf_report = run_legs(legs, hours, archive_dir, work_dir, olaf=olaf)
+            for name, reason in olaf_report.items():
+                log.info("%s: %s", name, reason)
+            report |= olaf_report
     return int("refused" in report.values())
 
 
