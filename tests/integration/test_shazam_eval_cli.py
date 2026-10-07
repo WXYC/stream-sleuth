@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from evaluation.shazam_eval import main
+from evaluation.shazam_eval import Throttle, ThrottleBusyError, hour_addresses, main
+from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
 from tests.unit.test_shazam_eval import HTML_429, FakeShazam, _json
 
@@ -124,6 +126,44 @@ def test_missing_and_unreadable_hours_are_logged_and_skipped_without_a_request(
     assert [r["address"] for r in _records(tmp_path / "shazam.jsonl")] == [f"{NEXT_HOUR}#0+12@128k"]
     assert len(fake.requests) == 1
     assert missing in caplog.text and unreadable in caplog.text
+
+
+@pytest.mark.parametrize("flag", ["--store", "--state", "--work-dir"])
+@pytest.mark.parametrize("where", ["inside", "relative"])
+def test_the_cli_refuses_a_path_in_the_checkout_before_any_request(
+    tmp_path: Path, flag: str, where: str
+) -> None:
+    _make_hour(tmp_path / "archive", HOUR, 20)
+    # Without the guard the run would query: the hour has an address.
+    assert hour_addresses([HOUR], tmp_path / "archive", 12, "128k")
+    bad = CHECKOUT / "shazam-guard-test" / "x" if where == "inside" else Path("x")
+    paths = dict(zip(_explicit_paths(tmp_path)[::2], _explicit_paths(tmp_path)[1::2], strict=True))
+    paths[flag] = str(bad)
+    fake = FakeShazam([_json(200, NO_MATCH)])
+    try:
+        with pytest.raises(DataPathError):
+            main([*_flags(tmp_path, fake, HOUR), *(p for pair in paths.items() for p in pair)])
+    finally:
+        fake.close()
+    assert fake.requests == []
+    assert not (CHECKOUT / "shazam-guard-test").exists()
+    assert not Path("x").exists()
+    for created in ("work", "shazam.jsonl", "throttle.json", "throttle.json.lock"):
+        assert not (tmp_path / created).exists()
+
+
+def test_a_second_run_on_a_held_state_file_is_refused_before_any_request(tmp_path: Path) -> None:
+    _make_hour(tmp_path / "archive", HOUR, 20)
+    fake = FakeShazam([_json(200, NO_MATCH)])
+    try:
+        with Throttle(tmp_path / "throttle.json", 500, 20.0):  # the first run, still going
+            with pytest.raises(ThrottleBusyError, match=re.escape(str(tmp_path / "throttle.json"))):
+                main([*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)])
+            assert fake.requests == []
+        assert main([*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)]) == 0
+    finally:
+        fake.close()
+    assert len(fake.requests) == 1
 
 
 def test_paths_default_from_the_data_directory(
