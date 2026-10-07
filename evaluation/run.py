@@ -258,16 +258,17 @@ def to_identification(record: dict[str, Any]) -> Emission | None:
     return Emission((record["address"], record["recognizer"]), address, found)
 
 
-def study_identities(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COUNT) -> set[str]:
+def study_identities(
+    snapshot: str | None, min_match_count: int = DEFAULT_MIN_MATCH_COUNT
+) -> set[str]:
     """Every recognizer identity one study scores: each Shazam segment length and the Olaf snapshot.
 
-    The Shazam identities name the pinned shazamio version (``SHAZAMIO_VERSION``), so they match
-    the stored records; :func:`read_results` still warns about records under any other identity.
+    With no ``snapshot`` there is no Olaf identity, for a run that scores Shazam alone. The Shazam
+    identities name the pinned shazamio version (``SHAZAMIO_VERSION``), so they match the stored
+    records; :func:`read_results` still warns about records under any other identity.
     """
-    return {
-        *(recognizer_identity(n) for n in CAPTURE_LENGTHS_S),
-        olaf_identity(snapshot, min_match_count),
-    }
+    identities = {recognizer_identity(n) for n in CAPTURE_LENGTHS_S}
+    return identities | {olaf_identity(snapshot, min_match_count)} if snapshot else identities
 
 
 def _line_of(path: Path, address: str) -> int:
@@ -346,6 +347,31 @@ def preflight(path: Path) -> None:
         raise SystemExit(f"{path}: {free / 2**30:.1f} GiB free; refusing to start below 5 GiB")
 
 
+def select_legs(
+    parser: argparse.ArgumentParser,
+    only: str | None,
+    names: Iterable[str] | None,
+) -> tuple[list[Leg], bool, bool]:
+    """The legs a run selects, and whether it uses Shazam and Olaf; the parser refuses (exit 2)
+    when none are selected.
+
+    ``only`` is one of :data:`SOURCES` or None for both; ``names`` are leg names or None for all.
+    """
+    use = {only} if only else set(SOURCES)
+    legs = [leg for leg in LEGS if (not names or leg.name in names) and use & set(leg.recognizers)]
+    if not legs:
+        parser.error("no leg is selected: --only and --legs name no leg in common")
+    use_shazam = "shazam" in use and any("shazam" in leg.recognizers for leg in legs)
+    use_olaf = "olaf" in use and any("olaf" in leg.recognizers for leg in legs)
+    return legs, use_shazam, use_olaf
+
+
+def require_snapshot(parser: argparse.ArgumentParser, use_olaf: bool, snapshot: str | None) -> None:
+    """The parser refuses (exit 2) an Olaf leg without a snapshot to query or score."""
+    if use_olaf and not snapshot:
+        parser.error("--snapshot is required for Olaf legs; pass --only shazam to skip them")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--selection", type=Path, help="default: <data>/selection.json")
@@ -362,22 +388,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)  # tests only
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    use = {args.only} if args.only else set(SOURCES)
-    legs = [
-        leg
-        for leg in LEGS
-        if (not args.legs or leg.name in args.legs) and use & set(leg.recognizers)
-    ]
-    if not legs:
-        parser.error("no leg is selected: --only and --legs name no leg in common")
+    legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
     # A run with no Shazam leg touches nothing of Shazam's: no pin check, budget, state, or lock.
-    use_shazam = "shazam" in use and any("shazam" in leg.recognizers for leg in legs)
-    use_olaf = "olaf" in use and any("olaf" in leg.recognizers for leg in legs)
     if use_shazam:
         require_pinned_shazamio()
         budget = budget_from_env()  # refused here, before any path is created
-    if use_olaf and not args.snapshot:
-        parser.error("--snapshot is required for Olaf legs; pass --only shazam to skip them")
+    require_snapshot(parser, use_olaf, args.snapshot)
     data = data_dir()
     work_dir = require_outside_checkout(args.work_dir or data / "clips")
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")

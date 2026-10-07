@@ -2,8 +2,10 @@
 
 Station-neutral. It reads ``plays.jsonl``, the result stores through
 :func:`evaluation.run.read_results`, and replay emissions files in the format ``JsonlOutput``
-writes; it never reads a flowsheet, a database, or station config, and never imports
-:mod:`evaluation.corpus` or :mod:`evaluation.archive` (the station import scan enforces it).
+writes; it never reads a flowsheet or station config, and never imports
+:mod:`evaluation.corpus` or :mod:`evaluation.archive` (the station import scan enforces it). The
+scoring functions touch no database: they take the Olaf references' artist names as an argument,
+and only the CLI's :func:`main` opens the snapshot's own ``pool.db``, read-only, to build them.
 
 Both inputs become :class:`evaluation.run.Emission` (store key, parsed address, identification)
 before :func:`attribute`, so attribution, precision, and per-play scores run on one code path;
@@ -21,23 +23,49 @@ its ``t_offset_s`` to the next play's in its hour, the last to 3,600 s.
 Audio without a scoring record is **uncovered**, never a miss: a play counts in recall only when
 every grid address of the leg that starts in its window has a ``matched`` or ``no_match``
 record, and a carryover play is a candidate only, never scored.
+
+``python -m evaluation.score`` scores every selected leg and writes the score file (:func:`main`).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import logging
 import math
+import os
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 from evaluation import names
-from evaluation.clips import ClipAddress, grid
-from evaluation.run import Emission, Leg, Results
+from evaluation.clips import ClipAddress, grid, hour_addresses
+from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir
+from evaluation.pool import open_read_only, reference_artists
+from evaluation.run import (
+    LEGS,
+    SOURCES,
+    Emission,
+    Leg,
+    Results,
+    read_hours,
+    read_results,
+    require_snapshot,
+    select_legs,
+    study_identities,
+)
+from evaluation.shazam_eval import ResultStore, recognizer_identity
+from stream_sleuth.paths import DataPathError, data_dir, require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification
+from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
+from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+
+log = logging.getLogger(__name__)
 
 HOUR_S = 3600.0
 MIN_LAG_SAMPLES = 20
@@ -63,6 +91,11 @@ class Play(NamedTuple):
     carryover: bool
     in_pool: bool | None
     pool_match_tier: str | None
+    pool_format: str | None
+    rotation: bool
+    reorder_flag: bool | None
+    play_order_status: str
+    talk_rows: int
     group: str | None
     band: str
     subset: bool
@@ -371,3 +404,178 @@ def score_leg(
         ),
     )
     return LegScore(coverage, verdicts, score_plays(plays, verdicts, covered))
+
+
+# What the score file says of a play: the fields report.py breaks results down by. A carryover
+# repeats the previous hour's ``play_id``, so a play is keyed by (hour_key, play_id, carryover).
+PLAY_FIELDS = (
+    "hour_key",
+    "play_id",
+    "carryover",
+    "era",
+    "in_pool",
+    "pool_match_tier",
+    "pool_format",
+    "rotation",
+    "group",
+    "band",
+    "subset",
+    "reorder_flag",
+    "play_order_status",
+    "talk_rows",
+)
+
+
+def _play_row(p: Play) -> dict[str, Any]:
+    return {f: getattr(p, f) for f in PLAY_FIELDS}
+
+
+def leg_json(leg: Leg, identity: str, ls: LegScore) -> dict[str, Any]:
+    """One leg's entry in the score file, which ``report.py`` reads: figures, coverage, and rows.
+
+    ``plays`` are the scored plays; ``carryover_plays`` the carryover plays some emission was
+    attributed to, which are candidates only and never scored. An emission row names its play by
+    ``(hour_key, play_id, carryover)``, which keys one of those two lists (``play_id`` and
+    ``carryover`` are null for a wrong emission).
+    """
+    attributed = {v.play for v in ls.verdicts if v.play and v.play.carryover}
+    return {
+        "leg": leg.name,
+        "recognizer": identity,
+        "length_s": leg.length_s,
+        "profile": leg.profile,
+        "coverage": asdict(ls.coverage),
+        "recall": ls.recall,
+        "in_pool_recall": ls.in_pool_recall,
+        "unjoinable_plays": ls.unjoinable_plays,
+        "precision": precision(ls.verdicts),
+        "distinct_precision": distinct_precision(ls.verdicts),
+        "adjudicated_precision": None,
+        "adjudicated_distinct_precision": None,
+        "pads": {era: p._asdict() for era, p in pads(ls.plays).items()},
+        "plays": [
+            {
+                **_play_row(r.play),
+                "covered": r.covered,
+                "identified": r.identified,
+                "first_s": r.first_s,
+                "ttfi_s": r.ttfi_s,
+                "lag_s": r.lag_s,
+            }
+            for r in ls.plays
+        ],
+        "carryover_plays": [
+            _play_row(p) for p in sorted(attributed, key=lambda p: (p.hour_key, p.t_offset_s))
+        ],
+        "emissions": [
+            {
+                "address": v.emission.address.key,
+                "hour_key": v.emission.address.hour_key,
+                "source": v.emission.found["source"],
+                "artist": v.emission.found["artist"],
+                "song": v.emission.found["song"],
+                "album": v.emission.found["album"],
+                "play_id": v.play.play_id if v.play else None,
+                "carryover": v.play.carryover if v.play else None,
+                "neighbor": v.neighbor,
+            }
+            for v in ls.verdicts
+        ],
+    }
+
+
+def check_score_file(path: Path) -> None:
+    """``SystemExit`` naming ``path`` unless it is absent or a score file this command wrote.
+
+    A score file is a JSON object of exactly ``version`` and ``legs``; anything else there, such
+    as a result store or a settings file, is not ours to replace.
+    """
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        found = None
+    if not isinstance(found, dict) or set(found) != {"version", "legs"}:
+        raise SystemExit(f"{path}: exists and is not a score file; not overwriting it")
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` are one file, by resolved path or, when both exist, by identity."""
+    return a.resolve() == b.resolve() or (a.exists() and b.exists() and os.path.samefile(a, b))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--plays", type=Path, required=True, help="the plays.jsonl to score against"
+    )
+    parser.add_argument("--selection", type=Path, help="default: <data>/selection.json")
+    parser.add_argument("--archive-dir", type=Path, help="default: <data>/archive")
+    parser.add_argument("--store", type=Path, help="default: <data>/shazam/results.jsonl")
+    parser.add_argument("--snapshot", help="the Olaf snapshot whose results and pool.db to score")
+    parser.add_argument("--min-match-count", type=int, default=DEFAULT_MIN_MATCH_COUNT)
+    parser.add_argument("--only", choices=sorted(SOURCES), help="score one recognizer's legs")
+    parser.add_argument(
+        "--legs", nargs="+", choices=[leg.name for leg in LEGS], help="default: all"
+    )
+    parser.add_argument("--out", type=Path, help="the score file; default: <data>/score/score.json")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
+    require_snapshot(parser, use_olaf, args.snapshot)
+    selected = [
+        (leg, who)
+        for leg in legs
+        for who in leg.recognizers
+        if (who == "shazam" and use_shazam) or (who == "olaf" and use_olaf)
+    ]
+    try:
+        data = data_dir()
+        plays_path = require_outside_checkout(args.plays)
+        selection = require_outside_checkout(args.selection or data / "selection.json")
+        archive_dir = require_outside_checkout(args.archive_dir or data / "archive")
+        store = ResultStore(
+            require_outside_checkout(args.store or data / "shazam" / "results.jsonl")
+        )
+        out = require_outside_checkout(args.out or data / "score" / "score.json")
+        home = checked_snapshot_dir(args.snapshot) if args.snapshot else None
+    except (DataPathError, SnapshotError) as refusal:
+        raise SystemExit(str(refusal)) from None
+    read = [
+        plays_path,
+        selection,
+        store.path,
+        *([home / "pool.db", home / RESULTS] if home else []),
+    ]
+    if clash := next((i for i in read if _same_file(out, i)), None):
+        raise SystemExit(f"{out}: is also an input ({clash}); not overwriting it")
+    check_score_file(out)
+    if home and not (home / "pool.db").is_file():
+        raise SystemExit(f"{home}: no snapshot here; build it first")
+    plays, hours = read_plays(plays_path), read_hours(selection)
+    stores = [store, ResultStore(home / RESULTS)] if home else [store]
+    results = read_results(stores, study_identities(args.snapshot, args.min_match_count))
+    references: dict[str, tuple[str, ...]] = {}
+    if home:
+        with closing(open_read_only(home / "pool.db")) as db:
+            references = dict(reference_artists(db))
+    entries: dict[str, dict[str, Any]] = {}
+    for leg, who in selected:
+        identity = (
+            recognizer_identity(leg.length_s)
+            if who == "shazam"
+            else olaf_identity(args.snapshot, args.min_match_count)
+        )
+        addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
+        ls = score_leg(plays, results, identity, leg, hours[leg.hours], addresses, references)
+        entries[f"{leg.name}/{who}"] = leg_json(leg, identity, ls)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    document = json.dumps({"version": 1, "legs": entries}, ensure_ascii=False, indent=1)
+    out.write_text(document + "\n", encoding="utf-8")
+    log.info("wrote %s", out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
