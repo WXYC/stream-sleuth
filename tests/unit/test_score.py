@@ -133,7 +133,7 @@ def _hit(track: tuple[str, str, str], at: float, hour: str = HOUR, **extra: Any)
             False,
             id="a version the play does not name is wrong",
         ),
-        pytest.param(("REM", "Drive", ""), 750.0, None, False, id="not this hour's song"),
+        pytest.param(("Stereolab", "Drive", ""), 750.0, None, False, id="not this hour's song"),
         pytest.param(PRATT, 420.0, 2, True, id="at the window's start, which is inside it"),
         pytest.param(CHUQUI, 1320.0, 4, True, id="at the other window's start"),
         pytest.param(CHUQUI, 2580.0, 4, True, id="at the window's end, which is inside it"),
@@ -146,6 +146,13 @@ def test_attribution(
 ) -> None:
     [verdict] = attribute(plays_from(RECORDS), [_hit(track, at)])
     assert (verdict.play.play_id if verdict.play else None, verdict.neighbor) == (play_id, neighbor)
+
+
+def test_a_dotted_initialism_joins_the_same_letters_undotted() -> None:
+    """The join's rule since WXYC/stream-sleuth#96, so "A.R. Kane" logged is "AR Kane" heard."""
+    plays = plays_from(_hour(HOUR, "canonical", (1, 120.0, ("A.R. Kane", "Baby Milk Snatcher", "69"), {})))  # fmt: skip
+    [verdict] = attribute(plays, [_hit(("AR Kane", "Baby Milk Snatcher", "69"), 195.0)])
+    assert verdict.play is not None and verdict.play.play_id == 1
 
 
 def test_a_same_song_play_in_neither_logged_interval_goes_to_the_earlier() -> None:
@@ -199,6 +206,10 @@ def test_precision_and_distinct_song_precision() -> None:
         pytest.param(
             [_hit(MOLINA, 195.0), _hit(MOLINA, 990.0)], 1 / 2, 1.0,
             id="a run is correct when any of it is, though one emission is past the window",
+        ),
+        pytest.param(
+            [_hit(CHUQUI, 1305.0), _hit(CHUQUI, 1320.0)], 1 / 2, 1.0,
+            id="a run whose first emission is before the window is still correct",
         ),
         pytest.param(
             [_hit(ELLINGTON, 3585.0), _hit(ELLINGTON, 0.0, hour=EMPTY)], 1 / 2, 1 / 2,
@@ -269,7 +280,8 @@ def test_the_song_start_is_the_earliest_offset_bearing_clips(
     hits: list[Emission], first: float, ttfi: float, lag: float
 ) -> None:
     plays = plays_from(_hour(HOUR, "canonical", (1, 200.0, MOLINA, {})))
-    [row] = score_plays(plays, attribute(plays, hits), covered=set(plays))
+    verdicts = list(reversed(attribute(plays, hits)))  # score_plays orders them itself
+    [row] = score_plays(plays, verdicts, covered=set(plays))
     assert (row.first_s, row.ttfi_s, row.lag_s) == (first, ttfi, lag)
 
 
@@ -278,7 +290,8 @@ def test_recall_counts_covered_plays_only() -> None:
     covered = {p for p in plays if p.play_id in (1, 5)}
     rows = score_plays(plays, attribute(plays, HITS), covered=covered)
     assert score.recall(rows) == pytest.approx(1 / 2)
-    assert {r.play.play_id: r.ttfi_s for r in rows}[2] is None  # timed only when covered
+    play_2 = {r.play.play_id: r for r in rows}[2]  # it has a timed hit, but is uncovered
+    assert (play_2.identified, play_2.ttfi_s, play_2.lag_s) == (True, None, None)
 
 
 def _rows(era: str, lags: list[float | None]) -> list[score.PlayScore]:
@@ -287,27 +300,31 @@ def _rows(era: str, lags: list[float | None]) -> list[score.PlayScore]:
 
 
 @pytest.mark.parametrize(
-    ("lags", "pad"),
+    ("lags", "recommended", "p95"),
     [
-        pytest.param([10.0] * 19, score.Pad(180.0, 19, None), id="19 samples: insufficient data"),
+        pytest.param([10.0] * 19, 180.0, None, id="19 samples: insufficient data, 180 s"),
         pytest.param(
-            [float(n) for n in range(-10, 10)], score.Pad(180.0, 20, 9.0),
-            id="20 samples under the default: the default stands",
+            [float(n) for n in range(-10, 10)], 180.0, 9.0,
+            id="20 samples under the default: 180 s stands",
         ),
         pytest.param(
-            [3.0 * n for n in range(1, 101)], score.Pad(285.0, 100, 285.0),
+            [3.0 * n for n in range(1, 101)], 285.0, 285.0,
             id="over the default: the pad covers p95 of |lag|",
         ),
         pytest.param(
-            [float(n) for n in range(190, 211)], score.Pad(209.0, 21, 209.0),
+            [float(n) for n in range(190, 211)], 209.0, 209.0,
             id="nearest rank: the 20th of 21, not the 19th",
         ),
-        pytest.param([700.0] * 25, score.Pad(600.0, 25, 700.0), id="capped at 600 s"),
+        pytest.param([700.0] * 25, 600.0, 700.0, id="capped at 600 s"),
     ],
 )  # fmt: skip
-def test_pad_per_era(lags: list[float], pad: score.Pad) -> None:
-    rows = _rows("canonical", [*lags, None]) + _rows("etl", [250.0] * 20)  # None: no offsets
-    assert score.pads(rows) == {"canonical": pad, "etl": score.Pad(250.0, 20, 250.0)}
+def test_pad_per_era(lags: list[float], recommended: float, p95: float | None) -> None:
+    rows = _rows("canonical", [*lags, None]) + _rows("etl", [200.0] * 20)  # None: no offsets
+    assert score.pads(rows) == {
+        "canonical": score.Pad(recommended, len(lags), p95, (180.0,)),
+        # Against the plan's 180 s default, not the 220 s this era's windows were padded with.
+        "etl": score.Pad(200.0, 20, 200.0, (220.0,)),
+    }
 
 
 def _store_line(address: str, kind: str, track: tuple[str, str, str] = MOLINA, **extra: Any) -> str:
@@ -390,6 +407,53 @@ def test_an_address_on_a_window_edge_gates_that_play(
     results = read_results([ResultStore(path)], {SHAZAM})
     leg = score.score_leg(plays_from(RECORDS), results, SHAZAM, LEG, [HOUR], grid(HOUR, 12))
     assert {r.play.play_id for r in leg.plays if not r.covered} == uncovered
+
+
+LABELS = "2026/08/12/202608122000.mp3"
+
+
+def test_plays_no_emission_can_join_stay_in_recall_and_are_counted(tmp_path: Path) -> None:
+    records = _hour(
+        LABELS,
+        "canonical",
+        (1, 120.0, ("", "Untitled", ""), {"in_pool": None, "pool_match_tier": None}),
+        (2, 600.0, ("Jessica Pratt", "", "On Your Own Love Again"), {}),  # in the pool by album
+        (3, 1200.0, MOLINA, {}),
+        (4, 2400.0, ("", "", ""), {"in_pool": None, "pool_match_tier": None}),  # uncovered
+    )
+    lines = [
+        _store_line(a.key, "no_match") for a in grid(LABELS, 12) if a.offset_s not in (1215, 3000)
+    ]
+    lines.append(_store_line(f"{LABELS}#1215+12@128k", "matched"))
+    path = tmp_path / "results.jsonl"
+    path.write_text("".join(lines), encoding="utf-8")
+    results = read_results([ResultStore(path)], {SHAZAM})
+    leg = score.score_leg(plays_from(records), results, SHAZAM, LEG, [LABELS], grid(LABELS, 12))
+    # Play 1 (no artist, in_pool null) is never in the in-pool denominator; plays 1 and 2 have
+    # no title key, so title_tier can never join them: misses all the same, and counted. Play 4
+    # has none either, but is uncovered, so it is neither a miss nor counted.
+    assert (leg.recall, leg.in_pool_recall, leg.unjoinable_plays) == pytest.approx(
+        (1 / 3, 1 / 2, 2)
+    )
+
+
+def test_an_hour_whose_records_are_all_errors_is_uncovered_but_has_records(tmp_path: Path) -> None:
+    errors = "2026/08/12/202608122100.mp3"
+    path = tmp_path / "results.jsonl"
+    path.write_text(
+        "".join(_store_line(f"{errors}#{o}+12@128k", "server_error", status=503) for o in (0, 15)),
+        encoding="utf-8",
+    )
+    results = read_results([ResultStore(path)], {SHAZAM})
+    plays = plays_from(_hour(errors, "canonical", (1, 120.0, MOLINA, {})))
+    leg = score.score_leg(plays, results, SHAZAM, LEG, [errors], grid(errors, 12))
+    assert leg.coverage == score.Coverage(
+        grid_addresses=240,
+        scored_addresses=0,
+        uncovered_addresses={"server_error": 2, "untried": 238},
+        hours_without_records=[],
+        uncovered_plays={errors: 1},
+    )
 
 
 def test_a_leg_with_no_grid_leaves_every_play_uncovered(tmp_path: Path) -> None:
