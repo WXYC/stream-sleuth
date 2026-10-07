@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from evaluation import olaf_snapshot, shazam_eval
 from evaluation import run as run_mod
-from evaluation import shazam_eval
 from evaluation.olaf_snapshot import (
     BUILDING,
     MARKER,
@@ -29,6 +30,7 @@ from evaluation.run import main
 from evaluation.shazam_eval import Throttle
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from stream_sleuth.recognizers.olaf import OLAF_COMMIT, OlafError
+from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 from tests.audio import render
 from tests.characterization.shazam_responses import NO_MATCH
 from tests.shazam_fake import FakeShazam, json_response
@@ -118,7 +120,7 @@ def test_an_olaf_leg_files_its_results_in_the_snapshot(data: Path) -> None:
     assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
     records = _records(home / RESULTS)
     assert [r["address"] for r in records] == [f"{HOUR}#0+12@128k", f"{OTHER}#0+12@128k"]
-    assert {r["recognizer"] for r in records} == {run_mod.olaf_identity("rotation")}
+    assert {r["recognizer"] for r in records} == {olaf_identity("rotation")}
     assert {r["ref_key"] for r in records} == {"cd" * 20}
     assert not (data / "shazam" / "throttle.json").exists()  # an Olaf-only run spends no budget
     assert list((data / "clips").iterdir()) == []
@@ -184,6 +186,13 @@ def test_olaf_legs_need_a_built_snapshot_and_a_name(data: Path) -> None:
         main(["--only", "olaf", "--snapshot", "rotation"])
     with pytest.raises(SystemExit):
         main(["--only", "olaf"])  # the parser's own error: --snapshot is required
+    assert not (data / "olaf").exists()
+
+
+def test_a_malformed_snapshot_name_is_refused_in_one_line(data: Path) -> None:
+    with pytest.raises(SystemExit, match="plain path component") as refusal:
+        main(["--only", "olaf", "--snapshot", "../x"])
+    assert "\n" not in str(refusal.value)
     assert not (data / "olaf").exists()
 
 
@@ -313,7 +322,7 @@ def test_the_marker_is_checked_under_the_snapshot_lock(
     data: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = _snapshot(data)
-    real = run_mod.require_built
+    real = olaf_snapshot.require_built
     held: list[bool] = []
 
     def check_lock_is_held(path: Path) -> dict:
@@ -323,10 +332,37 @@ def test_the_marker_is_checked_under_the_snapshot_lock(
         held.append(True)
         return real(path)
 
-    monkeypatch.setattr(run_mod, "require_built", check_lock_is_held)
+    monkeypatch.setattr(olaf_snapshot, "require_built", check_lock_is_held)
     assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
     assert held == [True]
     assert (home / RESULTS).exists()
+
+
+def test_the_olaf_query_path_reads_pool_db_read_only(
+    data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _snapshot(data)
+    seen: list[sqlite3.Connection] = []
+    real = run_mod.tag_lookup
+
+    def spy(db: sqlite3.Connection) -> object:
+        seen.append(db)
+        return real(db)
+
+    monkeypatch.setattr(run_mod, "tag_lookup", spy)
+    writes: list[str] = []
+
+    def try_to_write(self: FakeOlaf, wav_path: str) -> dict:
+        try:
+            seen[0].execute("DELETE FROM files")
+        except sqlite3.OperationalError as refusal:
+            writes.append(str(refusal))
+        return MATCH
+
+    monkeypatch.setattr(FakeOlaf, "recognize", try_to_write)
+    assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
+    assert writes and all("readonly" in w for w in writes)
+    assert not list(home.glob("pool.db-*"))  # no journal or WAL left beside it
 
 
 def test_a_run_logs_how_many_files_the_build_failed(

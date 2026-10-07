@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,13 @@ from evaluation import olaf_snapshot, pool
 from evaluation.olaf_snapshot import (
     BUILDING,
     MARKER,
+    POOL_DB,
     RESULTS,
     SnapshotError,
     build_snapshot,
     main,
     mark_built,
+    open_snapshot,
     require_built,
     snapshot_lock,
 )
@@ -30,6 +33,7 @@ from stream_sleuth.recognizers.olaf import (
     OLAF_COMMIT,
     SNAPSHOT_INDEX,
     OlafRecognizer,
+    recognizer_identity,
     snapshot_dir,
 )
 from tests.unit.test_s3_readonly import seed_objects
@@ -418,3 +422,114 @@ def test_the_mark_built_command_marks_and_a_refusal_is_one_line(capsys):
     assert "\n" not in str(refusal.value)
     with pytest.raises(SystemExit, match="plain path component"):
         main(["--mark-built", "../rotation"])
+
+
+def built_snapshot(name="rotation") -> Path:
+    """A snapshot with a ``pool.db`` and a completion marker, as a finished build leaves it."""
+    home = snapshot_dir(name)
+    pool.open_pool_db(home / POOL_DB).close()
+    (home / MARKER).write_text(
+        json.dumps({"olaf_commit": OLAF_COMMIT, "indexed": 0, "failed": 0, "source": "build"})
+    )
+    return home
+
+
+def test_open_snapshot_returns_the_home_identity_results_store_and_a_read_only_pool_db():
+    home = built_snapshot()
+
+    with open_snapshot("rotation", 7) as snapshot:
+        assert snapshot.home == home
+        assert snapshot.identity == recognizer_identity("rotation", 7)
+        assert snapshot.store.path == home / RESULTS
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            snapshot.db.execute("DELETE FROM files")
+        assert snapshot.db.execute("SELECT COUNT(*) FROM files").fetchone() == (0,)
+
+    with pytest.raises(sqlite3.ProgrammingError):  # closed on exit
+        snapshot.db.execute("SELECT 1")
+    assert not (home / RESULTS).exists()  # opening never files results
+    assert not (home / ".lock").exists()  # and, without lock=True, takes no lock
+
+
+def test_open_snapshot_holds_the_lock_only_when_asked_and_checks_the_marker_under_it(monkeypatch):
+    home = built_snapshot()
+    held_during_check = []
+
+    def check(path):
+        with pytest.raises(SnapshotError, match="another"):
+            with snapshot_lock(path):
+                pass
+        held_during_check.append(True)
+        return {}
+
+    monkeypatch.setattr(olaf_snapshot, "require_built", check)
+    with open_snapshot("rotation", 12, lock=True):
+        with pytest.raises(SnapshotError, match="another"):
+            with snapshot_lock(home):
+                pass
+    assert held_during_check == [True]
+    with snapshot_lock(home):  # released on exit
+        pass
+    with snapshot_lock(home), open_snapshot("rotation", 12):  # a reader never blocks on a run
+        pass
+
+
+@pytest.fixture
+def opened(monkeypatch):
+    """Every ``pool.db`` path the helper opens, so a refusal can be shown to open nothing."""
+    paths = []
+    real = olaf_snapshot.open_read_only
+
+    def spy(path):
+        paths.append(path)
+        return real(path)
+
+    monkeypatch.setattr(olaf_snapshot, "open_read_only", spy)
+    return paths
+
+
+def test_open_snapshot_does_not_open_pool_db_when_the_lock_is_held(opened):
+    home = built_snapshot()
+    with snapshot_lock(home), pytest.raises(SnapshotError, match="another"):
+        with open_snapshot("rotation", 12, lock=True):
+            raise AssertionError("not reached")
+    assert opened == []
+
+
+@pytest.mark.parametrize("lock", [False, True])
+@pytest.mark.parametrize(
+    ("setup", "name", "refusal"),
+    [
+        ("none", "rotation", "no snapshot here; build it first"),
+        ("no_pool_db", "rotation", "no snapshot here; build it first"),
+        ("built", "Rotation", "differs only in case"),
+        ("no_marker", "rotation", "no completion marker"),
+        ("interrupted", "rotation", "interrupted"),
+        ("none", "../rotation", "plain path component"),
+    ],
+)
+def test_open_snapshot_refuses_in_one_line_and_opens_nothing(setup, name, refusal, lock, opened):
+    root = snapshot_dir("rotation").parent
+    if setup == "no_pool_db":
+        snapshot_dir("rotation").mkdir(parents=True)
+    elif setup != "none":
+        home = built_snapshot()
+        if setup == "no_marker":
+            (home / MARKER).unlink()
+        if setup == "interrupted":
+            (home / BUILDING).write_text("")
+
+    def tree() -> list[str]:  # the lock file is the one thing a refusal under lock=True may leave
+        return sorted(str(p) for p in root.rglob("*") if p.name != ".lock")
+
+    before = tree() if root.exists() else []
+
+    with pytest.raises(SnapshotError, match=refusal) as error:
+        with open_snapshot(name, 12, lock=lock):
+            raise AssertionError("not reached")
+
+    assert "\n" not in str(error.value)
+    assert (tree() if root.exists() else []) == before
+    assert opened == []  # no refusal gets as far as opening pool.db
+    if setup == "none":
+        assert not root.exists()

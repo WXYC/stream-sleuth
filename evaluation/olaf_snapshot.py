@@ -31,11 +31,13 @@ import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from evaluation.pool import PoolObject, open_pool_db, open_read_only, stream
+from evaluation.results import ResultStore
 from stream_sleuth.paths import DataPathError
 from stream_sleuth.recognizers.olaf import (
     OLAF_COMMIT,
@@ -43,10 +45,12 @@ from stream_sleuth.recognizers.olaf import (
     OlafRecognizer,
     snapshot_dir,
 )
+from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
 
-# Where a query run files its results, inside the snapshot it queried.
+# The snapshot's own reference-pool database, and where a query run files its results.
+POOL_DB = "pool.db"
 RESULTS = "results.jsonl"
 # The completion marker a finished build (or ``--mark-built``) leaves in the snapshot.
 MARKER = "built.json"
@@ -85,6 +89,45 @@ def snapshot_lock(home: Path) -> Iterator[None]:
         os.close(fd)
 
 
+@dataclass(frozen=True)
+class Snapshot:
+    """What a command that reads one built snapshot needs: its home, ``pool.db`` (read-only), results store, and identity."""
+
+    home: Path
+    db: sqlite3.Connection
+    store: ResultStore
+    identity: str
+
+
+@contextmanager
+def open_snapshot(name: str, min_match_count: int, *, lock: bool = False) -> Iterator[Snapshot]:
+    """Open the built snapshot ``name`` for reading, or raise ``SnapshotError`` in one line.
+
+    Refused, in this order: a malformed name or data directory (the ``DataPathError``,
+    re-raised as ``SnapshotError``), a case-only twin of an existing snapshot, no ``pool.db``
+    ("no snapshot here"), the lock being held (``lock=True`` only), and no usable completion
+    marker (:func:`require_built`, under the lock when taken). No refusal opens ``pool.db`` or
+    creates anything but the lock file, which only ``lock=True`` creates, and only once the
+    snapshot has a ``pool.db``. ``pool.db`` is opened with :func:`evaluation.pool.open_read_only`
+    and closed on exit; the results store is returned unopened, and its path is not created. A command that writes
+    results (the leg runner) passes ``lock=True`` so no build or second run overlaps it; a
+    command that only reads them (the scorer) does not, so it never blocks on a running query
+    and never writes into the snapshot, and an append in progress is at worst a torn last line.
+    """
+    try:
+        home = checked_snapshot_dir(name)
+    except DataPathError as refusal:  # a malformed name or data directory is a refusal too
+        raise SnapshotError(str(refusal)) from None
+    if not (home / POOL_DB).is_file():
+        raise SnapshotError(f"{home}: no snapshot here; build it first")
+    with ExitStack() as stack:
+        if lock:
+            stack.enter_context(snapshot_lock(home))
+        require_built(home)  # an unfinished build must not have its misses stored or scored
+        db = stack.enter_context(closing(open_read_only(home / POOL_DB)))
+        yield Snapshot(home, db, ResultStore(home / RESULTS), olaf_identity(name, min_match_count))
+
+
 def build_snapshot(
     snapshot: str,
     objects: Iterable[PoolObject],
@@ -114,7 +157,7 @@ def build_snapshot(
                 f"{snapshot!r} already has results ({home / RESULTS}); not building"
             )
         _replace(home / BUILDING, "")  # a stale marker is ignored while this is present
-        with closing(open_pool_db(home / "pool.db")) as db:
+        with closing(open_pool_db(home / POOL_DB)) as db:
             counts = stream(
                 objects, consumer, db=db, staging_dir=home / "staging", client=client, bucket=bucket
             )
@@ -179,7 +222,7 @@ def mark_built(snapshot: str) -> dict[str, Any]:
     prove the build ran to the end: the operator vouches for that by running this.
     """
     home = checked_snapshot_dir(snapshot)
-    if not (home / "pool.db").is_file():
+    if not (home / POOL_DB).is_file():
         raise SnapshotError(f"{home}: no snapshot here")
     with snapshot_lock(home):
         if (home / BUILDING).exists():
@@ -188,7 +231,7 @@ def mark_built(snapshot: str) -> dict[str, Any]:
             raise SnapshotError(f"{home}: already has a completion marker; not marking")
         if not (home / SNAPSHOT_INDEX).is_file():
             raise SnapshotError(f"{home}: no Olaf index ({SNAPSHOT_INDEX}); not marking")
-        with closing(open_read_only(home / "pool.db")) as db:
+        with closing(open_read_only(home / POOL_DB)) as db:
             if unfinished := db.execute(
                 "SELECT COUNT(*) FROM files WHERE status NOT IN ('indexed', 'failed')"
             ).fetchone()[0]:

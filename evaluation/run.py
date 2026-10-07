@@ -23,19 +23,13 @@ import logging
 import shutil
 import sys
 from collections.abc import Callable, Iterable
-from contextlib import AbstractContextManager, ExitStack, closing
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
-from evaluation.olaf_snapshot import (
-    RESULTS,
-    SnapshotError,
-    checked_snapshot_dir,
-    require_built,
-    snapshot_lock,
-)
-from evaluation.pool import open_pool_db, tag_lookup
+from evaluation.olaf_snapshot import SnapshotError, open_snapshot
+from evaluation.pool import tag_lookup
 from evaluation.results import LEGS, SOURCES, Leg, ResultStore, require_snapshot, select_legs
 from evaluation.selection import read_hours
 from evaluation.shazam_eval import (
@@ -50,7 +44,6 @@ from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT, OlafRecognizer
-from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
 
@@ -194,23 +187,19 @@ def main(argv: list[str] | None = None) -> int:
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
     report: dict[str, str] = {}
-    with ExitStack() as stack:  # the snapshot's lock and pool.db, held through every leg
+    with ExitStack() as stack:  # the snapshot's lock and read-only pool.db, held through every leg
         olaf = None
         if use_olaf:  # refused before the Shazam lock is taken, in one line
-            try:
-                home = checked_snapshot_dir(args.snapshot)
-                if not (home / "pool.db").is_file():
-                    raise SystemExit(f"{home}: no snapshot here; build it first")
-                stack.enter_context(snapshot_lock(home))
-                require_built(home)  # an unfinished build must not have its misses stored
+            try:  # under the snapshot's lock, so an unfinished build never has its misses stored
+                snapshot = stack.enter_context(
+                    open_snapshot(args.snapshot, args.min_match_count, lock=True)
+                )
             except SnapshotError as refusal:
                 raise SystemExit(str(refusal)) from None
-            db = stack.enter_context(closing(open_pool_db(home / "pool.db")))
             recognizer = OlafRecognizer(
-                home, min_match_count=args.min_match_count, lookup=tag_lookup(db)
+                snapshot.home, min_match_count=args.min_match_count, lookup=tag_lookup(snapshot.db)
             )
-            identity = olaf_identity(args.snapshot, args.min_match_count)
-            olaf = (ResultStore(home / RESULTS), recognizer.recognize, identity)
+            olaf = (snapshot.store, recognizer.recognize, snapshot.identity)
         if use_shazam:  # the throttle's lock is released as soon as the Shazam legs end
             with Throttle(state, *budget) as throttle:
                 client = CountingClient(throttle, base_url=args.base_url)

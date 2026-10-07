@@ -41,7 +41,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from contextlib import closing
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from itertools import combinations, groupby
 from pathlib import Path
@@ -49,8 +49,15 @@ from typing import Any, NamedTuple, cast
 
 from evaluation import names
 from evaluation.clips import GRID_S, ClipAddress, grid, hour_addresses
-from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir
-from evaluation.pool import open_read_only, reference_artists
+from evaluation.olaf_snapshot import (
+    POOL_DB,
+    RESULTS,
+    Snapshot,
+    SnapshotError,
+    checked_snapshot_dir,
+    open_snapshot,
+)
+from evaluation.pool import reference_artists
 from evaluation.results import (
     LEGS,
     SOURCES,
@@ -68,7 +75,6 @@ from evaluation.selection import read_hours
 from stream_sleuth.paths import DataPathError, data_dir, require_outside_checkout
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT
-from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 
 log = logging.getLogger(__name__)
 
@@ -833,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
         plays_path,
         selection,
         store.path,
-        *([home / "pool.db", home / RESULTS] if home else []),
+        *([home / POOL_DB, home / RESULTS] if home else []),
     ]
     outputs = {"--out": out, "--near-misses": near_path, "--false-positives": fp_path}
     for (flag, a), (other, b) in combinations(outputs.items(), 2):
@@ -845,26 +851,30 @@ def main(argv: list[str] | None = None) -> int:
     check_score_file(out)
     check_queue(near_path)
     check_queue(fp_path, FP_COLUMNS)
-    if home and not (home / "pool.db").is_file():
-        raise SystemExit(f"{home}: no snapshot here; build it first")
-    try:
-        plays = read_plays(plays_path)
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise SystemExit(f"{plays_path}: not a readable plays.jsonl ({error!r})") from None
-    hours = read_hours(selection)
-    stores = [store, ResultStore(home / RESULTS)] if home else [store]
-    results = read_results(stores, study_identities(snapshot, args.min_match_count))
-    references: dict[str, tuple[str, ...]] = {}
-    if home:
-        with closing(open_read_only(home / "pool.db")) as db:
-            references = dict(reference_artists(db))
+    with ExitStack() as stack:  # the snapshot is read, not locked: a running query may append
+        try:
+            snap = (
+                stack.enter_context(open_snapshot(snapshot, args.min_match_count))
+                if snapshot
+                else None
+            )
+        except SnapshotError as refusal:
+            raise SystemExit(str(refusal)) from None
+        try:
+            plays = read_plays(plays_path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise SystemExit(f"{plays_path}: not a readable plays.jsonl ({error!r})") from None
+        hours = read_hours(selection)
+        stores = [store, snap.store] if snap else [store]
+        results = read_results(stores, study_identities(snapshot, args.min_match_count))
+        references = dict(reference_artists(snap.db)) if snap else {}
     scored: dict[str, LegScore] = {}
     entries: dict[str, dict[str, Any]] = {}
     for leg, who in selected:
         identity = (
             recognizer_identity(leg.length_s)
             if who == "shazam"
-            else olaf_identity(args.snapshot, args.min_match_count)
+            else cast(Snapshot, snap).identity  # an Olaf leg is selected only with a snapshot
         )
         addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
         ls = score_leg(plays, results, identity, leg, hours[leg.hours], addresses, references)

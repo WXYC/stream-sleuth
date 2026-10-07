@@ -16,10 +16,11 @@ import pytest
 
 from evaluation import score
 from evaluation.clips import ClipAddress, grid
-from evaluation.olaf_snapshot import RESULTS
+from evaluation.olaf_snapshot import BUILDING, MARKER, POOL_DB, RESULTS, snapshot_lock
 from evaluation.pool import open_pool_db
 from evaluation.results import Emission, ResultStore, recognizer_identity
 from evaluation.score import attribute, plays_from
+from stream_sleuth.recognizers.olaf import OLAF_COMMIT
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 from tests.stores import olaf_record, shazam_record
 from tests.unit.test_score import (
@@ -69,9 +70,12 @@ def write_plays(data: Path, records: list[dict[str, Any]]) -> Path:
     return path
 
 
-def add_snapshot(data: Path, artist: str = COCREDIT, album_artist: str = "Juana Molina") -> None:
-    """A snapshot whose one indexed file is the co-credited reference ``STAGE``."""
-    db = open_pool_db(data / "olaf" / SNAPSHOT / "pool.db")
+def add_snapshot(
+    data: Path, artist: str = COCREDIT, album_artist: str = "Juana Molina", built: bool = True
+) -> Path:
+    """A snapshot whose one indexed file is the co-credited reference ``STAGE``, marked built."""
+    home = data / "olaf" / SNAPSHOT
+    db = open_pool_db(home / POOL_DB)
     db.execute(
         "INSERT INTO files (key, stage_id, prefix, format, size, artist, album_artist, album,"
         " title, status) VALUES ('k', ?, 'rotation/', 'mp3', 1, ?, ?, ?, ?, 'indexed')",
@@ -79,6 +83,10 @@ def add_snapshot(data: Path, artist: str = COCREDIT, album_artist: str = "Juana 
     )
     db.commit()
     db.close()
+    if built:
+        marker = {"olaf_commit": OLAF_COMMIT, "indexed": 1, "failed": 0, "source": "build"}
+        (home / MARKER).write_text(json.dumps(marker))
+    return home
 
 
 def add_olaf(
@@ -283,6 +291,36 @@ def test_a_missing_snapshot_pool_db_is_one_line(data: Path) -> None:
     with pytest.raises(SystemExit, match="no snapshot"):
         run_cli(data, "--snapshot", "absent")
     assert not (data / "olaf").exists()
+
+
+def test_a_malformed_snapshot_name_is_refused_in_one_line(data: Path) -> None:
+    with pytest.raises(SystemExit, match="plain path component") as refusal:
+        run_cli(data, "--snapshot", "../x")
+    assert "\n" not in str(refusal.value)
+    assert not (data / "score").exists()
+
+
+def test_a_snapshot_that_is_not_built_is_refused_in_one_line_as_run_py_refuses_it(
+    data: Path,
+) -> None:
+    home = add_snapshot(data, built=False)
+    with pytest.raises(SystemExit, match="no completion marker") as refusal:
+        run_cli(data, "--snapshot", SNAPSHOT)
+    assert "\n" not in str(refusal.value)
+    (home / MARKER).write_text("{}")  # a stale marker
+    (home / BUILDING).write_text("")  # beside an interrupted build
+    with pytest.raises(SystemExit, match="interrupted"):
+        run_cli(data, "--snapshot", SNAPSHOT)
+    assert not (data / "score").exists()
+    assert not (home / RESULTS).exists()
+
+
+def test_scoring_does_not_take_the_snapshot_lock_so_it_reads_a_running_query(data: Path) -> None:
+    home = add_snapshot(data)
+    add_olaf(data, ClipAddress(HOUR, 195, 12), COCREDIT)
+    with snapshot_lock(home):  # as a running ``evaluation.run`` holds it
+        assert run_cli(data, "--snapshot", SNAPSHOT) == 0
+    assert (data / "score" / "score.json").exists()
 
 
 def legs_of_plays(
