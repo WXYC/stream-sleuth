@@ -1395,14 +1395,146 @@ def test_plays_from_a_bare_hours_file_have_no_group_and_the_hours_own_band(
     assert {(p["group"], p["band"], p["subset"]) for p in plays} == {(None, "evening", False)}
 
 
-def test_plays_need_exactly_one_of_hours_and_selection(tmp_path: Path, pool_db: Path) -> None:
+@pytest.mark.parametrize(
+    "given", [[], ["--hours", "h.txt", "--selection", "s.json"]], ids=["neither", "both"]
+)
+def test_plays_need_exactly_one_of_hours_and_selection(
+    tmp_path: Path, pool_db: Path, given: list[str]
+) -> None:
+    out = tmp_path / "p"
     with pytest.raises(SystemExit):
-        corpus.main(["--export", "e", "--pool-db", str(pool_db), "--out", str(tmp_path / "p")])
+        corpus.main(["--export", "e", "--pool-db", str(pool_db), "--out", str(out), *given])
+    assert not out.exists()
 
 
-def test_select_logs_the_subset_shortfalls(
+def test_plays_subset_only_needs_a_selection(tmp_path: Path, pool_db: Path) -> None:
+    with pytest.raises(SystemExit):
+        corpus.main(["--export", "e", "--pool-db", str(pool_db), "--hours", "h.txt",
+                     "--subset-only", "--out", str(tmp_path / "p")])  # fmt: skip
+
+
+def test_plays_subset_only_writes_just_the_subset_hours_stamped_from_the_selection(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    out = tmp_path / "frozen"
+    run_select(tmp_path, pool_db, out)
+    plays = plays_main(
+        tmp_path, pool_db, "--selection", str(out / "selection.json"), "--subset-only"
+    )
+    assert {(p["hour_key"], p["group"], p["subset"]) for p in plays} == {
+        (HOURS[0], "canonical-high", True),
+        (HOURS[2], "canonical-high", True),
+    }
+
+
+def test_plays_from_a_bare_hours_file_stamp_a_carryover_play_too(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    select_export(tmp_path)
+    hours = tmp_path / "hours.txt"
+    hours.write_text(f"{HOURS[1]}\n")  # 15:00 Eastern: the 14:00 hour's last track leads it
+    plays = plays_main(tmp_path, pool_db, "--hours", str(hours))
+    assert any(p["carryover"] for p in plays)
+    assert {(p["group"], p["band"], p["subset"]) for p in plays} == {(None, "daytime", False)}
+
+
+CROSSING = ["2026/08/12/202608121700.mp3", "2026/08/12/202608121800.mp3"]
+
+
+def crossing_export(tmp_path: Path) -> Path:
+    """A daytime-hour track at 17:55 Eastern, then one at 18:10, in the evening band."""
+    rows = [row(1, ts(21, 55)), row(2, ts(22, 10))]
+    return write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+
+
+def write_selection_json(
+    path: Path, pool_db: Path, hours: object, header: dict[str, str] | None = None
+) -> Path:
+    record = {"export": "export", "pool_db": str(pool_db), "hours": hours} | (header or {})
+    path.write_text(json.dumps(record))
+    return path
+
+
+def test_a_carryover_across_a_band_boundary_takes_the_band_of_the_hour_it_is_written_into(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    crossing_export(tmp_path)
+    hours = tmp_path / "hours.txt"
+    hours.write_text(f"{CROSSING[1]}\n")
+    plays = plays_main(tmp_path, pool_db, "--hours", str(hours))
+    assert [(p["play_id"], p["carryover"], p["band"]) for p in plays] == [
+        (1, True, "evening"),
+        (2, False, "evening"),
+    ]
+
+
+def test_a_carryover_takes_the_label_of_the_hour_it_is_written_into(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    crossing_export(tmp_path)
+    label = {"group": "contrast", "band": "evening", "subset": True}
+    sel = write_selection_json(tmp_path / "selection.json", pool_db, {CROSSING[1]: label})
+    plays = plays_main(tmp_path, pool_db, "--selection", str(sel))
+    assert [(p["carryover"], p["group"], p["band"], p["subset"]) for p in plays] == [
+        (True, "contrast", "evening", True),
+        (False, "contrast", "evening", True),
+    ]
+
+
+GOOD = {"group": "contrast", "band": "evening", "subset": False}
+
+
+@pytest.mark.parametrize(
+    ("content", "problem"),
+    [
+        pytest.param("2026/08/12/202608121400.mp3\n", "not JSON", id="not-json"),
+        pytest.param([], "not an object", id="top-level-list"),
+        pytest.param({"export": "export"}, "no `hours`", id="no-hours"),
+        pytest.param({"hours": [HOURS[0]]}, "`hours` is not an object", id="hours-list"),
+        pytest.param({"hours": {HOURS[0]: "contrast"}}, "not an object", id="entry-string"),
+        pytest.param({"hours": {HOURS[0]: GOOD | {"group": "high"}}}, "group", id="bad-group"),
+        pytest.param({"hours": {HOURS[0]: GOOD | {"group": None}}}, "group", id="null-group"),
+        pytest.param({"hours": {HOURS[0]: GOOD | {"band": "night"}}}, "band", id="bad-band"),
+        pytest.param({"hours": {HOURS[0]: GOOD | {"subset": "false"}}}, "subset", id="str-subset"),
+        pytest.param({"hours": {HOURS[0]: {"group": "contrast"}}}, "band", id="missing-band"),
+    ],
+)
+def test_a_bad_selection_file_exits_with_one_clear_line_and_writes_nothing(
+    tmp_path: Path, pool_db: Path, content: object, problem: str
+) -> None:
+    select_export(tmp_path)
+    sel = tmp_path / "selection.json"
+    sel.write_text(content if isinstance(content, str) else json.dumps(content))
+    with pytest.raises(SystemExit) as exc:
+        plays_main(tmp_path, pool_db, "--selection", str(sel))
+    message = str(exc.value.code)
+    assert str(sel) in message and problem in message and "\n" not in message
+    assert not (tmp_path / "plays.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("header", "warned"),
+    [
+        pytest.param({}, False, id="same-inputs"),
+        pytest.param({"export": "2020-01-01"}, True, id="other-export"),
+        pytest.param({"pool_db": "/elsewhere/pool.db"}, True, id="other-pool"),
+    ],
+)
+def test_plays_warn_when_the_selection_came_from_other_inputs(
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture,
+    header: dict[str, str], warned: bool,
+) -> None:  # fmt: skip
+    select_export(tmp_path)
+    sel = write_selection_json(tmp_path / "selection.json", pool_db, {HOURS[0]: GOOD}, header)
+    caplog.set_level(logging.WARNING, logger=corpus.log.name)
+    assert plays_main(tmp_path, pool_db, "--selection", str(sel))
+    assert ("selection.json was made from" in caplog.text) is warned
+
+
+def test_select_logs_the_subset_and_corpus_shortfalls(
     tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.WARNING, logger=corpus.log.name)
     run_select(tmp_path, pool_db, tmp_path / "frozen")
     assert "selection shortfall subset/canonical-low: 1" in caplog.text
+    assert "selection shortfall canonical-high/overnight: 3" in caplog.text

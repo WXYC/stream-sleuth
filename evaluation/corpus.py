@@ -30,7 +30,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from evaluation.archive import EASTERN, hour_key, hour_start
 from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers
@@ -50,6 +50,7 @@ MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
 # hours from 2022-2024, at most one per show and per recurring slot. No talk-hour group:
 # WXYC plays music every hour, and its talkset rows are DJ mic breaks inside music hours.
 BANDS = {"overnight": range(0, 6), "daytime": range(6, 18), "evening": range(18, 24)}
+GROUPS = ("canonical-high", "canonical-low", "contrast")
 HIGH_QUOTAS = {"daytime": 5, "evening": 4, "overnight": 3}
 LOW_QUOTAS = {"daytime": 2, "evening": 1, "overnight": 1}
 LOW_SHARE_MAX = 0.10
@@ -574,6 +575,48 @@ def _select(argv: list[str]) -> int:
     return 0
 
 
+def read_selection(path: Path, export: Path, pool_db: Path) -> dict[str, dict[str, Any]]:
+    """The ``hours`` labels of a ``selection.json``, checked against the closed value sets.
+
+    Anything wrong exits with one line naming ``path`` and the problem, before any output
+    exists. A record made from another export or ``pool.db`` than the ones given only warns:
+    a newer export may legitimately cover the same hours.
+    """
+
+    def fail(problem: str) -> NoReturn:
+        raise SystemExit(f"{path}: {problem}")
+
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        fail(f"cannot read: {e}")
+    except json.JSONDecodeError as e:
+        fail(f"not JSON ({e}); pass the selection.json that `select` wrote")
+    if not isinstance(record, dict):
+        fail("not an object")
+    hours = record.get("hours")
+    if hours is None:
+        fail("no `hours` key")
+    if not isinstance(hours, dict):
+        fail("`hours` is not an object")
+    allowed = {"group": GROUPS, "band": tuple(BANDS)}
+    for key, label in hours.items():
+        if not isinstance(label, dict):
+            fail(f"`hours` entry {key} is not an object")
+        for field_, values in allowed.items():
+            if label.get(field_) not in values:
+                fail(f"`hours` entry {key}: {field_} {label.get(field_)!r} is not one of {values}")
+        if not isinstance(label.get("subset"), bool):
+            fail(f"`hours` entry {key}: subset {label.get('subset')!r} is not a boolean")
+    made_from = record.get("export"), record.get("pool_db")
+    if made_from[0] != export.name or Path(str(made_from[1])).resolve() != pool_db.resolve():
+        log.warning(
+            "selection.json was made from export %s and pool %s, not %s and %s",
+            *made_from, export.name, pool_db,
+        )  # fmt: skip
+    return hours
+
+
 def main(argv: list[str] | None = None) -> int:
     """The CLI: ``select ...`` freezes a selection; otherwise ``--hours`` or ``--selection`` writes plays."""
     argv = sys.argv[1:] if argv is None else argv
@@ -587,11 +630,19 @@ def main(argv: list[str] | None = None) -> int:
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--hours", type=Path, help="file of hour keys, one per line")
     which.add_argument("--selection", type=Path, help="selection.json written by `select`")
+    parser.add_argument(
+        "--subset-only", action="store_true", help="with --selection: only the subset hours"
+    )
     parser.add_argument("--out", type=Path, required=True, help="plays.jsonl to create")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    labels = json.loads(args.selection.read_text())["hours"] if args.selection else None
-    hours = list(labels) if labels is not None else args.hours.read_text().split()
+    if args.subset_only and not args.selection:
+        parser.error("--subset-only needs --selection")
+    labels = read_selection(args.selection, args.export, args.pool_db) if args.selection else None
+    if labels is None:
+        hours = args.hours.read_text().split()
+    else:
+        hours = [k for k, label in labels.items() if label["subset"] or not args.subset_only]
     write_plays(args.out, hours, Flowsheet.load(args.export), PoolIndex.load(args.pool_db), labels)
     return 0
 
