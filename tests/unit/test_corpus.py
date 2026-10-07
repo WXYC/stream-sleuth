@@ -1396,14 +1396,23 @@ def test_plays_from_a_bare_hours_file_have_no_group_and_the_hours_own_band(
 
 
 @pytest.mark.parametrize(
-    "given", [[], ["--hours", "h.txt", "--selection", "s.json"]], ids=["neither", "both"]
+    ("given", "message"),
+    [([], "is required"), (["--hours", "h.txt", "--selection", "s.json"], "not allowed with")],
+    ids=["neither", "both"],
 )
 def test_plays_need_exactly_one_of_hours_and_selection(
-    tmp_path: Path, pool_db: Path, given: list[str]
+    tmp_path: Path,
+    pool_db: Path,
+    given: list[str],
+    message: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     out = tmp_path / "p"
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc_info:
         corpus.main(["--export", "e", "--pool-db", str(pool_db), "--out", str(out), *given])
+    # A usage error (exit 2) from the argument parser, not read_selection's "cannot read" exit.
+    assert exc_info.value.code == 2
+    assert message in capsys.readouterr().err
     assert not out.exists()
 
 
