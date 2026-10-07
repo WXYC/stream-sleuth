@@ -20,8 +20,9 @@ _CRUFT = re.compile(
     re.IGNORECASE,
 )
 # A dotted initialism: two or more single letters, each followed by a period but the last,
-# whose period is optional. A letter inside a longer word, or beside a digit, is no initial.
-_INITIALISM = re.compile(r"(?<!\w)[^\W\d_](?:\.[^\W\d_])+(?!\w)")
+# whose period is optional. A letter inside a longer word, or beside a digit, is no initial;
+# an underscore is a separator, as in the keys, so it is no part of a word here.
+_INITIALISM = re.compile(r"(?<![^\W_])[^\W\d_](?:\.[^\W\d_])+(?![^\W_])")
 _FEATURING = frozenset({"feat", "ft", "featuring", "with"})
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 # A bracketed clause with one of these whole words, or its plural or past form, names a
@@ -45,10 +46,16 @@ def _stem(word: str) -> str:
     return re.sub(r"(?:e?s|ed)$", "", word)
 
 
+def _undotted(text: str) -> str:
+    """``text`` with each dotted initialism ("R.E.M.", "L.P.") as one word ("REM", "LP")."""
+    return _INITIALISM.sub(lambda m: m.group().replace(".", ""), text)
+
+
 def _words(text: str) -> list[str]:
-    """``text``'s words, split as the key splits, less same-recording phrases and a generic
-    "version" beside another qualifier."""
-    words = SAME_RECORDING.sub(" ", " ".join(re.split(r"[\W_]+", text))).split()
+    """``text``'s words, split as the key splits (dotted initialisms collapsed first), less
+    same-recording phrases and a generic "version" beside another qualifier, so "(L.P.
+    Version)" is the phrase "LP version"."""
+    words = SAME_RECORDING.sub(" ", " ".join(re.split(r"[\W_]+", _undotted(text)))).split()
     if {_stem(w) for w in words} & (VERSION_QUALIFIERS - {"version"}):
         return [w for w in words if _stem(w) != "version"]
     return words
@@ -110,7 +117,7 @@ def fuzzy(s: str | None) -> str:
         )
         return f" {' '.join(words)} "
 
-    undotted = _INITIALISM.sub(lambda m: m.group().replace(".", ""), album_key(fold(s)))
+    undotted = _undotted(album_key(fold(s)))
     return " ".join(re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, undotted)).split())
 
 
