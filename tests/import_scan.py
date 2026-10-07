@@ -12,7 +12,11 @@ dot-directories such as ``.venv`` and the ``build``/``dist`` output.
   misses: S3 write and presign method names, tampering with a client's event
   handlers (which would remove the guard), and dynamic imports of those packages.
 
-Both return ``["<relative path>:<line>", ...]``; an empty list means clean.
+A third scanner guards the station boundary rather than S3:
+:func:`scan_for_station_imports` reports every import of the WXYC-specific
+``evaluation.archive`` or ``evaluation.corpus`` from station-neutral code.
+
+All three return ``["<relative path>:<line>", ...]``; an empty list means clean.
 """
 
 from __future__ import annotations
@@ -41,6 +45,11 @@ _WRITE_NAMES = re.compile(
     r"|meta\.events|_refuse_non_reads"
     r"|(?:import_module|__import__)\(\s*['\"](?:boto3|botocore|s3transfer)"
 )
+
+# The station side of the plays.jsonl boundary: WXYC-specific, so station-neutral code
+# (everything else outside tests/) never imports it.
+STATION_MODULES = frozenset({"evaluation.archive", "evaluation.corpus"})
+STATION_FILES = frozenset({"evaluation/archive.py", "evaluation/corpus.py"})
 
 _SKIPPED_DIRECTORIES = frozenset({"build", "dist", "venv", "node_modules", "__pycache__"})
 
@@ -72,6 +81,38 @@ def scan_for_s3_imports(root: Path) -> list[str]:
             if not isinstance(node, (ast.Import, ast.ImportFrom)):
                 continue
             if S3_PACKAGES.intersection(_imported_packages(node)):
+                found.append(f"{relative}:{node.lineno}")
+    return sorted(found)
+
+
+def _station_modules(node: ast.Import | ast.ImportFrom, package: str) -> set[str]:
+    """The WXYC-specific modules ``node`` imports, as ``evaluation.<name>``."""
+    if isinstance(node, ast.Import):
+        names = [alias.name for alias in node.names]
+    elif node.level == 0 and node.module:
+        names = [node.module] + [f"{node.module}.{alias.name}" for alias in node.names]
+    elif node.level == 1 and package == "evaluation":  # relative to evaluation/ itself
+        base = f"evaluation.{node.module}" if node.module else "evaluation"
+        names = [base] + [f"{base}.{alias.name}" for alias in node.names]
+    else:
+        return set()
+    return {m for m in STATION_MODULES for name in names if name == m or name.startswith(m + ".")}
+
+
+def scan_for_station_imports(root: Path) -> list[str]:
+    """Report every import of a WXYC-specific module from station-neutral code.
+
+    ``evaluation/archive.py`` and ``evaluation/corpus.py`` are the station side of the
+    ``plays.jsonl`` boundary; every other first-party module outside ``tests/`` must not
+    import them, at module level or inside a function.
+    """
+    found = []
+    for relative, path in _first_party_files(root):
+        if relative in STATION_FILES or relative.startswith("tests/"):
+            continue
+        package = relative.rsplit("/", 1)[0] if "/" in relative else ""
+        for node in ast.walk(ast.parse(path.read_text(), filename=relative)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and _station_modules(node, package):
                 found.append(f"{relative}:{node.lineno}")
     return sorted(found)
 
