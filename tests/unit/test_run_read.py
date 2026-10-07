@@ -319,12 +319,36 @@ def test_study_identities_name_every_shazam_segment_and_the_snapshot() -> None:
     }
 
 
-def test_importing_the_read_side_loads_neither_the_runner_nor_shazam():
-    code = (
-        "import sys, evaluation.results, evaluation.score; "
-        "print(sorted(m for m in ('evaluation.run', 'evaluation.shazam_eval', 'shazamio', 'aiohttp') "
-        "if m in sys.modules))"
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-    assert out.stdout.strip() == "[]"
+
+def _modules_loaded_by(statement: str, *names: str) -> list[str]:
+    """Which of ``names`` a fresh interpreter has loaded after ``statement``, run from the repo root."""
+    code = f"import json, sys; {statement}; print(json.dumps([m for m in {names!r} if m in sys.modules]))"
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=REPO_ROOT
+    )
+    return json.loads(out.stdout)
+
+
+def test_importing_the_read_side_loads_neither_the_runner_nor_shazam():
+    loaded = _modules_loaded_by(
+        "import evaluation.results, evaluation.score",
+        "evaluation.run",
+        "evaluation.shazam_eval",
+        "shazamio",
+        "aiohttp",
+    )
+
+    assert loaded == []
+
+
+def test_importing_shazam_eval_reads_no_runtime_setting_and_loads_no_olaf():
+    # The live Shazam CLI imports only stream_sleuth.paths and the shazam parser from the runtime
+    # package: stream_sleuth.config parses the loop settings at import, so a malformed WXDU_* value
+    # would otherwise crash the daily leg before it starts.
+    loaded = _modules_loaded_by(
+        "import evaluation.shazam_eval", "stream_sleuth.config", "stream_sleuth.recognizers.olaf"
+    )
+
+    assert loaded == []
