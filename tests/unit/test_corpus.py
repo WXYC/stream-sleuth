@@ -810,6 +810,23 @@ def test_hour_stats_counts_and_median_gap(tmp_path: Path, pool_db: Path) -> None
     )
 
 
+def test_hour_stats_slots_are_each_shows_first_track_in_eastern_time(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    # Show 1 starts in the hour, Wednesday 16:01 EDT. Show 2 started before it, with a
+    # talkset row at 15:20 and its first track at 15:50 EDT: its slot is the earlier hour.
+    rows = hour_rows(1, 20, 8, 200.0)
+    rows.append(row(20, ts(19, 20), "talkset", show_id=2))
+    rows += [row(21, ts(19, 50), show_id=2), row(22, ts(20, 10), show_id=2)]
+    rows.append(row(30, ts(20, 5, day=19), show_id=3))  # a week on, the same slot
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    sheet = corpus.Flowsheet.load(export)
+    assert sheet.show_slot == {"1": (2026, 2, 16), "2": (2026, 2, 15), "3": (2026, 2, 16)}
+    stats = corpus.hour_stats(sheet, corpus.PoolIndex.load(pool_db))
+    assert stats["2026/08/12/202608121600.mp3"].slots == {(2026, 2, 15), (2026, 2, 16)}
+    assert stats["2026/08/19/202608191600.mp3"].slots == {(2026, 2, 16)}
+
+
 @pytest.mark.parametrize(
     ("gaps", "median", "dj_hour"),
     [
@@ -881,10 +898,10 @@ def test_hour_stats_summarizes_show_less_tracks_as_unflagged(tmp_path: Path, poo
 def stat(
     key: str, *, era: str = "canonical", tracks: int = 10, in_pool: int = 5, **kw: Any
 ) -> corpus.HourStats:
-    """An hour's stats; unless ``shows`` is given, the hour is its own show."""
+    """An hour's stats; unless ``shows`` is given, the hour is its own show, in no known slot."""
     return corpus.HourStats(
         key, era, tracks, in_pool, kw.get("gap", 200.0), kw.get("flagged", False),
-        frozenset(kw.get("shows", {key})),
+        frozenset(kw.get("shows", {key})), frozenset(kw.get("slots", ())),
     )  # fmt: skip
 
 
@@ -1150,6 +1167,60 @@ def test_select_corpus_contrast_hour_spanning_two_shows_belongs_to_both(
     sel = corpus.select_corpus(stats)
     assert contrast(sel) == [keys[i] for i in chosen]
     assert sel.shortfalls["contrast/unfilled"] == corpus.CONTRAST_HOURS - len(chosen)
+
+
+def test_select_corpus_contrast_takes_one_hour_per_recurring_slot_per_year() -> None:
+    # Two broadcasts of one weekly Friday 20:00 show, same year: only the better one is chosen.
+    weekly = (2023, 4, 20)
+    week_one, week_two, other_slot = keys_in(5, range(10, 13), year=2023)
+    stats = {
+        week_one: stat(week_one, era="etl", in_pool=9, slots={weekly}),
+        week_two: stat(week_two, era="etl", in_pool=8, slots={weekly}),
+        other_slot: stat(other_slot, era="etl", in_pool=2, slots={(2023, 1, 9)}),
+    }
+    sel = corpus.select_corpus(stats)
+    assert contrast(sel) == [week_one, other_slot]
+    assert contrast_shortfalls(sel) == {
+        "contrast/2022": 1,
+        "contrast/2024": 1,
+        "contrast/unfilled": 2,
+    }
+
+
+def test_select_corpus_contrast_allows_the_same_slot_in_different_years() -> None:
+    # A schedule changes each semester, so a Friday 20:00 slot in 2022 and 2023 is likely two DJs.
+    in_2022, in_2023 = (keys_in(5, range(10, 11), year=y)[0] for y in (2022, 2023))
+    stats = {
+        in_2022: stat(in_2022, era="etl", slots={(2022, 4, 20)}),
+        in_2023: stat(in_2023, era="etl", slots={(2023, 4, 20)}),
+    }
+    sel = corpus.select_corpus(stats)
+    assert contrast(sel) == [in_2022, in_2023]
+
+
+def test_select_corpus_records_a_contrast_shortfall_when_slots_run_out() -> None:
+    # Distinct broadcasts, one slot per year: the cap is never relaxed to fill the remainder.
+    stats = {
+        k: stat(k, era="etl", in_pool=9 - i, slots={(2023, 4, 20)})
+        for i, k in enumerate(keys_in(5, range(10, 14), year=2023))
+    }
+    sel = corpus.select_corpus(stats)
+    assert contrast(sel) == [min(stats)]
+    assert contrast_shortfalls(sel) == {
+        "contrast/2022": 1,
+        "contrast/2024": 1,
+        "contrast/unfilled": 3,
+    }
+
+
+def test_select_corpus_contrast_hour_spanning_two_slots_belongs_to_both() -> None:
+    first, second, third = keys_in(5, range(10, 13), year=2023)
+    stats = {
+        first: stat(first, era="etl", in_pool=9, slots={(2023, 4, 20), (2023, 4, 21)}),
+        second: stat(second, era="etl", in_pool=8, slots={(2023, 4, 21)}),
+        third: stat(third, era="etl", in_pool=7, slots={(2023, 1, 9)}),
+    }
+    assert contrast(corpus.select_corpus(stats)) == [first, third]
 
 
 def test_select_corpus_is_twenty_hours_with_no_shortfall() -> None:

@@ -45,7 +45,7 @@ MIN_TRACKS = 8
 MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
 # Time-of-day bands by the hour's America/New_York start, and the plan §5.2 corpus:
 # 12 high-share and 4 low-share canonical DJ hours per band quota, and 4 contrast
-# hours from 2022-2024, at most one per show. No talk-hour group: WXYC plays music
+# hours from 2022-2024, at most one per show and per recurring slot. No talk-hour group: WXYC plays music
 # every hour, and its talkset rows are DJ mic breaks inside music hours.
 BANDS = {"overnight": range(0, 6), "daytime": range(6, 18), "evening": range(18, 24)}
 HIGH_QUOTAS = {"daytime": 5, "evening": 4, "overnight": 3}
@@ -185,6 +185,7 @@ def named_qualifiers(*names: str | None) -> frozenset[str]:
 
 
 Key = tuple[str, str]
+Slot = tuple[int, int, int]  # (Eastern year, weekday with Monday 0, hour) of a show's first track
 FileRef = tuple[str, str]  # (files.key, files.format)
 Entry = tuple[FileRef, frozenset[str]]  # a file and the qualifiers named in its album and title
 
@@ -284,6 +285,7 @@ class Flowsheet:
     stop: datetime
     by_hour: dict[str, list[Row]] = field(default_factory=lambda: defaultdict(list))
     order_status: dict[str, tuple[str, bool | None]] = field(default_factory=dict)
+    show_slot: dict[str, Slot] = field(default_factory=dict)
 
     @classmethod
     def load(cls, export_dir: Path) -> Flowsheet:
@@ -291,7 +293,9 @@ class Flowsheet:
 
         ``by_hour`` holds each hour key's rows; rows in the fall-back hour, which has
         no key, appear only in ``rows``. A show with a legacy row of any entry type
-        has two writers (``unreliable``); rows with no show get no label.
+        has two writers (``unreliable``); rows with no show get no label. A show's
+        ``show_slot`` is the Eastern year, weekday and hour of its first track row, the
+        proxy for a recurring program: a weekly show is one ``show_id`` per broadcast.
         """
         with open(export_dir / "flowsheet.csv", newline="", encoding="utf-8") as f:
             rows = [
@@ -314,6 +318,9 @@ class Flowsheet:
                 tracks = [r for r in show_rows if r.entry_type == "track"]
                 by_order = sorted(tracks, key=lambda r: r.play_order)
                 sheet.order_status[show] = ("single_writer", by_order != tracks)
+            if first := next((r for r in show_rows if r.entry_type == "track"), None):
+                local = first.add_time.astimezone(EASTERN)
+                sheet.show_slot[show] = (local.year, local.weekday(), local.hour)
         log.info("loaded %d rows, ETL_STOP %s", len(sheet.rows), sheet.stop.isoformat())
         return sheet
 
@@ -324,7 +331,7 @@ class Flowsheet:
 
 @dataclass(frozen=True)
 class HourStats:
-    """One hour's selection inputs; ``shows`` holds the show of every track row in it."""
+    """One hour's selection inputs; ``shows`` and ``slots`` cover every track row in it."""
 
     key: str
     era: str
@@ -333,6 +340,7 @@ class HourStats:
     median_gap_s: float
     reorder_flagged: bool
     shows: frozenset[str] = frozenset()
+    slots: frozenset[Slot] = frozenset()
 
 
 def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
@@ -349,6 +357,7 @@ def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
             any(sheet.order_status.get(r.show_id, ("unreliable", None))[1]
                 for r in tracks if sheet.era(r.add_time) == "canonical"),
             frozenset(r.show_id for r in tracks if r.show_id),
+            frozenset(sheet.show_slot[r.show_id] for r in tracks if r.show_id),
         )  # fmt: skip
     return stats
 
@@ -389,15 +398,18 @@ class Selection:
     """Chosen hour keys -> ``(group, band)`` in selection order, and every shortfall.
 
     Groups are ``canonical-high`` (12), ``canonical-low`` (4) and ``contrast`` (4):
-    20 hours when nothing is short. Contrast hours come from distinct shows; an hour
-    belongs to the show of every track row in it, so an hour spanning two shows
-    blocks both.
+    20 hours when nothing is short. Contrast hours come from distinct shows and
+    distinct recurring slots: a weekly program is one show per broadcast, so a slot
+    is a show's Eastern year, weekday and start hour. An hour belongs to the show and
+    slot of every track row in it, so an hour spanning two blocks both. This
+    guarantees distinct broadcasts and slots per year, not distinct DJs.
 
     A ``<group>/<band>`` shortfall was relaxed: filled from the group's other bands.
     A ``contrast/<year>`` shortfall was relaxed too: that year had no eligible hour
     from an unused show, so its slot went to the next best hour from the other
     contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
-    could not be found at all; the one-per-show cap is never relaxed to fill one.
+    could not be found at all; the one-per-show and per-slot caps are never relaxed
+    to fill one.
     """
 
     hours: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -443,14 +455,23 @@ def _fill(sel: Selection, candidates: list[HourStats], quotas: dict[str, int], g
 
 
 def _contrast(sel: Selection, old: list[HourStats]) -> None:
-    """Up to ``CONTRAST_HOURS`` hours, the best share per year first, one per show."""
+    """Up to ``CONTRAST_HOURS`` hours, the best share per year first, one per show and slot."""
     used: set[str] = set()
+    used_slots: set[Slot] = set()
 
     def pick(ranked: Iterable[HourStats]) -> int:
-        h = next((h for h in ranked if h.key not in sel.hours and not h.shows & used), None)
+        h = next(
+            (
+                h
+                for h in ranked
+                if h.key not in sel.hours and not h.shows & used and not h.slots & used_slots
+            ),
+            None,
+        )
         if h is None:
             return 0
         used.update(h.shows)
+        used_slots.update(h.slots)
         return sel.take([h], "contrast")
 
     chosen = 0
