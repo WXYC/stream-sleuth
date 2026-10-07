@@ -487,6 +487,38 @@ def test_an_unbracketed_featuring_credit_joins_through_the_pool_index(
 
 
 @pytest.mark.parametrize(
+    ("pool_artist", "play_artist", "play_album", "tier"),
+    [
+        # A co-credit in another order joins on the fuzzy keys (WXYC/stream-sleuth#126), through
+        # the title tier and through the fuzzy album tier, and never as an exact join.
+        ("Chris Cohen, Cass McCombs", "Cass McCombs & Chris Cohen", "Other", "title"),
+        ("Chris Cohen, Cass McCombs", "Cass McCombs & Chris Cohen", "Overgrown", "fuzzy"),
+        ("Cass McCombs & Chris Cohen", "Cass McCombs & Chris Cohen", "Overgrown", "exact"),
+        ("Cass McCombs & Chris Cohen", "Chris Cohen and Cass McCombs", "Overgrown", "fuzzy"),
+        ("Chris Cohen, Cass McCombs", "Cass McCombs", "Overgrown", None),
+        ("Chris Cohen, Cass McCombs", "Chris Cohen & Jessica Pratt", "Overgrown", None),
+        ("Belle and Sebastian", "Belle & Sebastian", "Overgrown", "fuzzy"),
+        ("Charli XCX", "XCX Charli", "Overgrown", None),
+    ],
+)
+def test_a_co_credit_in_another_order_joins_through_the_pool_index(
+    tmp_path: Path, pool_artist: str, play_artist: str, play_album: str, tier: str | None
+) -> None:
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    db.execute(
+        "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+        " VALUES ('k.mp3', ?, 'p/', 'mp3', 1, ?, 'Overgrown', 'Steel Reserve', 'indexed')",
+        (f"{0:040x}", pool_artist),
+    )
+    db.commit()
+    db.close()
+    found = corpus.PoolIndex.load(path).tier(play_artist, play_album, "Steel Reserve")
+    assert found == (None if tier is None else tier)
+
+
+@pytest.mark.parametrize(
     ("play_title", "match"),
     [("Back, Baby (Live)", ("exact", "flac")), ("Back, Baby", ("exact", "mp3"))],
 )

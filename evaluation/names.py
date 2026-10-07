@@ -149,6 +149,33 @@ def fuzzy(s: str | None) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, undotted)).split())
 
 
+# A co-credit separator: "&", "+", ",", ";" or "/" however spaced, or the whole word "and", "x",
+# "with" or "vs" ("vs." too) between spaces and before a name, so "Charli XCX" holds one name and
+# "Lil Nas X & Juana Molina" does not lose its X to a word separator. A separator inside a
+# bracketed clause is no separator.
+_CO_CREDIT = re.compile(
+    r"(?:\s*[&+,;/]\s*|\s+(?:and|x|with|vs\.?)\s+(?=[^\s&+,;/]))(?![^(\[{]*[)\]}])"
+)
+
+
+def artist_keys(artist: str | None) -> list[str]:
+    """The fuzzy-tier artist keys of one artist field: :func:`fuzzy`, then a co-credit's order-free key.
+
+    A field naming two or more artists (split on :data:`_CO_CREDIT` after the cruft rules,
+    each name keyed by :func:`fuzzy`) also keys as its names' keys sorted and joined with
+    ``|``, which no :func:`fuzzy` key holds. Two fields naming the same artists in any order,
+    with any separators, share that key; a single name has only its own, so it never joins a
+    reordering. The :func:`fuzzy` key stays first, so a field that joined before still does,
+    and a subset or superset of the names shares no key. The exact keys never take this key.
+    An empty key (no artist, or only brackets) gives ``[]``: it never joins.
+    """
+    key = fuzzy(artist)
+    if not key:
+        return []
+    names = sorted(k for k in map(fuzzy, _CO_CREDIT.split(album_key(fold(artist)))) if k)
+    return [key, "|".join(names)] if len(names) > 1 else [key]
+
+
 def qualifiers(*names: str | None) -> frozenset[str]:
     """The stemmed qualifiers in the version clauses of ``names``: the recording a play names."""
     clauses = [c for s in names for c in _BRACKETED.findall(album_key(fold(s)))]
@@ -174,14 +201,13 @@ def named_qualifiers(album: str | None, title: str | None) -> frozenset[str]:
 def title_keys(artist: str | None, title: str | None) -> list[tuple[str, tuple[str, str]]]:
     """The title-tier join keys of one recording or play, as ``(kind, key)`` in kind order.
 
-    ``exact`` is ``(fold(artist), album_key(title))`` and ``fuzzy`` is ``(fuzzy(artist),
-    fuzzy(title))``. A key with an empty part (a missing tag, or a name that normalizes to
-    nothing) is left out: it never joins.
+    ``exact`` is ``(fold(artist), album_key(title))`` and each ``fuzzy`` is ``(key,
+    fuzzy(title))`` for a key of :func:`artist_keys`, so a co-credit has a second fuzzy key.
+    A key with an empty part (a missing tag, or a name that normalizes to nothing) is left
+    out: it never joins.
     """
-    candidates = [
-        ("exact", (fold(artist), album_key(title))),
-        ("fuzzy", (fuzzy(artist), fuzzy(title))),
-    ]
+    candidates = [("exact", (fold(artist), album_key(title)))]
+    candidates += [("fuzzy", (key, fuzzy(title))) for key in artist_keys(artist)]
     return [(kind, key) for kind, key in candidates if all(key)]
 
 
