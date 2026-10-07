@@ -24,12 +24,14 @@ Audio without a scoring record is **uncovered**, never a miss: a play counts in 
 every grid address of the leg that starts in its window has a ``matched`` or ``no_match``
 record, and a carryover play is a candidate only, never scored.
 
-``python -m evaluation.score`` scores every selected leg and writes the score file (:func:`main`).
+``python -m evaluation.score`` scores every leg and writes the score file and the near-miss queue
+(:func:`main`); wrong emissions a person should judge are queued, never absorbed.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -40,6 +42,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import closing
 from dataclasses import asdict, dataclass
+from itertools import groupby
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -406,6 +409,29 @@ def score_leg(
     return LegScore(coverage, verdicts, score_plays(plays, verdicts, covered))
 
 
+NEAR_MISS_SIMILARITY = 0.8
+RUN_COLUMNS = (
+    "leg",
+    "address",
+    "last_address",
+    "emissions",
+    "hour_key",
+    "start",
+    "end",
+    "source",
+    "artist",
+    "song",
+    "album",
+)
+NEAR_COLUMNS = (
+    *RUN_COLUMNS,
+    "play_id",
+    "play_artist",
+    "play_title",
+    "play_album",
+    "matched_on",
+    "verdict",
+)
 # What the score file says of a play: the fields report.py breaks results down by. A carryover
 # repeats the previous hour's ``play_id``, so a play is keyed by (hour_key, play_id, carryover).
 PLAY_FIELDS = (
@@ -424,6 +450,157 @@ PLAY_FIELDS = (
     "play_order_status",
     "talk_rows",
 )
+
+
+def wrong_runs(verdicts: Sequence[Verdict]) -> list[list[Verdict]]:
+    """Runs of consecutive wrong emissions of one song (``distinct_precision``'s key)."""
+    groups = groupby(verdicts, lambda v: (v.play is None, _song(v)))
+    return [list(run) for (wrong, _), run in groups if wrong]
+
+
+def _clock(seconds: float) -> str:
+    return f"{int(seconds) // 3600}:{int(seconds) // 60 % 60:02d}:{int(seconds) % 60:02d}"
+
+
+def run_row(tag: str, run: Sequence[Verdict]) -> dict[str, Any]:
+    """A queue row for a run: leg, first and last clip address, count, and hour-file position."""
+    first, last = run[0].emission, run[-1].emission
+    f = first.found
+    return {
+        "leg": tag,
+        "address": first.address.key,
+        "last_address": last.address.key,
+        "emissions": len(run),
+        "hour_key": first.address.hour_key,
+        "start": _clock(f["at"]),
+        "end": _clock(last.found["at"] + last.address.length_s),
+        "source": f["source"],
+        "artist": f["artist"],
+        "song": f["song"],
+        "album": f["album"],
+    }
+
+
+def _same(a: str | None, b: str | None) -> bool:
+    key = names.fuzzy(a)
+    return bool(key) and key == names.fuzzy(b)
+
+
+def _tokens(artist: str | None, title: str | None) -> set[str]:
+    return set(names.fuzzy(f"{artist or ''} {title or ''}").split())
+
+
+def _nearness(p: Play, f: EvalIdentification, artists: Sequence[str]) -> tuple[list[str], float]:
+    """The fields of ``p`` equal to the emission's under the fuzzy key, and the best Jaccard."""
+    fields = [
+        field
+        for field, hit in (
+            ("artist", any(_same(p.artist, a) for a in artists)),
+            ("title", _same(p.title, f["song"])),
+        )
+        if hit
+    ]
+    theirs = _tokens(p.artist, p.title)
+    jaccards = [
+        len(theirs & mine) / len(theirs | mine) for a in artists if (mine := _tokens(a, f["song"]))
+    ]
+    return fields, max(jaccards, default=0.0)
+
+
+def near_miss(
+    run: Sequence[Verdict],
+    by_hour: Mapping[str, Sequence[Play]],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> tuple[Play, str] | None:
+    """The play nearest a run of wrong emissions, and why, judged from every emission of the run.
+
+    A candidate is a play whose window holds an emission's ``at`` and that shares ``artist`` or
+    ``title`` with it (both can hold, as for a version mismatch) under the fuzzy key, else
+    ``similarity``: a Jaccard of the token sets of at least 0.8. The best candidate has the most
+    shared fields, then the highest similarity, and the earliest emission wins a tie.
+    """
+    near = []
+    for v in run:
+        f = v.emission.found
+        artists = _artists(f, references)
+        for p in by_hour[v.emission.address.hour_key]:
+            if p.window_start_s <= f["at"] <= p.window_end_s:
+                fields, similarity = _nearness(p, f, artists)
+                if fields or similarity >= NEAR_MISS_SIMILARITY:
+                    near.append(((len(fields), similarity), p, "+".join(fields) or "similarity"))
+    return max(near, key=lambda n: n[0])[1:] if near else None
+
+
+def near_miss_rows(
+    plays: Sequence[Play],
+    legs: Mapping[str, LegScore],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> list[dict[str, Any]]:
+    """The near-miss queue: each run of wrong emissions that is a near miss, with its nearest
+    play and an empty ``verdict`` (``correct`` or ``wrong``) for a person to fill."""
+    by_hour: defaultdict[str, list[Play]] = defaultdict(list)
+    for p in plays:
+        by_hour[p.hour_key].append(p)
+    rows = []
+    for tag, ls in legs.items():
+        for run in wrong_runs(ls.verdicts):
+            if found := near_miss(run, by_hour, references):
+                play, matched_on = found
+                rows.append(
+                    {
+                        **run_row(tag, run),
+                        "play_id": play.play_id,
+                        "play_artist": play.artist,
+                        "play_title": play.title,
+                        "play_album": play.album,
+                        "matched_on": matched_on,
+                        "verdict": "",
+                    }
+                )
+    return rows
+
+
+def _refusal(path: Path, columns: Sequence[str]) -> str | None:
+    """Why the file at ``path`` must not be overwritten by a queue with ``columns``, or None.
+
+    Only an unfilled queue of this command's own is overwritten: its header (matched without
+    regard to case, and past a byte-order mark a spreadsheet adds) is ``columns`` and no row has
+    a ``verdict``. Anything else, such as a JSONL store, another CSV, an empty file, or a file that
+    cannot be read, is not ours to replace.
+    """
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            rows = csv.reader(f)
+            header = next(rows, None)
+            if header is None or [h.strip().lower() for h in header] != list(columns):
+                return "is not an unfilled queue of this command's"
+            verdict = list(columns).index("verdict")
+            if any(len(row) > verdict and row[verdict].strip() for row in rows):
+                return "has verdicts filled in"
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return "cannot be read"
+    return None
+
+
+def check_queue(path: Path, columns: Sequence[str] = NEAR_COLUMNS) -> None:
+    """``SystemExit``, one line naming ``path``, when :func:`_refusal` says not to overwrite it."""
+    if reason := _refusal(path, columns):
+        raise SystemExit(f"{path}: {reason}; not overwriting (move it, or pass another path)")
+
+
+def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
+    """Write a queue as UTF-8 CSV, its header always, so an empty queue still says what it holds.
+
+    A person's work is never overwritten (:func:`check_queue`): the caller writes nothing else.
+    """
+    check_queue(path, columns)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _play_row(p: Play) -> dict[str, Any]:
@@ -520,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         "--legs", nargs="+", choices=[leg.name for leg in LEGS], help="default: all"
     )
     parser.add_argument("--out", type=Path, help="the score file; default: <data>/score/score.json")
+    parser.add_argument("--near-misses", type=Path, help="default: <data>/score/near_misses.csv")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
@@ -540,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outside_checkout(args.store or data / "shazam" / "results.jsonl")
         )
         out = require_outside_checkout(args.out or data / "score" / "score.json")
+        near_path = require_outside_checkout(args.near_misses or data / "score" / "near_misses.csv")
         home = checked_snapshot_dir(snapshot) if snapshot else None
     except (DataPathError, SnapshotError) as refusal:
         raise SystemExit(str(refusal)) from None
@@ -549,9 +728,13 @@ def main(argv: list[str] | None = None) -> int:
         store.path,
         *([home / "pool.db", home / RESULTS] if home else []),
     ]
-    if clash := next((i for i in read if _same_file(out, i)), None):
-        raise SystemExit(f"{out}: is also an input ({clash}); not overwriting it")
+    if _same_file(out, near_path):
+        raise SystemExit(f"{out}: --out and --near-misses are the same file")
+    for output in (out, near_path):
+        if clash := next((i for i in read if _same_file(output, i)), None):
+            raise SystemExit(f"{output}: is also an input ({clash}); not overwriting it")
     check_score_file(out)
+    check_queue(near_path)
     if home and not (home / "pool.db").is_file():
         raise SystemExit(f"{home}: no snapshot here; build it first")
     try:
@@ -565,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     if home:
         with closing(open_read_only(home / "pool.db")) as db:
             references = dict(reference_artists(db))
+    scored: dict[str, LegScore] = {}
     entries: dict[str, dict[str, Any]] = {}
     for leg, who in selected:
         identity = (
@@ -574,7 +758,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
         ls = score_leg(plays, results, identity, leg, hours[leg.hours], addresses, references)
+        scored[f"{leg.name}/{who}"] = ls
         entries[f"{leg.name}/{who}"] = leg_json(leg, identity, ls)
+    write_queue(near_path, NEAR_COLUMNS, near_miss_rows(plays, scored, references))
     out.parent.mkdir(parents=True, exist_ok=True)
     document = json.dumps({"version": 1, "legs": entries}, ensure_ascii=False, indent=1)
     temp = out.with_name(out.name + ".tmp")  # a complete file, then a rename: never half-written

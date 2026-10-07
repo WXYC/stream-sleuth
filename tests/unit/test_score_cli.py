@@ -1,4 +1,4 @@
-"""``python -m evaluation.score``: the score file.
+"""``python -m evaluation.score``: the score file and the near-miss queue.
 
 Every plays file, store, and ``pool.db`` is synthetic and lives under a ``tmp_path`` data
 directory. ``hour_addresses`` is replaced, so no test needs ffmpeg or an archive.
@@ -6,10 +6,11 @@ directory. ``hour_addresses`` is replaced, so no test needs ffmpeg or an archive
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -17,8 +18,8 @@ from evaluation import score
 from evaluation.clips import ClipAddress, grid
 from evaluation.olaf_snapshot import RESULTS
 from evaluation.pool import open_pool_db
-from evaluation.run import OlafOutcome
-from evaluation.score import plays_from
+from evaluation.run import Emission, OlafOutcome
+from evaluation.score import attribute, plays_from
 from evaluation.shazam_eval import ResultStore, ShazamOutcome, recognizer_identity
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 from tests.unit.test_score import (
@@ -30,6 +31,8 @@ from tests.unit.test_score import (
     PRATT,
     RECORDS,
     STAGE,
+    _found,
+    _hit,
     _hour,
 )
 
@@ -246,7 +249,9 @@ def test_a_leg_without_records_is_scored_with_everything_uncovered(data: Path) -
     assert set(read_score(data)["legs"]) == {"12s/shazam"}  # no --snapshot: no Olaf leg
 
 
-@pytest.mark.parametrize("flag", ["--plays", "--out", "--selection", "--archive-dir", "--store"])
+@pytest.mark.parametrize(
+    "flag", ["--plays", "--out", "--near-misses", "--selection", "--archive-dir", "--store"]
+)
 def test_a_path_inside_the_checkout_or_relative_is_refused_before_anything_is_read(
     data: Path, flag: str
 ) -> None:
@@ -270,6 +275,248 @@ def test_a_missing_snapshot_pool_db_is_one_line(data: Path) -> None:
     assert not (data / "olaf").exists()
 
 
+def legs_of_plays(
+    plays: list[score.Play],
+    emissions: list[Emission],
+    references: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, score.LegScore]:
+    """One leg, ``12s/shazam``, holding the verdicts of ``emissions`` against ``plays``."""
+    verdicts = attribute(plays, emissions, references)
+    return {"12s/shazam": score.LegScore(cast(Any, None), verdicts, [])}
+
+
+def legs_of(
+    emissions: list[Emission], references: dict[str, tuple[str, ...]] | None = None
+) -> dict[str, score.LegScore]:
+    return legs_of_plays(plays_from(RECORDS), emissions, references)
+
+
+def near_misses(
+    emissions: list[Emission],
+    records: list[dict[str, Any]] = RECORDS,
+    references: dict[str, tuple[str, ...]] | None = None,
+) -> list[dict[str, Any]]:
+    plays = plays_from(records)
+    return score.near_miss_rows(plays, legs_of_plays(plays, emissions, references), references)
+
+
+def one_play(artist: str, title: str, *more: tuple[int, float, str, str]) -> list[dict[str, Any]]:
+    """Play 1 at 120 s, and any ``more`` as (play id, offset, artist, title)."""
+    rows: list[Any] = [(1, 120.0, (artist, title, ""), {})]
+    rows += [(i, t, (a, ti, ""), {}) for i, t, a, ti in more]
+    return _hour(HOUR, "canonical", *rows)
+
+
+NEAR_MISSES = [
+    pytest.param(("Juana Molina", "Otra Cancion", "DOGA"), 195.0, "artist", id="artist only"),
+    pytest.param(("Otra Artista", MOLINA[1], "DOGA"), 195.0, "title", id="title only"),
+    pytest.param((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, "title", id="a co-credit from Shazam"),
+    pytest.param(
+        ("Jessica Pratt", "Back, Baby (Live)", PRATT[2]),
+        750.0,
+        "artist",
+        id="a version the play does not name",
+    ),
+    pytest.param(
+        ("Jessica Pratt", "Back, Baby", PRATT[2]), 150.0, None, id="outside the play's window"
+    ),
+    pytest.param(("Stereolab", "Drive", ""), 750.0, None, id="nothing in common"),
+    pytest.param(MOLINA, 195.0, None, id="a correct emission is not a near miss"),
+]
+
+
+@pytest.mark.parametrize(("track", "at", "matched_on"), NEAR_MISSES)
+def test_near_misses_are_wrong_emissions_one_field_from_a_play_in_their_window(
+    track: tuple[str, str, str], at: float, matched_on: str | None
+) -> None:
+    rows = near_misses([_hit(track, at)])
+
+    assert [r["matched_on"] for r in rows] == ([matched_on] if matched_on else [])
+
+
+def test_a_similar_token_set_is_a_near_miss_when_neither_field_matches() -> None:
+    records = one_play("Chuquimamani-Condori", "Call Your Name Tonight Now Forever")
+    near = ("Chuquimamani Condori Jr", "Call Your Name Tonight Now Forever Again", "Edits")
+    far = ("Chuquimamani Condori Jr", "Call Your Name Tonight Now Forever Again Please", "Edits")
+
+    [hit] = near_misses([_hit(near, 195.0)], records)
+    assert hit["matched_on"] == "similarity"
+    assert not near_misses([_hit(far, 195.0)], records)
+
+
+def test_two_empty_artists_do_not_match() -> None:
+    assert not near_misses([_hit(("", "Otra Cancion", ""), 195.0)], one_play("", "la paradoja"))
+
+
+def test_a_run_is_judged_by_every_emission_and_the_nearest_play_wins() -> None:
+    """The run starts outside every window of its song's play and enters one later."""
+    chuqui = ("Chuquimamani-Condori", "Otra Cancion", "Edits")
+
+    [row] = near_misses([_hit(chuqui, 1200.0), _hit(chuqui, 1335.0)])
+
+    assert (row["address"], row["last_address"], row["play_id"]) == (
+        f"{HOUR}#1200+12@128k",
+        f"{HOUR}#1335+12@128k",
+        4,
+    )
+
+
+def test_among_near_plays_the_most_similar_is_chosen() -> None:
+    records = one_play(
+        "Jessica Pratt",
+        "Something Entirely Different Here",
+        (2, 200.0, "Jessica Pratt", "Back, Baby (Live)"),
+    )
+
+    [row] = near_misses([_hit(("Jessica Pratt", "Back, Baby", ""), 195.0)], records)
+
+    assert (row["play_id"], row["matched_on"]) == (2, "artist")
+
+
+def test_a_near_miss_under_olaf_references_names_every_artist_tag_of_its_file() -> None:
+    address = ClipAddress(HOUR, 195, 12)
+    found = _found(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
+    found |= {"source": "local", "confidence": 40.0, "ref_key": STAGE}
+    emission = Emission((address.key, OLAF), address, found)
+
+    [row] = near_misses([emission], references={STAGE: ("Juana Molina",)})
+
+    assert (row["play_id"], row["matched_on"]) == (1, "artist")
+    assert not near_misses([emission])
+
+
+def test_consecutive_wrong_emissions_of_one_song_are_one_row_with_archive_times() -> None:
+    other = ("Juana Molina", "Otra Cancion", "DOGA")
+    hits = [_hit(other, at) for at in (195.0, 210.0, 225.0)]
+    hits += [_hit(MOLINA, 240.0), _hit(other, 255.0)]
+
+    rows = near_misses(hits)
+
+    assert [(r["address"], r["last_address"], r["emissions"]) for r in rows] == [
+        (f"{HOUR}#195+12@128k", f"{HOUR}#225+12@128k", 3),
+        (f"{HOUR}#255+12@128k", f"{HOUR}#255+12@128k", 1),
+    ]
+    assert (rows[0]["hour_key"], rows[0]["start"], rows[0]["end"]) == (HOUR, "0:03:15", "0:03:57")
+    assert rows[0]["verdict"] == ""
+
+
+def read_queue(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+QUEUE = "score/near_misses.csv"
+OTHER_SONG = ("Juana Molina", "Otra Canción", "DOGA")
+
+
+def test_the_cli_writes_the_near_miss_queue_with_an_empty_verdict_column(data: Path) -> None:
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
+    add_shazam(data, ClipAddress(HOUR, 210, 12), OTHER_SONG)
+    add_shazam(data, ClipAddress(HOUR, 750, 12), ("Stereolab", "Drive", ""))
+
+    run_cli(data)
+
+    path = data / QUEUE
+    assert path.read_text(encoding="utf-8").splitlines()[0] == (
+        "leg,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
+        "play_id,play_artist,play_title,play_album,matched_on,verdict"
+    )
+    [row] = read_queue(path)
+    assert (row["leg"], row["emissions"], row["song"], row["play_id"], row["verdict"]) == (
+        "12s/shazam",
+        "2",
+        "Otra Canción",
+        "1",
+        "",
+    )
+
+
+def fill_verdict(path: Path, verdict: str) -> bytes:
+    """Put ``verdict`` in the queue's first row, as a person would; return the file's bytes."""
+    rows = read_queue(path)
+    rows[0]["verdict"] = verdict
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path.read_bytes()
+
+
+def queued(data: Path) -> Path:
+    """Run once over a store holding one near miss; return the queue it wrote."""
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
+    run_cli(data)
+    (data / "score" / "score.json").unlink()
+    return data / QUEUE
+
+
+def test_a_queue_with_a_verdict_is_never_overwritten_and_nothing_else_is_written(
+    data: Path,
+) -> None:
+    queue = queued(data)
+    filled = fill_verdict(queue, "correct")
+
+    with pytest.raises(SystemExit, match=r"near_misses\.csv.*verdict"):
+        run_cli(data)
+
+    assert queue.read_bytes() == filled
+    assert not (data / "score" / "score.json").exists()
+
+
+def test_a_queue_with_no_verdict_is_rewritten(data: Path) -> None:
+    queue = queued(data)
+    queue.write_text(queue.read_text(encoding="utf-8") + "stale\n", encoding="utf-8")
+
+    run_cli(data)
+
+    assert len(read_queue(queue)) == 1
+
+
+HEADER = (
+    "leg,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
+    "play_id,play_artist,play_title,play_album,matched_on,verdict"
+)
+ROW = "12s/shazam,a,b,1,h,0:00:00,0:00:12,shazam,x,y,z,1,p,q,r,artist"
+BOM = b"\xef\xbb\xbf"
+NOT_OURS = [
+    pytest.param(
+        f"{HEADER.replace('verdict', 'Verdict')}\n{ROW},correct\n".encode(), id="re-cased"
+    ),
+    pytest.param(BOM + f"{HEADER}\n{ROW},wrong\n".encode(), id="byte-order mark"),
+    pytest.param(f"{HEADER}\n{ROW},caf".encode() + b"\xe9\n", id="not UTF-8"),
+    pytest.param(b'{"hour_key": "h", "play_id": 1}\n', id="a JSONL file"),
+    pytest.param(b"a,b\n1,2\n", id="another CSV"),
+    pytest.param(b"", id="an empty file"),
+    pytest.param(f"{HEADER.replace(',verdict', '')}\n".encode(), id="a header without verdict"),
+]
+
+
+@pytest.mark.parametrize("content", NOT_OURS)
+def test_an_existing_file_that_is_not_an_unfilled_queue_of_ours_is_never_overwritten(
+    data: Path, content: bytes
+) -> None:
+    queue = data / QUEUE
+    queue.parent.mkdir()
+    queue.write_bytes(content)
+
+    with pytest.raises(SystemExit, match=r"near_misses\.csv"):
+        run_cli(data)
+
+    assert queue.read_bytes() == content
+    assert not (data / "score" / "score.json").exists()
+
+
+@pytest.mark.parametrize("prefix", ["", "\ufeff"], ids=["plain", "byte-order mark"])
+def test_a_header_only_queue_of_ours_is_rewritten(data: Path, prefix: str) -> None:
+    queue = data / QUEUE
+    queue.parent.mkdir()
+    queue.write_text(prefix + HEADER.replace("verdict", "Verdict") + "\n", encoding="utf-8")
+
+    run_cli(data)
+
+    assert queue.read_text(encoding="utf-8").splitlines()[0] == HEADER
+
+
 def inputs(data: Path) -> dict[str, Path]:
     """Every input a run reads, each existing, by the flag that names it (or its role)."""
     add_snapshot(data)
@@ -285,10 +532,11 @@ def inputs(data: Path) -> dict[str, Path]:
     }
 
 
+@pytest.mark.parametrize("output", ["--out", "--near-misses"])
 @pytest.mark.parametrize("role", ["plays", "selection", "shazam store", "olaf store", "pool.db"])
 @pytest.mark.parametrize("alias", ["path", "symlink", "hardlink"])
 def test_an_output_that_is_an_input_is_refused_before_anything_is_written(
-    data: Path, role: str, alias: str, tmp_path: Path
+    data: Path, output: str, role: str, alias: str, tmp_path: Path
 ) -> None:
     target = inputs(data)[role]
     before = target.read_bytes()
@@ -301,9 +549,18 @@ def test_an_output_that_is_an_input_is_refused_before_anything_is_written(
         os.link(target, named)
 
     with pytest.raises(SystemExit, match="input"):
-        run_cli(data, "--snapshot", SNAPSHOT, "--out", str(named))
+        run_cli(data, "--snapshot", SNAPSHOT, output, str(named))
 
     assert target.read_bytes() == before
+    assert not (data / "score").exists()
+
+
+def test_the_score_file_and_the_queue_may_not_share_a_path(data: Path) -> None:
+    shared = data / "score" / "both"
+
+    with pytest.raises(SystemExit, match="same"):
+        run_cli(data, "--out", str(shared), "--near-misses", str(shared))
+
     assert not (data / "score").exists()
 
 
