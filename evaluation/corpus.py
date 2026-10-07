@@ -24,6 +24,7 @@ import re
 import sqlite3
 import sys
 import unicodedata
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ TALK_TYPES = {"talkset", "message"}
 
 _TIME = re.compile(r"(.{19})(?:\.(\d+))?([+-]\d{2})(?::?(\d{2}))?")
 _CRUFT = re.compile(
-    r"\s*[\(\[](?:feat\.?|ft\.?|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)[^\)\]]*[\)\]]",
+    r"\s*[\(\[](?:feat|ft|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
 
@@ -160,9 +161,11 @@ class PoolIndex:
 
 @dataclass(frozen=True)
 class Row:
+    """One flowsheet export row; ``show_id`` is ``""`` for a row with no show."""
+
     id: int
     show_id: str
-    play_order: int | None
+    play_order: int
     legacy: bool
     entry_type: str
     add_time: datetime
@@ -183,11 +186,17 @@ class Flowsheet:
 
     @classmethod
     def load(cls, export_dir: Path) -> Flowsheet:
+        """Read ``flowsheet.csv`` and ``cronjob_runs.csv`` from ``export_dir``.
+
+        ``by_hour`` holds each hour key's rows; rows in the fall-back hour, which has
+        no key, appear only in ``rows``. A show with a legacy row of any entry type
+        has two writers (``unreliable``); rows with no show get no label.
+        """
         with open(export_dir / "flowsheet.csv", newline="", encoding="utf-8") as f:
             rows = [
-                Row(int(r["id"]), r["show_id"], int(r["play_order"]) if r["play_order"] else None,
-                    bool(r["legacy_entry_id"]), r["entry_type"], parse_add_time(r["add_time"]),
-                    r["artist_name"], r["track_title"], r["album_title"], bool(r["rotation_id"]))
+                Row(int(r["id"]), r["show_id"], int(r["play_order"]), bool(r["legacy_entry_id"]),
+                    r["entry_type"], parse_add_time(r["add_time"]), r["artist_name"],
+                    r["track_title"], r["album_title"], bool(r["rotation_id"]))
                 for r in csv.DictReader(f)
             ]  # fmt: skip
         sheet = cls(sorted(rows, key=lambda r: (r.add_time, r.id)), etl_stop(export_dir))
@@ -195,38 +204,47 @@ class Flowsheet:
         for r in sheet.rows:
             if (key := hour_key(r.add_time)) is not None:
                 sheet.by_hour[key].append(r)
-            if r.entry_type == "track":
+            if r.show_id:
                 shows[r.show_id].append(r)
-        for show, tracks in shows.items():
-            if any(r.legacy for r in tracks):
+        for show, show_rows in shows.items():
+            if any(r.legacy for r in show_rows):
                 sheet.order_status[show] = ("unreliable", None)
             else:
-                by_order = sorted(tracks, key=lambda r: (r.play_order is None, r.play_order or 0))
+                tracks = [r for r in show_rows if r.entry_type == "track"]
+                by_order = sorted(tracks, key=lambda r: r.play_order)
                 sheet.order_status[show] = ("single_writer", by_order != tracks)
         log.info("loaded %d rows, ETL_STOP %s", len(sheet.rows), sheet.stop.isoformat())
         return sheet
 
     def era(self, t: datetime) -> str:
+        """``canonical`` at or after ``ETL_STOP``, else ``etl``."""
         return "canonical" if t >= self.stop else "etl"
 
 
 def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
     """Write one ``plays.jsonl`` record per track row in each hour; never overwrites ``out``.
 
-    Every key is validated before ``out`` is created, so a bad key leaves no partial file.
+    Every key is validated before ``out`` is created, so a bad key leaves no partial
+    file, and a failed write removes the file it created. An hour with no flowsheet
+    rows (outside the export, or a gap) writes no records and logs a warning.
 
-    Each hour also gets the previous hour's last track row as an attribution-only
-    play (``carryover: true``, negative ``t_offset_s``): a song started before the
-    top of the hour is still playing in it.
+    Each hour also gets the last track row of the 60 minutes before it as an
+    attribution-only play (``carryover: true``, negative ``t_offset_s``): a song
+    started before the top of the hour is still playing in it. Plays with no show
+    are ``unreliable``: there is no show order to check them against.
     """
     lines = []
     for key in dict.fromkeys(hours):
         start = hour_start(key)
         rows = sheet.by_hour.get(key, [])
+        if not rows:
+            log.warning("%s: no flowsheet rows; is the hour inside the export?", key)
         tracks = [r for r in rows if r.entry_type == "track"]
         talk_rows = sum(r.entry_type in TALK_TYPES for r in rows)
-        before = [r for r in sheet.by_hour.get(hour_key(start - timedelta(hours=1)) or "", [])
-                  if r.entry_type == "track"]  # fmt: skip
+        # By instant, not hour key, so the hour after fall-back still gets its carryover.
+        lo = bisect_left(sheet.rows, start - timedelta(hours=1), key=lambda r: r.add_time)
+        hi = bisect_left(sheet.rows, start, lo=lo, key=lambda r: r.add_time)
+        before = [r for r in sheet.rows[lo:hi] if r.entry_type == "track"]
         plays = [(r, True) for r in before[-1:]] + [(r, False) for r in tracks]
         for i, (r, carryover) in enumerate(plays):
             t = (r.add_time - start).total_seconds()
@@ -235,12 +253,16 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
             )
             era = sheet.era(r.add_time)
             tier, fmt = pool.match(r.artist, r.album, r.title) or (None, None)
-            status, flag = sheet.order_status[r.show_id] if era == "canonical" else ("etl", None)
+            status, flag = (
+                sheet.order_status.get(r.show_id, ("unreliable", None))
+                if era == "canonical"
+                else ("etl", None)
+            )
             record = {
                 "hour_key": key, "play_id": r.id, "t_offset_s": t,
                 "window_start_s": max(0.0, t - PADS[era]), "window_end_s": min(3600.0, t_next + PADS[era]),
                 "artist": r.artist, "title": r.title, "album": r.album, "era": era, "pad_s": PADS[era],
-                "in_pool": tier is not None if r.artist else None, "pool_match_tier": tier,
+                "in_pool": tier is not None if fold(r.artist) else None, "pool_match_tier": tier,
                 "pool_format": fmt, "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
                 "carryover": carryover, "track_rows": len(tracks), "talk_rows": talk_rows,
             }  # fmt: skip
@@ -248,11 +270,16 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
         log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
     # Built in full first, so a bad key leaves no partial file.
     with open(out, "x", encoding="utf-8") as f:
-        f.writelines(lines)
+        try:
+            f.writelines(lines)
+        except BaseException:
+            out.unlink()  # the file this call created, never an earlier one
+            raise
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    """The CLI: ``--export``, ``--pool-db``, ``--hours`` and ``--out``; see the README."""
+    parser = argparse.ArgumentParser(description="Write plays.jsonl from a flowsheet export.")
     parser.add_argument("--export", type=Path, required=True, help="dated export directory")
     parser.add_argument("--pool-db", type=Path, required=True)
     parser.add_argument("--hours", type=Path, required=True, help="file of hour keys, one per line")
