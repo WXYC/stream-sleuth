@@ -460,6 +460,11 @@ def test_the_same_qualifier_on_both_sides_joins(
         ("Hibiscus (Radio Edit feat. Bbyafricka)", "Hibiscus", "title"),
         ("Hibiscus (Live feat. Bbyafricka)", "Hibiscus", None),
         ("Hibiscus", "Hibiscus (Live feat. Bbyafricka)", None),
+        # A credit never swallows a version word, at any tier.
+        ("Hibiscus feat. Bbyafricka Remix", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka, Live at KEXP", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka\u3010Live\u3011", "Hibiscus", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka Remix", None),
         # A word that is no credit is kept.
         ("Six Ft. Under", "Six Ft. Deep", None),
         ("Little Feat", "Little", None),
