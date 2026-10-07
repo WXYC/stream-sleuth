@@ -81,15 +81,24 @@ def add_snapshot(data: Path, artist: str = COCREDIT, album_artist: str = "Juana 
     db.close()
 
 
-def add_olaf(data: Path, address: ClipAddress, artist: str) -> None:
+def add_olaf(
+    data: Path,
+    address: ClipAddress,
+    artist: str,
+    query_offset_s: float = 0.0,
+    ref_start_s: float = 75.0,
+    song: str = MOLINA[1],
+    album: str = MOLINA[2],
+) -> None:
     olaf_record(
         ResultStore(data / "olaf" / SNAPSHOT / RESULTS),
         str(address),
         "matched",
-        (artist, MOLINA[1], MOLINA[2]),
+        (artist, song, album),
         identity=OLAF,
         ref_key=STAGE,
-        ref_start_s=75.0,
+        query_offset_s=query_offset_s,
+        ref_start_s=ref_start_s,
     )
 
 
@@ -885,9 +894,9 @@ def test_fewer_than_two_emissions_with_offsets_cannot_be_steady(run: list[Emissi
     assert false_positives(run)[0]["preflag"] == ""
 
 
-def other(track: tuple[str, str, str], at: float, hour: str = HOUR) -> Emission:
+def other(track: tuple[str, str, str], at: float, hour: str = HOUR, **offsets: float) -> Emission:
     """An Olaf answer at ``at`` that names its reference by ``STAGE``."""
-    emission = _local(track[0], at, STAGE)
+    emission = _local(track[0], at, STAGE, **offsets)
     found = {**emission.found, "song": track[1], "album": track[2]}
     address = ClipAddress(hour, int(at), 12)
     return Emission((address.key, OLAF), address, cast(Any, found))
@@ -1019,3 +1028,72 @@ def test_the_two_queues_may_not_share_a_path(data: Path) -> None:
         run_cli(data, "--near-misses", str(shared), "--false-positives", str(shared))
 
     assert not (data / "score").exists()
+
+
+def olaf_run(*clips: tuple[float, float, float]) -> list[Emission]:
+    """Olaf answers for one song at (grid offset, query_offset_s, ref_start_s) each."""
+    return [other(UNLOGGED, at, query_offset_s=q, ref_start_s=r) for at, q, r in clips]
+
+
+# As ``run_olaf`` stores them for consecutive grid clips of one playback that started at 650 s: a
+# clip's matched query window starts ``query_offset_s`` into it, and ``ref_start_s`` is where in
+# the reference that window began, so the estimate is ``at + query_offset_s - ref_start_s``.
+OLAF_PLAYBACK = [(750.0, 0.5, 100.5), (765.0, 11.0, 126.0), (780.0, 2.25, 132.25)]
+OLAF_STEADY = [
+    pytest.param(OLAF_PLAYBACK, LIKELY, id="one playback, estimate 650 throughout"),
+    pytest.param(
+        [(750.0, 0.5, 100.5), (765.0, 11.0, 126.0 - 7.5)], LIKELY, id="7.5 s off, at the tolerance"
+    ),
+    pytest.param(
+        [(750.0, 0.5, 100.5), (765.0, 11.0, 126.0 - 7.6)], "", id="7.6 s off, past the tolerance"
+    ),
+    pytest.param(
+        [(750.0, 0.5, 100.5), (765.0, 11.0, 115.5)], "", id="a reference position standing still"
+    ),
+    pytest.param([(750.0, 0.5, 100.5)], "", id="a single emission"),
+]
+
+
+@pytest.mark.parametrize(("clips", "preflag"), OLAF_STEADY)
+def test_an_olaf_playbacks_song_start_is_steady_only_with_its_query_offset(
+    clips: list[tuple[float, float, float]], preflag: str
+) -> None:
+    """Dropping the query offset or flipping its sign moves this playback's estimates 10.5 s and
+    21 s apart, so the run would stop being preflagged."""
+    [row] = false_positives([], olaf_run(*clips))
+
+    assert row["preflag"] == preflag
+
+
+def test_the_cli_preflags_a_stored_olaf_playback_through_the_read_side(data: Path) -> None:
+    add_snapshot(data, UNLOGGED[0], UNLOGGED[0])  # tags that share nothing with a logged play
+    for at, q, r in OLAF_PLAYBACK[:2]:
+        add_olaf(data, ClipAddress(HOUR, int(at), 12), UNLOGGED[0], q, r, UNLOGGED[1], UNLOGGED[2])
+
+    run_cli(data, "--snapshot", SNAPSHOT)
+
+    [row] = [r for r in read_queue(data / FP_QUEUE) if r["leg"] == "12s/olaf"]
+    assert (row["emissions"], row["song"], row["preflag"]) == ("2", UNLOGGED[1], LIKELY)
+
+
+def test_an_olaf_run_is_flagged_through_its_reference_tags_by_a_shazam_album_artist() -> None:
+    credited = ("Stereolab & Duo Tag", UNLOGGED[1], UNLOGGED[2])
+    references: dict[str, tuple[str, ...]] = {STAGE: ("Stereolab & Duo Tag", "Stereolab")}
+
+    flagged = false_positives([unlogged(750.0)], [other(credited, 750.0)], references)
+
+    assert {r["recognizer"]: r["preflag"] for r in flagged} == {SHAZAM: LIKELY, OLAF: LIKELY}
+
+
+def test_the_span_follows_the_capture_length_of_the_runs_last_emission() -> None:
+    """A 20 s clip runs past the next 15 s grid offset, so an agreeing answer there counts; at 12 s
+    the span ends before it. The span's end never lands on a grid offset (6, 12, 20 s from a
+    multiple of 15), so its exclusive edge is not reachable."""
+
+    def flagged(length_s: int) -> str:
+        address = ClipAddress(HOUR, 750, length_s)
+        answer = Emission((address.key, SHAZAM), address, unlogged(750.0).found)
+        rows = false_positives([answer], [other(UNLOGGED, 765.0)])
+        return next(r["preflag"] for r in rows if r["recognizer"] == SHAZAM)
+
+    assert (flagged(20), flagged(12)) == (LIKELY, "")
