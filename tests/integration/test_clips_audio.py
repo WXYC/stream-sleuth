@@ -13,6 +13,7 @@ from array import array
 import pytest
 
 from evaluation import clips
+from tests.audio import render
 
 pytestmark = pytest.mark.ffmpeg
 
@@ -27,17 +28,12 @@ LOUD = 1000
 @pytest.fixture(scope="module", params=[["-q:a", "0"], ["-b:a", "128k"]], ids=["vbr", "cbr"])
 def step_hour(request, tmp_path_factory):
     path = tmp_path_factory.mktemp("archive") / "step.mp3"
-    subprocess.run(
-        [
-            "ffmpeg", "-nostdin", "-v", "error",
-            "-f", "lavfi", "-i", f"anullsrc=r={RATE}:cl=mono:d={STEP_S}",
-            "-f", "lavfi", "-i", f"sine=frequency=440:duration={HOUR_S - STEP_S}:sample_rate={RATE}",
-            "-filter_complex", "[0][1]concat=n=2:v=0:a=1",
-            "-c:a", "libmp3lame", *request.param, str(path),
-        ],
-        check=True,
-    )  # fmt: skip
-    return path
+    return render(
+        path,
+        (f"anullsrc=r={RATE}:cl=mono", STEP_S),
+        (f"sine=frequency=440:sample_rate={RATE}", HOUR_S - STEP_S),
+        args=["-c:a", "libmp3lame", *request.param],
+    )
 
 
 def _probe(path):

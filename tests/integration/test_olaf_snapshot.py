@@ -8,7 +8,6 @@ two references: one tagged the way the station's files are, one with no tags at 
 from __future__ import annotations
 
 import os
-import subprocess
 
 import pytest
 from moto import mock_aws
@@ -19,6 +18,7 @@ from evaluation import pool
 from evaluation.olaf_snapshot import build_snapshot
 from stream_sleuth.loop import Cadence, State, step
 from stream_sleuth.recognizers.olaf import OlafRecognizer, snapshot_dir
+from tests.audio import render
 from tests.unit.test_s3_readonly import seed_objects
 
 pytestmark = pytest.mark.olaf
@@ -34,11 +34,7 @@ CADENCE = Cadence(fast=6, slow=12, interval=23, interval_gap=4)
 
 
 def noise(seed):
-    return ["-f", "lavfi", "-i", f"anoisesrc=d=60:c=pink:seed={seed}:a=0.5"]
-
-
-def ffmpeg(*args):
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args], check=True)
+    return (f"anoisesrc=c=pink:seed={seed}:a=0.5", 60)
 
 
 @pytest.fixture
@@ -48,7 +44,7 @@ def synthetic_pool(monkeypatch, aws_isolated_env, tmp_path):
     references = {}
     for key, seed in ((TAGGED, 11), (UNTAGGED, 22)):
         path = tmp_path / f"{seed}.wav"
-        ffmpeg(*noise(seed), "-ac", "1", "-ar", "16000", str(path))
+        render(path, noise(seed), args=["-ac", "1", "-ar", "16000"])
         references[key] = path
     wav = WAVE(references[TAGGED])
     wav.add_tags()
@@ -63,11 +59,13 @@ def synthetic_pool(monkeypatch, aws_isolated_env, tmp_path):
 
 def cut_of_the_hour(tmp_path, start):
     """A 12 s, 128 kbps cut starting ``start`` s into an hour of the two references back to back."""
-    clip = tmp_path / f"clip-{start}.mp3"
-    ffmpeg(*noise(11), *noise(22), "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
-           "-ac", "1", "-ar", "16000", "-ss", str(start), "-t", "12",
-           "-c:a", "libmp3lame", "-b:a", "128k", str(clip))  # fmt: skip
-    return clip
+    return render(
+        tmp_path / f"clip-{start}.mp3",
+        noise(11),
+        noise(22),
+        args=["-ac", "1", "-ar", "16000", "-ss", str(start), "-t", "12",
+              "-c:a", "libmp3lame", "-b:a", "128k"],
+    )  # fmt: skip
 
 
 def test_a_match_carries_the_references_tags_and_an_untagged_one_is_a_miss(

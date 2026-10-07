@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,6 +11,7 @@ import pytest
 from evaluation.clips import hour_addresses
 from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, main
 from stream_sleuth.paths import CHECKOUT, DataPathError
+from tests.audio import render
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
 from tests.shazam_fake import HTML_429, FakeShazam, json_response
 
@@ -28,23 +28,7 @@ def _no_interval(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _make_hour(archive: Path, key: str, seconds: int) -> None:
     (archive / key).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"sine=frequency=440:duration={seconds}",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            str(archive / key),
-        ],
-        check=True,
-    )
+    render(archive / key, seconds, args=["-c:a", "libmp3lame", "-b:a", "128k"])
 
 
 def _records(path: Path) -> list[dict]:
