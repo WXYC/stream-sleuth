@@ -291,8 +291,8 @@ class ResultStore:
             return False
 
     def history(self) -> tuple[set[Key], dict[Key, int], set[Key]]:
-        """The scored keys, each tried key's latest status, and the exhausted keys: the one tally
-        that ``run`` and the report share.
+        """The scored keys, each tried key's latest status (ordered by its latest record), and
+        the exhausted keys: the one tally that ``run`` and the report share.
 
         A key is exhausted after a first failure and ``MAX_RETRIES`` failed retries, where a
         failure is a non-scoring outcome that is not a day-stopping status.
@@ -300,6 +300,7 @@ class ResultStore:
         scored, last, failures = set[Key](), dict[Key, int](), Counter[Key]()
         for r in self.records():
             key = (r["address"], r["recognizer"])
+            last.pop(key, None)  # re-inserted, so ``last`` is ordered by each key's latest record
             last[key] = r["status"]
             if r["kind"] in SCORING_KINDS:
                 scored.add(key)
@@ -340,8 +341,16 @@ async def run(
     pending = [a for k, a in by_key.items() if k not in scored and k not in exhausted]
     # Never-tried addresses first, so a stretch that always fails is retried only after them
     # and cannot trip the failure streak at the same place every day; then retries, and last
-    # those whose latest answer stopped the day, so one address cannot lead every day's queue.
-    pending.sort(key=lambda a: (key(a) in last, last.get(key(a)) in STOP_REASONS))  # stable
+    # those whose latest answer stopped the day, least recently tried first, so one address
+    # cannot lead every day's queue.
+    recency = {k: i for i, k in enumerate(last)}
+
+    def rank(a: ClipAddress) -> tuple[bool, bool, int]:
+        k = key(a)
+        stopped = last.get(k) in STOP_REASONS
+        return (k in last, stopped, recency[k] if stopped else 0)
+
+    pending.sort(key=rank)  # stable: grid order within the never-tried and retry tiers
     streak = 0
     for address in pending:
         shazam = Shazam(http_client=client, segment_duration_seconds=address.length_s)
