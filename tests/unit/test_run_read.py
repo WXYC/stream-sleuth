@@ -181,6 +181,19 @@ def test_a_key_scored_in_one_store_is_not_uncovered_for_another_store_error(
     assert (len(result.emissions), result.scored, result.uncovered) == (1, {KEY}, {})
 
 
+@pytest.mark.parametrize("second", ["matched", "no_match"])
+def test_the_first_scoring_record_wins_across_stores(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, second: str
+) -> None:
+    first = _store(tmp_path, _record("matched", song="first store"))
+    copy = ResultStore(tmp_path / "copy.jsonl")
+    copy.path.write_text(json.dumps(_record(second, song="second store")) + "\n")
+    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+        result = read_results([first, copy], {SHAZAM})
+    assert [e.found["song"] for e in result.emissions] == ["first store"]
+    assert caplog.text.count("ignored") == 1
+
+
 def test_the_union_over_stores_has_every_stores_keys(tmp_path: Path) -> None:
     olaf = olaf_identity("rotation")
     first = _store(tmp_path, _record("decode_error"))
@@ -206,6 +219,15 @@ def test_a_result_filed_under_one_floor_is_not_returned_for_another(tmp_path: Pa
     assert result.uncovered == {(f"{OTHER}#0+12@128k", loose): "server_error"}
 
 
+def test_a_bare_string_is_not_a_set_of_identities(tmp_path: Path) -> None:
+    # A str is a Collection[str], and `in` on it is a substring test: "min=1" is inside "min=12".
+    loose, strict = olaf_identity("rotation", 1), olaf_identity("rotation", 12)
+    store = _store(tmp_path, _record("no_match", recognizer=loose))
+    with pytest.raises(TypeError, match="set of identities"):
+        read_results([store], strict)  # type: ignore[arg-type]
+    assert read_results([store], {strict}).scored == set()  # the same request, as a set
+
+
 def test_records_under_other_identities_are_counted_in_a_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -216,6 +238,20 @@ def test_records_under_other_identities_are_counted_in_a_warning(
     assert len(result.emissions) == 1
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
     assert other in caplog.text and "1 record" in caplog.text
+
+
+def test_the_warning_counts_every_record_and_each_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    a, b = "shazam@9.9.9, segment=12", "shazam@9.9.9, segment=6"
+    others = [
+        _record("no_match", recognizer=a, address=f"{HOUR}#{15 * i}+12@128k") for i in range(3)
+    ]
+    store = _store(tmp_path, _record("matched"), *others, _record("no_match", recognizer=b))
+    with caplog.at_level(logging.WARNING, logger="evaluation.run"):
+        read_results([store], {SHAZAM})
+    assert "4 record(s)" in caplog.text
+    assert f"{a!r}: 3" in caplog.text and f"{b!r}: 1" in caplog.text
 
 
 def test_no_warning_when_every_record_is_under_a_requested_identity(

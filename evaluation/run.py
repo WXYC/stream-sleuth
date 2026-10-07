@@ -21,7 +21,8 @@ import logging
 import shutil
 import sys
 from collections import Counter
-from collections.abc import Collection, Iterable
+from collections.abc import Iterable
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +37,8 @@ from evaluation.shazam_eval import (
     ResultStore,
     Throttle,
     budget_from_env,
-    require_pinned_shazamio,
     recognizer_identity,
+    require_pinned_shazamio,
 )
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
@@ -202,8 +203,8 @@ def to_identification(record: dict[str, Any]) -> Emission | None:
 def study_identities(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COUNT) -> set[str]:
     """Every recognizer identity one study scores: each Shazam segment length and the Olaf snapshot.
 
-    The Shazam identities name the *installed* shazamio version, so a lock change makes them
-    stop matching the records already stored; :func:`read_results` warns when that happens.
+    The Shazam identities name the pinned shazamio version (``SHAZAMIO_VERSION``), so they match
+    the stored records; :func:`read_results` still warns about records under any other identity.
     """
     return {
         *(recognizer_identity(n) for n in CAPTURE_LENGTHS_S),
@@ -222,7 +223,7 @@ def _line_of(path: Path, address: str) -> int:
     return 0
 
 
-def read_results(stores: Iterable[ResultStore], identities: Collection[str]) -> Results:
+def read_results(stores: Iterable[ResultStore], identities: AbstractSet[str]) -> Results:
     """The matched answers, scored keys, and uncovered keys in the union of ``stores``.
 
     Only records under ``identities`` are read. Per key the first ``matched`` or ``no_match``
@@ -236,7 +237,12 @@ def read_results(stores: Iterable[ResultStore], identities: Collection[str]) -> 
     A record filed under another identity, such as another match floor or shazamio version, is
     not read, and a warning counts those per identity, so it never reads as zero coverage. A
     record whose address does not parse raises ``ValueError`` naming the store and line.
+
+    ``identities`` is a set, never a bare ``str``: ``in`` on a string is a substring test, and
+    Olaf identities nest (``min=1`` is inside ``min=12``), so a string raises ``TypeError``.
     """
+    if isinstance(identities, str):
+        raise TypeError(f"identities must be a set of identities, not the string {identities!r}")
     emissions: list[Emission] = []
     scored: set[Key] = set()
     tried: dict[Key, str] = {}  # key -> latest kind
