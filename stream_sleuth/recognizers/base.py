@@ -26,7 +26,8 @@ class EvalIdentification(Identification, total=False):
 
     at: float
     """Seconds from the start of the hour file at which the clip (grid run) or capture (replay)
-    begins; the origin and unit of ``plays.jsonl``'s ``t_offset_s`` and ``window_*_s``."""
+    begins; the origin and unit of ``plays.jsonl``'s ``t_offset_s`` and ``window_*_s``. The driver
+    (grid run or replay) sets it on every emission it stores; a recognizer cannot know it."""
 
     source: IdentificationSource
     """Which recognizer produced this emission."""
@@ -35,7 +36,8 @@ class EvalIdentification(Identification, total=False):
     """Recognizer-specific and not comparable across sources: Olaf's ``match_count``; absent for Shazam."""
 
     query_offset_s: float
-    """Seconds into the query clip at which the match begins."""
+    """Seconds into the query clip at which the match begins. Set together with ``ref_start_s`` or
+    not at all; Shazam reports no query offset, so both are absent for Shazam."""
 
     ref_start_s: float
     """Seconds into the reference recording at which the match begins."""
