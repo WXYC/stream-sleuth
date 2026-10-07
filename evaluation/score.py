@@ -293,23 +293,40 @@ def attribute(
     return verdicts
 
 
-def precision(verdicts: Sequence[Verdict]) -> float | None:
-    """Flowsheet precision: the share of emissions attributed to a play."""
-    return sum(v.play is not None for v in verdicts) / len(verdicts) if verdicts else None
+def _status(v: Verdict, calls: Mapping[str, str]) -> str:
+    """``correct`` (attributed to a play, or a person's verdict on the run it is in), ``talk``, or ``wrong``."""
+    return "correct" if v.play else calls.get(v.emission.address.key, "wrong")
 
 
-def distinct_precision(verdicts: Sequence[Verdict]) -> float | None:
+def precision(verdicts: Sequence[Verdict], calls: Mapping[str, str] | None = None) -> float | None:
+    """Flowsheet precision: the share of emissions attributed to a play.
+
+    With ``calls``, a person's verdicts on the queued runs (``correct``, ``wrong``, or ``talk``, by
+    each emission's address key: a verdict applies to every emission of its run), it is the
+    adjudicated precision: a ``correct`` run adds all of its emissions to the numerator, and a
+    ``talk`` run takes all of its emissions out of the numerator and the denominator.
+    """
+    states = [s for v in verdicts if (s := _status(v, calls or {})) != "talk"]
+    return states.count("correct") / len(states) if states else None
+
+
+def distinct_precision(
+    verdicts: Sequence[Verdict], calls: Mapping[str, str] | None = None
+) -> float | None:
     """Precision over runs of consecutive identical emissions, as the loop, which emits only on
     change, would show them; a run is correct when any of it is. Identical is ``loop.step``'s
     key, ``(artist.lower(), song.lower())``, within one hour: the replay drives each hour
-    with a fresh loop, so a song across the top of the hour starts a second run."""
+    with a fresh loop, so a song across the top of the hour starts a second run. With ``calls``
+    (see :func:`precision`) a run of nothing but ``talk`` emissions is dropped."""
     runs: list[list[Verdict]] = []
     for v in verdicts:
         if runs and _song(runs[-1][-1]) == _song(v):
             runs[-1].append(v)
         else:
             runs.append([v])
-    return sum(any(v.play for v in run) for run in runs) / len(runs) if runs else None
+    states = [{_status(v, calls or {}) for v in run} for run in runs]
+    states = [s for s in states if s != {"talk"}]
+    return sum("correct" in s for s in states) / len(states) if states else None
 
 
 def _song(v: Verdict) -> tuple[str, str, str]:
@@ -565,35 +582,43 @@ def near_miss(
     return max(near, key=lambda n: n[0])[1:] if near else None
 
 
+def near_miss_runs(
+    plays: Sequence[Play],
+    legs: Mapping[str, LegScore],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> list[tuple[dict[str, Any], list[Verdict]]]:
+    """The near-miss queue: each run of wrong emissions that is a near miss, as its row (with its
+    nearest play and an empty ``verdict``, ``correct`` or ``wrong``, for a person to fill) and the run."""
+    by_hour: defaultdict[str, list[Play]] = defaultdict(list)
+    for p in plays:
+        by_hour[p.hour_key].append(p)
+    queued = []
+    for tag, ls in legs.items():
+        for run in wrong_runs(ls.verdicts):
+            if found := near_miss(run, by_hour, references):
+                play, matched_on, emission = found
+                row = {
+                    **run_row(tag, run),
+                    "reference_artists": _tags(emission, references),
+                    "play_id": play.play_id,
+                    "play_carryover": play.carryover,
+                    "play_artist": play.artist,
+                    "play_title": play.title,
+                    "play_album": play.album,
+                    "matched_on": matched_on,
+                    "verdict": "",
+                }
+                queued.append((row, run))
+    return queued
+
+
 def near_miss_rows(
     plays: Sequence[Play],
     legs: Mapping[str, LegScore],
     references: Mapping[str, tuple[str, ...]] | None,
 ) -> list[dict[str, Any]]:
-    """The near-miss queue: each run of wrong emissions that is a near miss, with its nearest
-    play and an empty ``verdict`` (``correct`` or ``wrong``) for a person to fill."""
-    by_hour: defaultdict[str, list[Play]] = defaultdict(list)
-    for p in plays:
-        by_hour[p.hour_key].append(p)
-    rows = []
-    for tag, ls in legs.items():
-        for run in wrong_runs(ls.verdicts):
-            if found := near_miss(run, by_hour, references):
-                play, matched_on, emission = found
-                rows.append(
-                    {
-                        **run_row(tag, run),
-                        "reference_artists": _tags(emission, references),
-                        "play_id": play.play_id,
-                        "play_carryover": play.carryover,
-                        "play_artist": play.artist,
-                        "play_title": play.title,
-                        "play_album": play.album,
-                        "matched_on": matched_on,
-                        "verdict": "",
-                    }
-                )
-    return rows
+    """The rows of :func:`near_miss_runs`."""
+    return [row for row, _ in near_miss_runs(plays, legs, references)]
 
 
 def _steady(run: Sequence[Verdict]) -> bool:
@@ -627,13 +652,14 @@ def _agrees(
     )
 
 
-def false_positive_rows(
+def false_positive_runs(
     plays: Sequence[Play],
     legs: Mapping[str, LegScore],
     references: Mapping[str, tuple[str, ...]] | None,
-) -> list[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], list[Verdict]]]:
     """The flowsheet-false-positive queue: each run of wrong emissions the near-miss queue does not
-    hold, with a ``preflag`` and an empty ``verdict`` (``wrong``, ``unlogged-correct``, or ``talk``).
+    hold, as its row (a ``preflag`` and an empty ``verdict``, ``wrong``, ``unlogged-correct``, or
+    ``talk``) and the run.
 
     The playlist is an imperfect label, so a wrong emission may be a recognizer error, a song the DJ
     played and did not log, or talk over a bed. ``preflag`` is ``likely-unlogged-correct`` when the
@@ -644,7 +670,7 @@ def false_positive_rows(
     by_hour: defaultdict[str, list[Play]] = defaultdict(list)
     for p in plays:
         by_hour[p.hour_key].append(p)
-    rows = []
+    queued = []
     for tag, ls in legs.items():
         others: defaultdict[str, list[Emission]] = defaultdict(list)
         for other, theirs in legs.items():
@@ -656,54 +682,81 @@ def false_positive_rows(
                 continue
             hour = run[0].emission.address.hour_key
             likely = _steady(run) or _agrees(run, others[hour], references)
-            rows.append(
-                {
-                    **run_row(tag, run),
-                    "reference_artists": _tags(run[0].emission, references),
-                    "preflag": LIKELY_UNLOGGED if likely else "",
-                    "verdict": "",
-                }
-            )
+            row = {
+                **run_row(tag, run),
+                "reference_artists": _tags(run[0].emission, references),
+                "preflag": LIKELY_UNLOGGED if likely else "",
+                "verdict": "",
+            }
+            queued.append((row, run))
+    return queued
+
+
+def false_positive_rows(
+    plays: Sequence[Play],
+    legs: Mapping[str, LegScore],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> list[dict[str, Any]]:
+    """The rows of :func:`false_positive_runs`."""
+    return [row for row, _ in false_positive_runs(plays, legs, references)]
+
+
+# What a person may write in a queue's ``verdict`` column, each as the verdict it stands for.
+NEAR_VERDICTS = {"correct": "correct", "wrong": "wrong"}
+FP_VERDICTS = {"wrong": "wrong", "unlogged-correct": "correct", "talk": "talk"}
+VERDICTS = {NEAR_COLUMNS: NEAR_VERDICTS, FP_COLUMNS: FP_VERDICTS}
+KEY_COLUMNS = ("leg", "recognizer", "address", "play_carryover")  # a run, and a near miss's play
+
+
+def _key(row: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(str(row.get(c, "")) for c in KEY_COLUMNS)
+
+
+def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str, ...], str]]:
+    """A queue's rows as ``(row number, key, verdict)``, ``[]`` when ``path`` is absent.
+
+    The row number is the spreadsheet's (the header is row 1). The verdict is what the person's
+    entry stands for (``correct``, ``wrong``, or ``talk``; blank stays ``""``, matched without
+    regard to case and surrounding blanks). ``SystemExit``, one line naming ``path``, when the
+    file is not a queue of this command's (its header, matched without regard to case and past a
+    byte-order mark a spreadsheet adds, is not ``columns``; a JSONL store, another CSV, an empty
+    file), cannot be read, or holds a verdict outside the queue's vocabulary.
+    """
+    allowed = VERDICTS[tuple(columns)]
+    rows = []
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None or [h.strip().lower() for h in header] != list(columns):
+                raise SystemExit(f"{path}: is not a queue of this command's; not overwriting it")
+            for number, cells in enumerate(reader, 2):
+                row = dict(zip(columns, cells, strict=False))
+                entry = row.get("verdict", "").strip()
+                if entry and entry.lower() not in allowed:
+                    raise SystemExit(f"{path}: row {number}: unknown verdict {entry!r}")
+                rows.append((number, _key(row), allowed.get(entry.lower(), "")))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, csv.Error):
+        raise SystemExit(f"{path}: cannot be read; not overwriting it") from None
     return rows
 
 
-def _refusal(path: Path, columns: Sequence[str]) -> str | None:
-    """Why the file at ``path`` must not be overwritten by a queue with ``columns``, or None.
-
-    Only an unfilled queue of this command's own is overwritten: its header (matched without
-    regard to case, and past a byte-order mark a spreadsheet adds) is ``columns`` and no row has
-    a ``verdict``. Anything else, such as a JSONL store, another CSV, an empty file, or a file that
-    cannot be read, is not ours to replace.
-    """
-    try:
-        with path.open(encoding="utf-8-sig", newline="") as f:
-            rows = csv.reader(f)
-            header = next(rows, None)
-            if header is None or [h.strip().lower() for h in header] != list(columns):
-                return "is not an unfilled queue of this command's"
-            verdict = list(columns).index("verdict")
-            if any(len(row) > verdict and row[verdict].strip() for row in rows):
-                return "has verdicts filled in"
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeDecodeError, csv.Error):
-        return "cannot be read"
-    return None
-
-
 def check_queue(path: Path, columns: Sequence[str] = NEAR_COLUMNS) -> None:
-    """``SystemExit``, one line naming ``path``, when :func:`_refusal` says not to overwrite it."""
-    if reason := _refusal(path, columns):
-        raise SystemExit(f"{path}: {reason}; not overwriting (move it, or pass another path)")
+    """``SystemExit`` when :func:`read_queue` refuses the file: the early check, before any work."""
+    read_queue(path, columns)
 
 
 def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
     """Write a queue as UTF-8 CSV with a byte-order mark, so a spreadsheet shows diacritics, and
     its header always, so an empty queue still says what it holds.
 
-    A person's work is never overwritten (:func:`check_queue`): the caller writes nothing else.
+    A person's work is never overwritten: a file with a verdict in it is refused here, and
+    :func:`settle_queue` is what keeps it.
     """
-    check_queue(path, columns)
+    if any(verdict for *_, verdict in read_queue(path, columns)):
+        raise SystemExit(f"{path}: has verdicts filled in; not overwriting it")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, columns)
@@ -711,11 +764,40 @@ def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, 
         writer.writerows(rows)
 
 
+def settle_queue(
+    path: Path, columns: Sequence[str], queued: Sequence[tuple[dict[str, Any], list[Verdict]]]
+) -> dict[str, dict[str, str]]:
+    """Write the queue of ``queued`` runs unless a person has begun filling in the file at ``path``;
+    then keep it, byte for byte, and return each leg's verdicts by emission address.
+
+    A verdict applies to every emission of its run. A filled-in row is matched to a current run by
+    :data:`KEY_COLUMNS`; a row that matches none is logged once, in one line, and ignored, and a
+    current run the file has no row for stays wrong. A blank verdict gives no entry.
+    """
+    rows = read_queue(path, columns)
+    if not any(verdict for *_, verdict in rows):
+        write_queue(path, columns, (row for row, _ in queued))
+        return {}
+    current = {_key(row): (row["leg"], run) for row, run in queued}
+    if stale := [str(n) for n, key, _ in rows if key not in current]:
+        log.warning("%s: no current run matches row(s) %s; ignored", path, ", ".join(stale))
+    if unqueued := current.keys() - {key for _, key, _ in rows}:
+        log.warning("%s: %d current run(s) have no row; they stay wrong", path, len(unqueued))
+    calls: defaultdict[str, dict[str, str]] = defaultdict(dict)
+    for _, key, verdict in rows:
+        if verdict and key in current:
+            tag, run = current[key]
+            calls[tag].update({v.emission.address.key: verdict for v in run})
+    return calls
+
+
 def _play_row(p: Play) -> dict[str, Any]:
     return {f: getattr(p, f) for f in PLAY_FIELDS}
 
 
-def leg_json(leg: Leg, identity: str, ls: LegScore) -> dict[str, Any]:
+def leg_json(
+    leg: Leg, identity: str, ls: LegScore, calls: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     """One leg's entry in the score file, which ``report.py`` reads: figures, coverage, and rows.
 
     ``plays`` are the scored plays; ``carryover_plays`` the carryover plays some emission was
@@ -735,8 +817,8 @@ def leg_json(leg: Leg, identity: str, ls: LegScore) -> dict[str, Any]:
         "unjoinable_plays": ls.unjoinable_plays,
         "precision": precision(ls.verdicts),
         "distinct_precision": distinct_precision(ls.verdicts),
-        "adjudicated_precision": None,
-        "adjudicated_distinct_precision": None,
+        "adjudicated_precision": precision(ls.verdicts, calls),
+        "adjudicated_distinct_precision": distinct_precision(ls.verdicts, calls),
         "pads": {era: p._asdict() for era, p in pads(ls.plays).items()},
         "plays": [
             {
@@ -870,7 +952,7 @@ def main(argv: list[str] | None = None) -> int:
         results = read_results(stores, study_identities(snapshot, args.min_match_count))
         references = dict(reference_artists(snap.db)) if snap else {}
     scored: dict[str, LegScore] = {}
-    entries: dict[str, dict[str, Any]] = {}
+    ran: dict[str, tuple[Leg, str]] = {}
     for leg, who in selected:
         identity = (
             recognizer_identity(leg.length_s)
@@ -880,9 +962,13 @@ def main(argv: list[str] | None = None) -> int:
         addresses = hour_addresses(hours[leg.hours], archive_dir, leg.length_s, leg.profile)
         ls = score_leg(plays, results, identity, leg, hours[leg.hours], addresses, references)
         scored[f"{leg.name}/{who}"] = ls
-        entries[f"{leg.name}/{who}"] = leg_json(leg, identity, ls)
-    write_queue(near_path, NEAR_COLUMNS, near_miss_rows(plays, scored, references))
-    write_queue(fp_path, FP_COLUMNS, false_positive_rows(plays, scored, references))
+        ran[f"{leg.name}/{who}"] = (leg, identity)
+    near = settle_queue(near_path, NEAR_COLUMNS, near_miss_runs(plays, scored, references))
+    fp = settle_queue(fp_path, FP_COLUMNS, false_positive_runs(plays, scored, references))
+    entries = {
+        tag: leg_json(leg, identity, scored[tag], near.get(tag, {}) | fp.get(tag, {}))
+        for tag, (leg, identity) in ran.items()
+    }
     out.parent.mkdir(parents=True, exist_ok=True)
     document = json.dumps({"version": 1, "legs": entries}, ensure_ascii=False, indent=1)
     temp = out.with_name(out.name + ".tmp")  # a complete file, then a rename: never half-written
