@@ -1,15 +1,48 @@
 name: Install ffmpeg
 description: >-
-  Installs ffmpeg from apt with bounded network waits. Acquire::Retries retries a
-  failed fetch and the Timeout options drop a stalled connection, so a stuck
-  mirror fails fast instead of holding the runner to the job's timeout. The
-  caller sets the step's own timeout-minutes as the outer bound.
+  Installs ffmpeg from apt without depending on the mirror for packages it has
+  already fetched. The downloaded .deb files are cached (keyed on the runner
+  image's OS, with a prefix fallback to older debs), and the install is a bounded
+  retry loop with apt retries and connection timeouts, so a stuck mirror fails
+  fast instead of holding the runner to the job's timeout. The caller sets the
+  step's own timeout-minutes as the outer bound.
 runs:
   using: composite
   steps:
+    # A user-owned directory, so the cache can read it and write it back. The
+    # image OS (not the weekly image version) keeps the key stable; an Ubuntu
+    # bump falls back to the older debs and apt fetches only what changed.
+    - shell: bash
+      run: mkdir -p "$HOME/.cache/apt-archives/partial"
+    - uses: actions/cache@v6
+      with:
+        path: ~/.cache/apt-archives
+        key: apt-debs-${{ runner.os }}-${{ env.ImageOS }}-ffmpeg
+        restore-keys: |
+          apt-debs-${{ runner.os }}-${{ env.ImageOS }}-
+          apt-debs-${{ runner.os }}-
     - shell: bash
       run: |
         set -euo pipefail
-        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        archives="$HOME/.cache/apt-archives"
+        apt_opts=(
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30
+          -o "Dir::Cache::Archives=$archives"
+          -o APT::Keep-Downloaded-Packages=true
+          -o APT::Sandbox::User=root
+        )
         sudo apt-get "${apt_opts[@]}" update
-        sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends ffmpeg
+        for attempt in 1 2 3; do
+          if sudo timeout 90 apt-get "${apt_opts[@]}" install -y --no-install-recommends ffmpeg; then
+            break
+          fi
+          echo "apt-get install attempt $attempt failed or timed out" >&2
+          if [ "$attempt" -eq 3 ]; then
+            exit 1
+          fi
+          sudo dpkg --configure -a
+        done
+        # apt ran as root; give the directory back so the cache can save it.
+        sudo chown -R "$(id -u):$(id -g)" "$archives"
