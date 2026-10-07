@@ -19,21 +19,17 @@ _CRUFT = re.compile(
     r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
-# An unbracketed featuring credit: "feat.", "ft." or "featuring" after some text, with a word
-# after it, and the words that follow. A bare "feat" or "ft" is a word ("Little Feat"), and so
-# is "ft." after a number, digits or a word ("50 Ft. Queenie", "Six Ft. Under"); "with" is a
-# title word. The credit stops before any bracket, opening or closing, ASCII or full-width (the
-# exact keys are not folded), and before a spaced hyphen, en dash or em dash, so a clause or
-# suffix that follows it, or holds it, is still there for the version rules to read.
+# An unbracketed featuring credit: "feat." (with the period) or "featuring" after some text,
+# with a word after it, and the words that follow. A bare "feat" is a word ("Little Feat"), and
+# "with" is a title word. "ft." is not handled here: the pool carries it inline nowhere, and it
+# is feet and Fort as often as featuring ("Six Ft. Under", "Ft. Worth"); the bracketed rule
+# still drops "(ft. X)". The credit stops before any bracket, opening or closing, ASCII or
+# full-width (the exact keys are not folded), and before a spaced hyphen, en dash or em dash,
+# so a clause or suffix that follows it, or holds it, is still there for the version rules.
 _CLOSERS = ")]}\uff09\uff3d\uff5d"
 _BRACKETS = re.escape("([{\uff08\uff3b\uff5b" + _CLOSERS)
-_NUMBER_WORDS = (
-    "zero one two three four five six seven eight nine ten eleven twelve twenty thirty forty"
-    " fifty sixty seventy eighty ninety hundred thousand".split()
-)
-_FEET = "".join(rf"(?<!\b{w})" for w in _NUMBER_WORDS)
 _CREDIT = re.compile(
-    rf"(?:(?<=\S)\s+(?:feat\.|featuring\b)|(?<=[^\s\d]){_FEET}\s+ft\.)\s+(?=\w)"
+    rf"(?<=\S)\s+(?:feat\.|featuring\b)\s+(?=\w)"
     rf"[^{_BRACKETS}]*?(?=\s[-\u2010-\u2015]\s|[{_BRACKETS}]|$)",
     re.IGNORECASE,
 )
@@ -103,8 +99,8 @@ def album_key(s: str | None) -> str:
     Version)" and "(Remastered 2011 Version)" go, "(Bonus Live Track)" stays. Only ASCII
     ``(...)`` and ``[...]`` clauses are seen: the fuzzy keys fold full-width brackets first.
 
-    An unbracketed credit goes too (:data:`_CREDIT`): "Hibiscus Feat. Bbyafricka" keys as
-    "hibiscus", but "Dancing with Myself", "Featuring Ourselves" and "Theft" are untouched,
+    An unbracketed "feat." or "featuring" credit goes too (:data:`_CREDIT`; "ft." does not):
+    "Hibiscus Feat. Bbyafricka" keys as "hibiscus", but "Dancing with Myself", "Featuring Ourselves" and "Theft" are untouched,
     and a version after the credit ("Hibiscus feat. X (Live)") is kept.
     """
 
