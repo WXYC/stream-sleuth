@@ -168,8 +168,14 @@ def _snapshot_home(home: str | Path) -> Path:
         resolved = require_outside_checkout(path)
     except DataPathError as exc:
         raise OlafError(f"the snapshot directory: {exc}") from exc
-    # By file identity, not spelling: a mis-cased or firmlinked home is still the home.
-    if resolved.exists() and os.path.samefile(resolved, Path.home()):
+    # By file identity when both exist, so a mis-cased or firmlinked home is still the
+    # home; by resolved spelling otherwise (e.g. $HOME names a missing directory).
+    home_dir = Path.home()
+    if resolved.exists() and home_dir.exists():
+        is_home = os.path.samefile(resolved, home_dir)
+    else:
+        is_home = resolved == home_dir.resolve()
+    if is_home:
         raise OlafError(
             f"the snapshot directory {path} is the home directory, whose ~/.olaf is never touched"
         )
