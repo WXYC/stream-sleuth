@@ -17,6 +17,7 @@ import pytest
 from evaluation import run as run_mod
 from evaluation import shazam_eval
 from evaluation.olaf_snapshot import (
+    BUILDING,
     MARKER,
     RESULTS,
     SnapshotError,
@@ -292,6 +293,40 @@ def test_a_snapshot_that_is_not_marked_built_is_refused_before_the_shazam_lock(
     assert fake.requests == []
     assert not (home / RESULTS).exists()
     assert not (data / "shazam" / "throttle.json.lock").exists()  # the lock was never taken
+
+
+def test_a_snapshot_with_an_unfinished_build_is_refused_even_with_a_stale_marker(
+    data: Path, fake: FakeShazam
+) -> None:
+    home = _snapshot(data)
+    (home / BUILDING).write_text("")
+    for argv in (["--snapshot", "rotation"], ["--only", "olaf", "--snapshot", "rotation"]):
+        with pytest.raises(SystemExit, match="interrupted") as error:
+            main([*argv, "--base-url", fake.url])
+        assert "\n" not in str(error.value)
+    assert fake.requests == []
+    assert not (home / RESULTS).exists()
+    assert not (data / "shazam" / "throttle.json.lock").exists()
+
+
+def test_the_marker_is_checked_under_the_snapshot_lock(
+    data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _snapshot(data)
+    real = run_mod.require_built
+    held: list[bool] = []
+
+    def check_lock_is_held(path: Path) -> dict:
+        with pytest.raises(SnapshotError, match="another"):  # the run already holds the lock
+            with snapshot_lock(path):
+                pass
+        held.append(True)
+        return real(path)
+
+    monkeypatch.setattr(run_mod, "require_built", check_lock_is_held)
+    assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
+    assert held == [True]
+    assert (home / RESULTS).exists()
 
 
 def test_a_run_logs_how_many_files_the_build_failed(
