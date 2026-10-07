@@ -30,6 +30,7 @@ from tests.unit.test_score import (
     OTHER,
     PRATT,
     RECORDS,
+    SHAZAM,
     STAGE,
     _found,
     _hit,
@@ -385,6 +386,77 @@ def test_a_near_miss_under_olaf_references_names_every_artist_tag_of_its_file() 
     assert not near_misses([emission])
 
 
+def local_emission(track: tuple[str, str, str], at: float) -> Emission:
+    """An Olaf emission of ``track`` whose reference file is ``STAGE``."""
+    address = ClipAddress(HOUR, int(at), 12)
+    found = _found(track, at) | {"source": "local", "confidence": 40.0, "ref_key": STAGE}
+    return Emission((address.key, OLAF), address, found)
+
+
+ARTISTS = "Chuquimamani Condori Jessica Pratt Hermanos Gutierrez Duo"  # seven tokens
+
+
+def test_the_similarity_counts_the_artist_tokens_and_not_the_title_alone() -> None:
+    """Titles alone overlap at 2/3; with the artists the token sets overlap at 9/11."""
+    records = one_play(ARTISTS, "Call Name")
+
+    [row] = near_misses([_hit((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
+
+    assert row["matched_on"] == "similarity"
+
+
+def test_the_similarity_of_an_olaf_match_is_taken_over_every_artist_tag_of_its_file() -> None:
+    records = one_play(ARTISTS, "Call Name")
+    emission = local_emission(("Mislabeled Tag", "Call Name Again", ""), 195.0)
+
+    [row] = near_misses([emission], records, {STAGE: (f"{ARTISTS} Jr",)})
+
+    assert (row["matched_on"], row["reference_artists"]) == ("similarity", f"{ARTISTS} Jr")
+    assert not near_misses([emission], records)
+
+
+def test_more_shared_fields_win_over_more_similar_tokens() -> None:
+    """The first play shares no field but is the more similar; the second shares the artist."""
+    records = one_play(ARTISTS, "Call Name", (2, 200.0, f"{ARTISTS} Jr", "Something Else"))
+
+    [row] = near_misses([_hit((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
+
+    assert (row["play_id"], row["matched_on"]) == (2, "artist")
+
+
+def test_a_play_that_shares_both_fields_but_not_its_album_version_names_both() -> None:
+    records = _hour(
+        HOUR, "canonical", (1, 120.0, ("Juana Molina", "la paradoja", "DOGA (Live)"), {})
+    )
+
+    [row] = near_misses([_hit(MOLINA, 195.0)], records)
+
+    assert row["matched_on"] == "artist+title"
+
+
+def test_a_row_names_the_run_the_play_and_what_an_olaf_match_was_made_on() -> None:
+    emission = local_emission(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
+
+    [row] = near_misses([emission], references={STAGE: ("Juana Molina", "Duo Tag")})
+
+    assert (row["recognizer"], row["reference_artists"], row["play_carryover"]) == (
+        OLAF,
+        "Juana Molina | Duo Tag",
+        False,
+    )
+
+
+def test_a_shazam_row_has_no_reference_artists_and_a_carryover_play_says_so() -> None:
+    [row] = near_misses([_hit(("Hermanos Gutiérrez", "Otra Cancion", ""), 30.0)])
+
+    assert (row["recognizer"], row["play_id"], row["play_carryover"], row["reference_artists"]) == (
+        SHAZAM,
+        100,
+        True,
+        "",
+    )
+
+
 def test_consecutive_wrong_emissions_of_one_song_are_one_row_with_archive_times() -> None:
     other = ("Juana Molina", "Otra Cancion", "DOGA")
     hits = [_hit(other, at) for at in (195.0, 210.0, 225.0)]
@@ -401,11 +473,15 @@ def test_consecutive_wrong_emissions_of_one_song_are_one_row_with_archive_times(
 
 
 def read_queue(path: Path) -> list[dict[str, str]]:
-    with path.open(encoding="utf-8", newline="") as f:
+    with path.open(encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
 
 QUEUE = "score/near_misses.csv"
+HEADER = (
+    "leg,recognizer,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
+    "reference_artists,play_id,play_carryover,play_artist,play_title,play_album,matched_on,verdict"
+)
 OTHER_SONG = ("Juana Molina", "Otra Canción", "DOGA")
 
 
@@ -417,10 +493,7 @@ def test_the_cli_writes_the_near_miss_queue_with_an_empty_verdict_column(data: P
     run_cli(data)
 
     path = data / QUEUE
-    assert path.read_text(encoding="utf-8").splitlines()[0] == (
-        "leg,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
-        "play_id,play_artist,play_title,play_album,matched_on,verdict"
-    )
+    assert path.read_text(encoding="utf-8-sig").splitlines()[0] == HEADER
     [row] = read_queue(path)
     assert (row["leg"], row["emissions"], row["song"], row["play_id"], row["verdict"]) == (
         "12s/shazam",
@@ -429,6 +502,33 @@ def test_the_cli_writes_the_near_miss_queue_with_an_empty_verdict_column(data: P
         "1",
         "",
     )
+
+
+def test_the_queue_is_utf_8_with_a_byte_order_mark_and_is_rewritten_by_the_next_run(
+    data: Path,
+) -> None:
+    song = ("Hermanos Gutiérrez", "Otra Canción", "")
+    add_shazam(data, ClipAddress(HOUR, 30, 12), song)
+    run_cli(data)
+    queue = data / QUEUE
+
+    first = queue.read_bytes()
+    [row] = read_queue(queue)
+    run_cli(data)
+
+    assert first.startswith(b"\xef\xbb\xbf")
+    assert "Otra Canción".encode() in first and row["artist"] == "Hermanos Gutiérrez"
+    assert queue.read_bytes() == first
+
+
+def test_the_queue_defaults_to_the_directory_of_the_score_file(data: Path) -> None:
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
+    out = data / "elsewhere" / "shazam-only.json"
+
+    run_cli(data, "--out", str(out))
+
+    assert [r["leg"] for r in read_queue(out.parent / "near_misses.csv")] == ["12s/shazam"]
+    assert not (data / "score").exists()
 
 
 def fill_verdict(path: Path, verdict: str) -> bytes:
@@ -472,11 +572,7 @@ def test_a_queue_with_no_verdict_is_rewritten(data: Path) -> None:
     assert len(read_queue(queue)) == 1
 
 
-HEADER = (
-    "leg,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
-    "play_id,play_artist,play_title,play_album,matched_on,verdict"
-)
-ROW = "12s/shazam,a,b,1,h,0:00:00,0:00:12,shazam,x,y,z,1,p,q,r,artist"
+ROW = "12s/shazam,rec,a,b,1,h,0:00:00,0:00:12,shazam,x,y,z,,1,False,p,q,r,artist"
 BOM = b"\xef\xbb\xbf"
 NOT_OURS = [
     pytest.param(
@@ -514,7 +610,7 @@ def test_a_header_only_queue_of_ours_is_rewritten(data: Path, prefix: str) -> No
 
     run_cli(data)
 
-    assert queue.read_text(encoding="utf-8").splitlines()[0] == HEADER
+    assert queue.read_text(encoding="utf-8-sig").splitlines()[0] == HEADER
 
 
 def inputs(data: Path) -> dict[str, Path]:
