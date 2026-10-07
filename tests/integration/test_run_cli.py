@@ -6,7 +6,6 @@ Hours are 20 s of sine, so each holds one 12 s clip and one 6 s clip (at 0 s).
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -15,6 +14,7 @@ import pytest
 from evaluation import run as run_mod
 from evaluation.run import main
 from stream_sleuth.paths import CHECKOUT, DataPathError
+from tests.audio import render
 from tests.characterization.shazam_responses import NO_MATCH
 from tests.shazam_fake import FakeShazam, json_response
 
@@ -36,11 +36,7 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key in (HOUR, OTHER):
         path = tmp_path / "data" / "archive" / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
-             "-c:a", "libmp3lame", "-b:a", "128k", str(path)],
-            check=True,
-        )  # fmt: skip
+        render(path, 20, args=["-c:a", "libmp3lame", "-b:a", "128k"])
     labels = {
         HOUR: {"group": "contrast", "band": "evening", "subset": True},
         OTHER: {"group": "contrast", "band": "evening", "subset": False},

@@ -7,8 +7,6 @@ then tagged with mutagen, the way the station's files were tagged.
 
 from __future__ import annotations
 
-import subprocess
-
 import pytest
 from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4
@@ -18,6 +16,7 @@ from mutagen.mp3 import EasyMP3
 from mutagen.wave import WAVE
 
 from evaluation import pool
+from tests.audio import render
 
 pytestmark = pytest.mark.ffmpeg
 
@@ -72,22 +71,7 @@ FORMATS = {
 def test_each_reader_returns_the_tags_and_stream_info(tmp_path, fmt):
     extension, args, tag = FORMATS[fmt]
     path = tmp_path / f"fixture{extension}"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=3",
-            "-ac",
-            "2",
-            *args,
-            str(path),
-        ],
-        check=True,
-    )
+    render(path, 3, args=["-ac", "2", *args])
     tag(path)
 
     assert pool.FORMATS[extension] == fmt
@@ -108,20 +92,7 @@ def test_each_reader_returns_the_tags_and_stream_info(tmp_path, fmt):
 def test_an_untagged_file_reads_as_no_tags(tmp_path, fmt):
     extension, args, _ = FORMATS[fmt]
     path = tmp_path / f"untagged{extension}"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=duration=2",
-            *args,
-            str(path),
-        ],
-        check=True,
-    )
+    render(path, 2, args=args)
 
     tags = pool.read_tags(path, fmt)
 

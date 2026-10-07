@@ -8,11 +8,12 @@ the replay knows each hour's length and stops its clock there.
 from __future__ import annotations
 
 import importlib
-import subprocess
 import wave
 from dataclasses import dataclass
 
 import pytest
+
+from tests.audio import render
 
 pytestmark = pytest.mark.ffmpeg
 
@@ -36,12 +37,7 @@ def sources(fresh_recognizer):
 @pytest.fixture(scope="module")
 def tone(tmp_path_factory):
     path = tmp_path_factory.mktemp("audio") / "Jessica Pratt - Back, Baby.mp3"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency=440:duration={TONE_SECONDS}",
-         "-ac", "2", "-ar", "44100", str(path)],
-        check=True,
-    )  # fmt: skip
-    return path
+    return render(path, TONE_SECONDS, args=["-ac", "2", "-ar", "44100"])
 
 
 @pytest.mark.parametrize(

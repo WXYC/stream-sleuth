@@ -13,19 +13,18 @@ import subprocess
 
 import pytest
 
+from tests.audio import render
+
 pytestmark = pytest.mark.olaf
 
 # Read before fresh_recognizer clears every STREAM_SLEUTH_* variable.
 OLAF_BIN = os.environ.get("STREAM_SLEUTH_OLAF_BIN") or "olaf"
 
 
-def render(path, seed):
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"anoisesrc=d=60:c=pink:seed={seed}:a=0.5",
-         "-ac", "1", "-ar", "16000", str(path)],
-        check=True,
-    )  # fmt: skip
-    return path
+def noise_reference(path, seed):
+    return render(
+        path, (f"anoisesrc=c=pink:seed={seed}:a=0.5", 60), args=["-ac", "1", "-ar", "16000"]
+    )
 
 
 @pytest.fixture
@@ -35,8 +34,8 @@ def olaf(fresh_recognizer):
 
 
 def test_a_128_kbps_cut_of_a_stored_reference_is_found_at_its_offset(olaf, tmp_path):
-    molina = render(tmp_path / "molina.wav", seed=11)
-    pratt = render(tmp_path / "pratt.wav", seed=22)
+    molina = noise_reference(tmp_path / "molina.wav", seed=11)
+    pratt = noise_reference(tmp_path / "pratt.wav", seed=22)
     recognizer = olaf.OlafRecognizer(tmp_path / "snapshot", olaf_bin=OLAF_BIN)
     recognizer.store(
         [(str(molina), "juana-molina-la-paradoja"), (str(pratt), "jessica-pratt-back-baby")]
@@ -62,7 +61,7 @@ def test_index_build_cli_fills_a_snapshot_a_query_can_read(fresh_recognizer, tmp
     fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
     cli = importlib.import_module("stream_sleuth.cli")
     olaf = importlib.import_module("stream_sleuth.recognizers.olaf")
-    ref = render(tmp_path / "gutierrez.wav", seed=33)
+    ref = noise_reference(tmp_path / "gutierrez.wav", seed=33)
     home = tmp_path / "snapshot"
     argv = [
         "index",
