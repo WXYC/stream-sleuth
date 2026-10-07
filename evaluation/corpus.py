@@ -43,17 +43,16 @@ EXCLUDED_DAYS = {date(2026, 8, 9), date(2026, 8, 10), date(2026, 8, 11)}
 PADS = {"canonical": 180.0, "etl": 220.0}
 MIN_TRACKS = 8
 MIN_MEDIAN_GAP_S = 90.0  # batch-logged hours log tracks seconds apart
-MAX_TALK_HOUR_TRACKS = 3
 # Time-of-day bands by the hour's America/New_York start, and the plan §5.2 corpus:
-# 12 high-share and 4 low-share canonical DJ hours per band quota, 4 contrast hours
-# from 2022-2024, 2 talk-heavy hours.
+# 12 high-share and 4 low-share canonical DJ hours per band quota, and 4 contrast
+# hours from 2022-2024, at most one per show. No talk-hour group: WXYC plays music
+# every hour, and its talkset rows are DJ mic breaks inside music hours.
 BANDS = {"overnight": range(0, 6), "daytime": range(6, 18), "evening": range(18, 24)}
 HIGH_QUOTAS = {"daytime": 5, "evening": 4, "overnight": 3}
 LOW_QUOTAS = {"daytime": 2, "evening": 1, "overnight": 1}
 LOW_SHARE_MAX = 0.10
 CONTRAST_YEARS = (2022, 2023, 2024)
 CONTRAST_HOURS = 4
-TALK_HOURS = 2
 TALK_TYPES = {"talkset", "message"}
 
 _TIME = re.compile(r"(.{19})(?:\.(\d+))?([+-]\d{2})(?::?(\d{2}))?")
@@ -243,13 +242,15 @@ class Flowsheet:
 
 @dataclass(frozen=True)
 class HourStats:
+    """One hour's selection inputs; ``shows`` holds the show of every track row in it."""
+
     key: str
     era: str
     track_rows: int
-    talk_rows: int
     in_pool: int
     median_gap_s: float
     reorder_flagged: bool
+    shows: frozenset[str] = frozenset()
 
 
 def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
@@ -260,11 +261,12 @@ def hour_stats(sheet: Flowsheet, pool: PoolIndex) -> dict[str, HourStats]:
         times = [r.add_time.timestamp() for r in tracks]
         gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
         stats[key] = HourStats(
-            key, sheet.era(hour_start(key)), len(tracks), sum(r.entry_type in TALK_TYPES for r in rows),
+            key, sheet.era(hour_start(key)), len(tracks),
             sum(pool.tier(r.artist, r.album, r.title) is not None for r in tracks),
             statistics.median(gaps) if gaps else 0.0,
             any(sheet.order_status.get(r.show_id, ("unreliable", None))[1]
                 for r in tracks if sheet.era(r.add_time) == "canonical"),
+            frozenset(r.show_id for r in tracks if r.show_id),
         )  # fmt: skip
     return stats
 
@@ -294,16 +296,6 @@ def select_hours(stats: dict[str, HourStats], *, era: str, target: int) -> list[
     return chosen
 
 
-def select_talk_hours(stats: dict[str, HourStats], *, count: int) -> list[str]:
-    """Hours with the most talkset/message rows and at most three track rows."""
-    talk = [
-        h
-        for h in stats.values()
-        if _eligible(h) and h.talk_rows and h.track_rows <= MAX_TALK_HOUR_TRACKS
-    ]
-    return [h.key for h in sorted(talk, key=lambda h: (-h.talk_rows, h.key))[:count]]
-
-
 def band(key: str) -> str:
     """The time-of-day band of an hour key's Eastern start."""
     hour = hour_start(key).astimezone(EASTERN).hour
@@ -314,10 +306,16 @@ def band(key: str) -> str:
 class Selection:
     """Chosen hour keys -> ``(group, band)`` in selection order, and every shortfall.
 
+    Groups are ``canonical-high`` (12), ``canonical-low`` (4) and ``contrast`` (4):
+    20 hours when nothing is short. Contrast hours come from distinct shows; an hour
+    belongs to the show of every track row in it, so an hour spanning two shows
+    blocks both.
+
     A ``<group>/<band>`` shortfall was relaxed: filled from the group's other bands.
-    A ``contrast/<year>`` shortfall was relaxed too: that year had no eligible hour,
-    so its slot went to the next best hour from the other contrast years, if one was
-    left. Only ``<group>/unfilled`` counts hours that could not be found at all.
+    A ``contrast/<year>`` shortfall was relaxed too: that year had no eligible hour
+    from an unused show, so its slot went to the next best hour from the other
+    contrast years, if one was left. Only ``<group>/unfilled`` counts hours that
+    could not be found at all; the one-per-show cap is never relaxed to fill one.
     """
 
     hours: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -362,8 +360,29 @@ def _fill(sel: Selection, candidates: list[HourStats], quotas: dict[str, int], g
     )
 
 
+def _contrast(sel: Selection, old: list[HourStats]) -> None:
+    """Up to ``CONTRAST_HOURS`` hours, the best share per year first, one per show."""
+    used: set[str] = set()
+
+    def pick(ranked: Iterable[HourStats]) -> int:
+        h = next((h for h in ranked if h.key not in sel.hours and not h.shows & used), None)
+        if h is None:
+            return 0
+        used.update(h.shows)
+        return sel.take([h], "contrast")
+
+    chosen = 0
+    for year in CONTRAST_YEARS:
+        got = pick(h for h in old if h.key.startswith(str(year)))
+        sel.short(f"contrast/{year}", 1 - got)
+        chosen += got
+    while chosen < CONTRAST_HOURS and pick(old):
+        chosen += 1
+    sel.short("contrast/unfilled", CONTRAST_HOURS - chosen)
+
+
 def select_corpus(stats: dict[str, HourStats]) -> Selection:
-    """The plan §5.2 corpus: stratified canonical DJ hours, contrast hours, talk hours.
+    """The plan §5.2 corpus: stratified canonical DJ hours and contrast hours.
 
     Canonical hours never come from the ``etl`` era, however thin a band is.
     """
@@ -376,18 +395,7 @@ def select_corpus(stats: dict[str, HourStats]) -> Selection:
     _fill(sel, low, LOW_QUOTAS, "canonical-low")
     old = sorted((h for h in stats.values() if h.era == "etl" and _dj(h)
                   and hour_start(h.key).astimezone(EASTERN).year in CONTRAST_YEARS), key=_by_share)  # fmt: skip
-    for year in CONTRAST_YEARS:
-        sel.short(
-            f"contrast/{year}",
-            1 - sel.take([h for h in old if h.key.startswith(str(year))][:1], "contrast"),
-        )
-    chosen = sum(g == "contrast" for g, _ in sel.hours.values())
-    chosen += sel.take(
-        [h for h in old if h.key not in sel.hours][: CONTRAST_HOURS - chosen], "contrast"
-    )
-    sel.short("contrast/unfilled", CONTRAST_HOURS - chosen)
-    talk = select_talk_hours(stats, count=TALK_HOURS)
-    sel.short("talk/unfilled", TALK_HOURS - sel.take([stats[k] for k in talk], "talk"))
+    _contrast(sel, old)
     for name, missing in sel.shortfalls.items():
         log.warning("selection shortfall %s: %d", name, missing)
     log.info("selected %d hours", len(sel.hours))

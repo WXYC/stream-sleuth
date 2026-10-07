@@ -542,18 +542,18 @@ def hour_rows(
 def test_hour_stats_counts_and_median_gap(tmp_path: Path, pool_db: Path) -> None:
     rows = hour_rows(1, 20, 4, 200.0, artist="Juana Molina", album="DOGA")
     rows += hour_rows(10, 20, 4, 200.0)  # out of pool, interleaved in time below
-    rows[4:] = [row(10 + i, ts(20, second=160 + i * 200.0)) for i in range(4)]
-    rows.append(row(50, ts(20, 50), "talkset"))
+    rows[4:] = [row(10 + i, ts(20, second=160 + i * 200.0), show_id=2) for i in range(4)]
+    rows.append(row(50, ts(20, 50), "talkset", show_id=3))  # a show's mic break, not its track
     export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
     flowsheet = corpus.Flowsheet.load(export)
     stats = corpus.hour_stats(flowsheet, corpus.PoolIndex.load(pool_db))
     h = stats["2026/08/12/202608121600.mp3"]
-    assert (h.era, h.track_rows, h.talk_rows, h.in_pool, h.median_gap_s) == (
+    assert (h.era, h.track_rows, h.in_pool, h.median_gap_s, h.shows) == (
         "canonical",
         8,
-        1,
         4,
         100.0,
+        frozenset({"1", "2"}),
     )
 
 
@@ -603,21 +603,6 @@ def test_select_hours_ranks_by_in_pool_and_applies_rules(tmp_path: Path, pool_db
     assert corpus.select_hours(stats, era="etl", target=5) == []
 
 
-def test_select_talk_hours(tmp_path: Path, pool_db: Path) -> None:
-    rows = [row(1, ts(20, 5), "talkset"), row(2, ts(20, 10), "talkset"), row(3, ts(20, 20))]
-    rows += [row(10 + i, ts(21, 5 + i), "talkset") for i in range(3)]
-    rows += [row(20 + i, ts(22, 1 + i), "show_start") for i in range(9)]  # markers are not talk
-    rows += [row(40 + i, ts(23, i * 5)) for i in range(4)] + [
-        row(50 + i, ts(23, 30 + i), "talkset") for i in range(5)
-    ]
-    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
-    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
-    assert corpus.select_talk_hours(stats, count=2) == [
-        "2026/08/12/202608121700.mp3",
-        "2026/08/12/202608121600.mp3",
-    ]
-
-
 def test_select_hours_deprioritizes_reorder_flagged_shows(tmp_path: Path, pool_db: Path) -> None:
     pooled: dict[str, Any] = {"artist": "Juana Molina", "album": "DOGA"}
     flagged = hour_rows(100, 20, 8, 200.0, show_id=1, **pooled)
@@ -643,9 +628,11 @@ def test_hour_stats_summarizes_show_less_tracks_as_unflagged(tmp_path: Path, poo
 def stat(
     key: str, *, era: str = "canonical", tracks: int = 10, in_pool: int = 5, **kw: Any
 ) -> corpus.HourStats:
+    """An hour's stats; unless ``shows`` is given, the hour is its own show."""
     return corpus.HourStats(
-        key, era, tracks, kw.get("talk", 0), in_pool, kw.get("gap", 200.0), kw.get("flagged", False)
-    )
+        key, era, tracks, in_pool, kw.get("gap", 200.0), kw.get("flagged", False),
+        frozenset(kw.get("shows", {key})),
+    )  # fmt: skip
 
 
 def keys_in(day: int, hours: range, month: int = 9, year: int = 2026) -> list[str]:
@@ -691,7 +678,7 @@ def test_select_corpus_fills_band_quotas_exactly() -> None:
     expected = {("canonical-high", b): q for b, q in corpus.HIGH_QUOTAS.items()}
     expected |= {("canonical-low", b): q for b, q in corpus.LOW_QUOTAS.items()}
     assert counts == expected
-    assert sel.shortfalls["contrast/unfilled"] == 4 and sel.shortfalls["talk/unfilled"] == 2
+    assert sel.shortfalls["contrast/unfilled"] == 4
     assert {k: v for k, v in sel.shortfalls.items() if k.startswith("canonical")} == {}
 
 
@@ -819,13 +806,6 @@ def test_excluded_days_are_eastern_dates_for_dj_hours(key: str, eligible: bool) 
     assert selected == ([key] if eligible else [])
 
 
-@pytest.mark.parametrize(("key", "eligible"), EXCLUDED_DAY_EDGES)
-def test_excluded_days_are_eastern_dates_for_talk_hours(key: str, eligible: bool) -> None:
-    sel = corpus.select_corpus({key: stat(key, era=era_of(key), tracks=2, talk=5, in_pool=0)})
-    assert (key in sel.hours) is eligible
-    assert (sel.shortfalls.get("talk/unfilled") == 1) is eligible
-
-
 def test_select_corpus_skips_ineligible_hours() -> None:
     stats = {
         k: stat(k, tracks=7) if i == 0 else stat(k, gap=30.0) if i == 1 else stat(k)
@@ -852,12 +832,85 @@ def test_select_corpus_contrast_one_per_year_then_best_remaining() -> None:
     assert sel.shortfalls["contrast/2023"] == 1
 
 
-def test_select_corpus_talk_hours_and_no_duplicates() -> None:
-    stats = plenty()
-    stats |= {
-        k: stat(k, tracks=2, talk=6 - i, in_pool=0)
-        for i, k in enumerate(keys_in(20, range(10, 13)))
+def contrast(sel: corpus.Selection) -> list[str]:
+    return [k for k, (g, _) in sel.hours.items() if g == "contrast"]
+
+
+def contrast_shortfalls(sel: corpus.Selection) -> dict[str, int]:
+    return {k: v for k, v in sel.shortfalls.items() if k.startswith("contrast")}
+
+
+def test_select_corpus_contrast_takes_at_most_one_hour_per_show() -> None:
+    # Two high-share hours from one 2023 show: only the better one is chosen.
+    best, same_show, other_show = keys_in(5, range(10, 13), year=2023)
+    stats = {
+        best: stat(best, era="etl", in_pool=9, shows={"7"}),
+        same_show: stat(same_show, era="etl", in_pool=8, shows={"7"}),
+        other_show: stat(other_show, era="etl", in_pool=2, shows={"8"}),
     }
     sel = corpus.select_corpus(stats)
-    assert [k for k, (g, _) in sel.hours.items() if g == "talk"] == keys_in(20, range(10, 12))
-    assert len(sel.hours) == 16 + 2
+    assert contrast(sel) == [best, other_show]
+    assert contrast_shortfalls(sel) == {
+        "contrast/2022": 1,
+        "contrast/2024": 1,
+        "contrast/unfilled": 2,
+    }
+
+
+def test_select_corpus_records_a_contrast_shortfall_when_shows_run_out() -> None:
+    # One show across all three years: one hour, and the cap is never relaxed.
+    first = keys_in(5, range(10, 11), year=2022)[0]
+    stats = {first: stat(first, era="etl", in_pool=9, shows={"7"})}
+    stats |= {
+        k: stat(k, era="etl", in_pool=8, shows={"7"}) for k in keys_in(5, range(10, 12), year=2023)
+    }
+    stats |= {
+        k: stat(k, era="etl", in_pool=8, shows={"7"}) for k in keys_in(5, range(10, 12), year=2024)
+    }
+    sel = corpus.select_corpus(stats)
+    assert contrast(sel) == [first]
+    assert contrast_shortfalls(sel) == {
+        "contrast/2023": 1,
+        "contrast/2024": 1,
+        "contrast/unfilled": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("ranked", "chosen"),
+    [
+        # The two-show hour ranks first: it blocks an hour from either show.
+        ([{"7", "8"}, {"7"}, {"8"}, {"9"}], [0, 3]),
+        # An hour of show 7 ranks first: the two-show hour holds show 7 too.
+        ([{"7"}, {"7", "8"}, {"8"}, {"9"}], [0, 2, 3]),
+    ],
+    ids=["spanning-first", "spanning-second"],
+)
+def test_select_corpus_contrast_hour_spanning_two_shows_belongs_to_both(
+    ranked: list[set[str]], chosen: list[int]
+) -> None:
+    keys = keys_in(5, range(10, 14), year=2023)
+    stats = {
+        k: stat(k, era="etl", in_pool=9 - i, shows=s)
+        for i, (k, s) in enumerate(zip(keys, ranked, strict=True))
+    }
+    sel = corpus.select_corpus(stats)
+    assert contrast(sel) == [keys[i] for i in chosen]
+    assert sel.shortfalls["contrast/unfilled"] == corpus.CONTRAST_HOURS - len(chosen)
+
+
+def test_select_corpus_is_twenty_hours_with_no_shortfall() -> None:
+    stats = plenty()
+    stats |= {
+        k: stat(k, era="etl", in_pool=3, shows={f"{year}"})
+        for year in corpus.CONTRAST_YEARS
+        for k in keys_in(5, range(10, 12), year=year)
+    }
+    stats |= {
+        k: stat(k, era="etl", in_pool=2, shows={"2023b"})
+        for k in keys_in(6, range(10, 11), year=2023)
+    }
+    sel = corpus.select_corpus(stats)
+    assert len(sel.hours) == 20 and sel.shortfalls == {}
+    assert len(contrast(sel)) == 4
+    assert len(set().union(*(stats[k].shows for k in contrast(sel)))) == 4
