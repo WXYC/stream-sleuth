@@ -302,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     require_pinned_shazamio()
+    budget = budget_from_env()  # refused here, before any path is created
     data = data_dir()
     work_dir = require_outside_checkout(args.work_dir or data / "clips")
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")
@@ -311,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (work_dir, store.path.parent, state.parent):
         directory.mkdir(parents=True, exist_ok=True)
     preflight(work_dir)
-    with Throttle(state, *budget_from_env()) as throttle:  # held until every leg has run
+    with Throttle(state, *budget) as throttle:  # held until every leg has run
         client = CountingClient(throttle, base_url=args.base_url)
         legs = [leg for leg in LEGS if not args.legs or leg.name in args.legs]
         report = run_legs(legs, hours, archive_dir, work_dir, store, client)

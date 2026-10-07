@@ -870,6 +870,73 @@ def test_a_cli_on_another_shazamio_version_refuses_before_the_lock_or_any_reques
     assert not (tmp_path / "data").exists()
 
 
+RATE = "STREAM_SLEUTH_SHAZAM_RATE_PER_DAY"
+INTERVAL = "STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S"
+BAD_BUDGETS = [
+    *[(RATE, v) for v in ("500/day", "", " ", "5.5", "1e3", "nan", "inf", "-1", "0", "9" * 400)],
+    *[(INTERVAL, v) for v in ("20s", "", "nan", "NaN", "inf", "-inf", "-20", "-0.5", "1e999")],
+]
+
+
+@pytest.mark.parametrize(("name", "value"), BAD_BUDGETS)
+def test_a_malformed_non_finite_or_out_of_range_budget_is_refused_by_name_in_one_line(
+    name: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit) as refusal:
+        shazam_eval.budget_from_env()
+    message = str(refusal.value)
+    assert message.startswith(f"{name}={value!r}: must be ")
+    assert "\n" not in message
+    assert "Traceback" not in message
+
+
+@pytest.mark.parametrize(
+    ("rate", "interval", "expected"),
+    [
+        ("1", "0", (1, 0.0)),
+        ("500", "20", (500, 20.0)),
+        (" 7 ", "0.25", (7, 0.25)),
+        ("3", "1e1", (3, 10.0)),
+    ],
+)
+def test_valid_budgets_are_read_as_before_and_an_interval_of_zero_is_allowed(
+    rate: str, interval: str, expected: tuple[int, float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(RATE, rate)
+    monkeypatch.setenv(INTERVAL, interval)
+    assert shazam_eval.budget_from_env() == expected
+
+
+@pytest.mark.parametrize("entry", [shazam_eval.main, run_mod.main], ids=["shazam_eval", "run"])
+@pytest.mark.parametrize(("name", "value"), [(RATE, "500/day"), (INTERVAL, "-20")])
+def test_a_cli_on_a_bad_budget_refuses_in_one_line_before_the_lock_or_any_request(
+    entry: Callable[[list[str]], int],
+    name: str,
+    value: str,
+    tmp_path: Path,
+    server: list[FakeShazam],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeShazam([])
+    server.append(fake)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path / "data"))
+    state = tmp_path / "throttle.json"
+    hours = tmp_path / "hours.txt"
+    hours.write_text(HOUR + "\n")
+    argv = ["--state", str(state), "--base-url", fake.url]
+    if entry is shazam_eval.main:
+        argv += ["--hours", str(hours), "--archive-dir", str(tmp_path)]
+    with pytest.raises(SystemExit) as refusal:
+        entry(argv)
+    assert refusal.value.code not in (0, None)
+    assert str(refusal.value).startswith(f"{name}={value!r}: must be ")  # a line, not a traceback
+    assert fake.requests == []
+    assert list(tmp_path.glob("throttle.json*")) == []  # no state file and no <state>.lock
+    assert not (tmp_path / "data").exists()  # no directory made
+
+
 def test_external_api_is_declared_excluded_and_opted_out_of_ci_sync() -> None:
     text = (CHECKOUT / "pyproject.toml").read_text()  # no tomllib: the floor is 3.10
     assert '"external_api: ' in text
