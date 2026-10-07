@@ -5,7 +5,8 @@ Station-neutral. ``shazamio``'s own client retries and hides status codes, so
 ``aiohttp`` attempt per request, every request counted against a ``Throttle``
 before it is sent, and the status and parsed body kept for ``outcome_from``.
 A 429 stops the run for the rest of the UTC day, and the stop is persisted, so a
-restart that day sends nothing. Only ``matched`` and ``no_match`` are scoring
+restart that day sends nothing. One process holds a throttle state file at a
+time, enforced with a lock. Only ``matched`` and ``no_match`` are scoring
 outcomes; ``server_error`` and ``decode_error`` are stored too and retried by a
 later run. The store is a JSONL file the harness only ever appends to.
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -68,7 +70,8 @@ def outcome_from(status: int, body: dict[str, Any] | None) -> ShazamOutcome:
     """Classify a response; ``body`` is None when it was not a JSON object.
 
     Any non-2xx status but 429 is a ``server_error`` (retried later); status 0
-    means the request never got a response.
+    means the request never got a response. A 2xx body that is not JSON, or is
+    JSON of an unexpected shape, is a ``decode_error``.
     """
     if status == 429:
         return ShazamOutcome(status, "rate_limited")
@@ -76,6 +79,13 @@ def outcome_from(status: int, body: dict[str, Any] | None) -> ShazamOutcome:
         return ShazamOutcome(status, "server_error")
     if body is None:
         return ShazamOutcome(status, "decode_error")
+    try:
+        return _match(status, body)
+    except (AttributeError, LookupError, TypeError, ValueError):
+        return ShazamOutcome(status, "decode_error")
+
+
+def _match(status: int, body: dict[str, Any]) -> ShazamOutcome:
     track = body.get("track")
     if not track:
         return ShazamOutcome(status, "no_match")
@@ -101,14 +111,21 @@ class DayStoppedError(Exception):
     """The throttle refuses any more requests today; ``args[0]`` says why."""
 
 
+class ThrottleBusyError(Exception):
+    """Another process holds the throttle state file's lock."""
+
+
 class Throttle:
     """At most ``rate_per_day`` requests per UTC day, ``min_interval_s`` apart, persisted to ``state_path``.
 
     The state file records the UTC day, the requests sent that day, the time of
     the last one, and whether a 429 stopped the day, so a restarted process
     honors all four. ``state_path`` is refused if it is relative or inside the
-    checkout (``DataPathError``). One process per state file: there is no lock, and the
-    budget is the account's, so every leg shares one file and runs in turn.
+    checkout (``DataPathError``); its directory must exist. One process per state
+    file: opening takes a non-blocking exclusive ``flock`` on ``<state_path>.lock``
+    and holds it until ``close()`` (or process exit), and a second opener gets
+    ``ThrottleBusyError``. The budget is the account's, so every leg shares one
+    file and runs in turn.
     """
 
     def __init__(
@@ -125,11 +142,34 @@ class Throttle:
         self.min_interval_s = min_interval_s
         self.clock = clock
         self.sleep = sleep
+        lock_path = self.state_path.with_name(self.state_path.name + ".lock")
+        self._lock: int | None = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self._lock)
+            raise ThrottleBusyError(
+                f"{self.state_path}: another run holds it ({lock_path}); one process per state file"
+            ) from None
+
+    def close(self) -> None:
+        """Release the lock; the throttle refuses to read or write state after this."""
+        if self._lock is not None:
+            os.close(self._lock)
+            self._lock = None
+
+    def __enter__(self) -> Throttle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _state(self) -> dict[str, Any]:
+        if self._lock is None:
+            raise ValueError(f"throttle on {self.state_path} is closed")
         today = datetime.fromtimestamp(self.clock(), timezone.utc).date().isoformat()
         state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
-        if state.get("day") != today:
+        if today > state.get("day", ""):  # a clock stepped back keeps the later day's state
             state = {"day": today, "count": 0, "last": state.get("last"), "stopped": False}
         return state
 
@@ -139,17 +179,23 @@ class Throttle:
         os.replace(tmp, self.state_path)
 
     async def acquire(self) -> None:
-        """Wait out the interval and count one request, or raise ``DayStoppedError``."""
-        state = self._state()
-        if state["last"] is not None:
-            wait = state["last"] + self.min_interval_s - self.clock()
-            if wait > 0:
-                await self.sleep(wait)
-                state = self._state()
-        if state["stopped"]:
-            raise DayStoppedError("rate_limited")
-        if state["count"] >= self.rate_per_day:
-            raise DayStoppedError("daily_cap")
+        """Wait out the interval and count one request, or raise ``DayStoppedError``.
+
+        The stop, the cap, and the interval are checked again after every sleep,
+        and the count and time are saved before the caller sends, so a crash
+        after this returns over-counts rather than under-counts.
+        """
+        while True:
+            state = self._state()
+            if state["stopped"]:
+                raise DayStoppedError("rate_limited")
+            if state["count"] >= self.rate_per_day:
+                raise DayStoppedError("daily_cap")
+            last = state["last"]
+            wait = 0.0 if last is None else last + self.min_interval_s - self.clock()
+            if wait <= 0:
+                break
+            await self.sleep(wait)
         self._save({**state, "count": state["count"] + 1, "last": self.clock()})
 
     def stop_for_day(self) -> None:
@@ -180,6 +226,7 @@ class CountingClient(HTTPClientInterface):
         timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(method, url, **kwargs) as resp:
+                self.last = (resp.status, None)  # kept if reading the body fails
                 try:
                     body = await resp.json(content_type=None)
                 except ValueError:
@@ -195,9 +242,24 @@ class ResultStore:
         self.path = require_outside_checkout(path)
 
     def records(self) -> list[dict[str, Any]]:
+        """Every whole record; a line torn by a crash is logged and skipped, never rewritten."""
         if not self.path.exists():
             return []
-        return [json.loads(line) for line in self.path.read_text().splitlines() if line]
+        records: list[dict[str, Any]] = []
+        for line in filter(None, self.path.read_text(encoding="utf-8").splitlines()):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                log.warning("skipped a torn line in %s: %.60s", self.path, line)
+        return records
+
+    def _ends_mid_line(self) -> bool:
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                return f.read(1) != b"\n"
+        except OSError:  # missing or empty
+            return False
 
     def scored(self) -> set[tuple[str, str]]:
         """Addresses with a scoring outcome; anything else is retried."""
@@ -212,8 +274,9 @@ class ResultStore:
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             **asdict(outcome),
         }
+        lead = "\n" if self._ends_mid_line() else ""  # never glue onto a torn line
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(lead + json.dumps(record, ensure_ascii=False) + "\n")
 
 
 async def run(
@@ -239,11 +302,13 @@ async def run(
             log.warning("skipped %s: %s", address, exc)
             continue
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            outcome = ShazamOutcome(0, "server_error")
-        store.append(str(address), identity, outcome)
+            status = client.last[0]  # a 429 whose body failed to arrive still stops the day
+            outcome = ShazamOutcome(status, "rate_limited" if status == 429 else "server_error")
         if outcome.kind == "rate_limited":
-            client.throttle.stop_for_day()
+            client.throttle.stop_for_day()  # before the record, so a crash between keeps the stop
+            store.append(str(address), identity, outcome)
             return "rate_limited"
+        store.append(str(address), identity, outcome)
     return "done"
 
 
@@ -285,25 +350,27 @@ def main(argv: list[str] | None = None) -> int:
     # Every path this run writes is checked before a request, a mkdir, or a decode.
     work_dir = require_outside_checkout(args.work_dir or data_dir() / "clips")
     store = ResultStore(args.store or data_dir() / "shazam" / "results.jsonl")
-    throttle = Throttle(
-        args.state or data_dir() / "shazam" / "throttle.json",
+    state_path = require_outside_checkout(args.state or data_dir() / "shazam" / "throttle.json")
+    for directory in (work_dir, store.path.parent, state_path.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    # Held until the run ends, before any decode: a second run on this state is refused.
+    with Throttle(
+        state_path,
         int(os.environ.get("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500")),
         float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
-    )
-    for directory in (work_dir, store.path.parent, throttle.state_path.parent):
-        directory.mkdir(parents=True, exist_ok=True)
-    client = CountingClient(throttle, base_url=args.base_url)
-    addresses = hour_addresses(
-        args.hours.read_text().split(), args.archive_dir, args.length, args.profile
-    )
-    stop = asyncio.run(
-        run(
-            addresses,
-            lambda a: cut(a, args.archive_dir / a.hour_key, work_dir),
-            store,
-            client,
+    ) as throttle:
+        client = CountingClient(throttle, base_url=args.base_url)
+        addresses = hour_addresses(
+            args.hours.read_text().split(), args.archive_dir, args.length, args.profile
         )
-    )
+        stop = asyncio.run(
+            run(
+                addresses,
+                lambda a: cut(a, args.archive_dir / a.hour_key, work_dir),
+                store,
+                client,
+            )
+        )
     log.info("stopped: %s after %d requests", stop, client.requests)
     return 0
 
