@@ -624,3 +624,33 @@ def test_the_usage_line_is_the_invocation_that_works(fresh_recognizer, capsys):
     with pytest.raises(SystemExit):
         cli.main(["index", "build", "--help"])
     assert "usage: python -m stream_sleuth.cli index build" in capsys.readouterr().out
+
+
+def test_the_pinned_commit_is_one_constant_every_pin_agrees_with(olaf):
+    # The constant, the CI job's env, pyproject.toml's comment, the README, and CLAUDE.md move together.
+    assert len(olaf.OLAF_COMMIT) == 40
+    for name in (".github/workflows/ci.yml", "pyproject.toml", "README.md", "CLAUDE.md"):
+        assert olaf.OLAF_COMMIT in (CHECKOUT / name).read_text(), name
+
+
+def test_the_identity_names_the_commit_the_snapshot_and_the_floor(olaf):
+    assert olaf.recognizer_identity("rotation") == (
+        f"olaf@{olaf.OLAF_COMMIT}, snapshot=rotation, min=12"
+    )
+
+
+def test_two_floors_are_two_identities(olaf):
+    assert olaf.recognizer_identity("rotation", 12) != olaf.recognizer_identity("rotation", 20)
+
+
+def test_a_snapshot_lives_under_the_data_directory(olaf, tmp_path, monkeypatch):
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path))
+    assert olaf.snapshot_dir("rotation") == tmp_path.resolve() / "olaf" / "rotation"
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "../x", "a/b", ".hidden", "a b", "a,b", "a=b"])
+def test_a_snapshot_name_is_one_plain_path_component(olaf, name):
+    with pytest.raises(olaf.DataPathError, match="snapshot name"):
+        olaf.snapshot_dir(name)
+    with pytest.raises(olaf.DataPathError, match="snapshot name"):
+        olaf.recognizer_identity(name)

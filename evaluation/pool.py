@@ -37,6 +37,7 @@ from mutagen.wave import WAVE
 
 from evaluation.s3_readonly import MissingSettingError, pool_bucket, pool_client
 from stream_sleuth.paths import require_outside_checkout
+from stream_sleuth.recognizers.base import Identification
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +174,26 @@ def open_pool_db(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute(SCHEMA)
     return db
+
+
+def tag_lookup(db: sqlite3.Connection) -> Callable[[str], Identification]:
+    """Return a ``stage_id -> Identification`` lookup over ``db``'s indexed files.
+
+    ``title`` becomes ``song``, every NULL tag ``""``, and ``label`` is always ``""``
+    (``pool.db`` has no label column). An untagged reference has an empty ``song``,
+    which ``step()`` treats as a miss, as it does a stage id that is not an indexed
+    row (a failed file Olaf may still hold): a hit is never filed under its sha1.
+    """
+
+    def lookup(stage: str) -> Identification:
+        row = db.execute(
+            "SELECT artist, title, album FROM files WHERE stage_id = ? AND status = 'indexed'",
+            (stage,),
+        ).fetchone()
+        artist, song, album = (value or "" for value in row or (None,) * 3)
+        return {"artist": artist, "song": song, "album": album, "label": ""}
+
+    return lookup
 
 
 def _record(

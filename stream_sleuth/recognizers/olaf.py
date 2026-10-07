@@ -17,14 +17,19 @@ tag database, say); without one, the identifier is the song and the other keys a
 
 import json
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from ..config import OLAF_BIN
-from ..paths import DataPathError, require_outside_checkout
+from ..paths import DataPathError, data_dir, require_outside_checkout
 from .base import EvalIdentification, Identification, Recognizer
+
+# The Olaf commit the code is built and tested against. CI's job env, pyproject.toml's
+# comment, the README, and CLAUDE.md pin it too; change them together.
+OLAF_COMMIT = "a98d8c03cfd447011d402718ca2d10b2bb467eb0"
 
 # Phase 1 of the viability study (2026-10-06): over 2,400 12 s clips, Olaf's own
 # thresholds passed stray matches at match_count 6-10 while real songs scored 17-178;
@@ -48,6 +53,29 @@ STORE_BATCH = 200
 
 class OlafError(RuntimeError):
     """Olaf failed or printed no query result, or the snapshot directory is unusable."""
+
+
+def snapshot_dir(snapshot: str) -> Path:
+    """``$STREAM_SLEUTH_DATA_DIR/olaf/<snapshot>``: the snapshot's ``HOME``, with its ``pool.db`` beside it.
+
+    ``snapshot`` is one plain path component, else :class:`DataPathError`; nothing is created.
+    """
+    return data_dir() / "olaf" / _snapshot_name(snapshot)
+
+
+def _snapshot_name(snapshot: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", snapshot):
+        raise DataPathError(f"snapshot name {snapshot!r} is not one plain path component")
+    return snapshot
+
+
+def recognizer_identity(snapshot: str, min_match_count: int = DEFAULT_MIN_MATCH_COUNT) -> str:
+    """The identity a stored Olaf result is filed under: commit, snapshot, and match floor.
+
+    ``recognize()`` drops matches below the floor before anything is stored, so results
+    stored at one floor must never be reused at another; the identity differs with it.
+    """
+    return f"olaf@{OLAF_COMMIT}, snapshot={_snapshot_name(snapshot)}, min={min_match_count}"
 
 
 class OlafRecognizer(Recognizer):

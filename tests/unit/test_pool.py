@@ -294,3 +294,39 @@ def test_open_pool_db_refuses_a_checkout_or_relative_path_before_any_write(path,
         pool.open_pool_db(path)
     assert not (CHECKOUT / "pool.db").exists()
     assert not (CHECKOUT / "nested").exists()
+
+
+def _record(db, key, status="indexed", **tags):
+    pool._record(
+        db, pool.PoolObject(key, "rotation/", 1, "mp3"), {**SYNTHETIC_TAGS, **tags}, status, None
+    )
+    return pool.stage_id(key)
+
+
+def test_the_tag_lookup_names_a_reference_by_its_stage_id(db):
+    stage = _record(db, "rotation/Heavy/doga/01.mp3")
+
+    assert pool.tag_lookup(db)(stage) == {
+        "artist": "Juana Molina",
+        "song": "la paradoja",
+        "album": "DOGA",
+        "label": "",
+    }
+
+
+def test_the_tag_lookup_turns_null_tags_into_empty_strings(db):
+    stage = _record(db, "rotation/Light/untagged.mp3", artist=None, album=None, title=None)
+
+    assert pool.tag_lookup(db)(stage) == {"artist": "", "song": "", "album": "", "label": ""}
+
+
+@pytest.mark.parametrize("case", ["failed", "unknown"])
+def test_the_tag_lookup_gives_a_reference_it_cannot_vouch_for_no_song(db, case):
+    # A failed file may still be in the index; a hit on it must be a miss, never its sha1.
+    stage = (
+        _record(db, "rotation/Heavy/doga/01.mp3", status="failed")
+        if case == "failed"
+        else pool.stage_id("rotation/Heavy/not-in-pool.mp3")
+    )
+
+    assert pool.tag_lookup(db)(stage)["song"] == ""
