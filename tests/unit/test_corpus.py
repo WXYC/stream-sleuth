@@ -1280,6 +1280,10 @@ HOURS = [
 ]
 
 
+# Each select_export hour: eight track rows, all in the pool.
+BASIS = {"in_pool": 8, "track_rows": 8}
+
+
 def run_select(tmp_path: Path, pool_db: Path, out_dir: Path) -> int:
     export = tmp_path / "export"
     if not export.exists():
@@ -1295,11 +1299,11 @@ def test_select_writes_the_frozen_hours_and_the_subset(tmp_path: Path, pool_db: 
     assert (out / "hours.txt").read_text() == "".join(f"{k}\n" for k in HOURS)
     assert (out / "subset.txt").read_text() == f"{HOURS[0]}\n{HOURS[2]}\n"
     record = json.loads((out / "selection.json").read_text())
-    assert record["export"] == "export" and record["pool_db"] == str(pool_db)
+    assert record["export"] == "export" and record["pool_db"] == str(pool_db.resolve())
     assert record["hours"] == {
-        HOURS[0]: {"group": "canonical-high", "band": "daytime", "subset": True},
-        HOURS[1]: {"group": "canonical-high", "band": "daytime", "subset": False},
-        HOURS[2]: {"group": "canonical-high", "band": "evening", "subset": True},
+        HOURS[0]: {"group": "canonical-high", "band": "daytime", "subset": True} | BASIS,
+        HOURS[1]: {"group": "canonical-high", "band": "daytime", "subset": False} | BASIS,
+        HOURS[2]: {"group": "canonical-high", "band": "evening", "subset": True} | BASIS,
     }
     assert record["shortfalls"]["subset/canonical-low"] == 1
     assert record["shortfalls"]["canonical-high/overnight"] == 3
@@ -1490,7 +1494,7 @@ def test_a_carryover_takes_the_label_of_the_hour_it_is_written_into(
     ]
 
 
-GOOD = {"group": "contrast", "band": "evening", "subset": False}
+GOOD = {"group": "contrast", "band": "daytime", "subset": False}
 
 
 @pytest.mark.parametrize(
@@ -1506,6 +1510,11 @@ GOOD = {"group": "contrast", "band": "evening", "subset": False}
         pytest.param({"hours": {HOURS[0]: GOOD | {"band": "night"}}}, "band", id="bad-band"),
         pytest.param({"hours": {HOURS[0]: GOOD | {"subset": "false"}}}, "subset", id="str-subset"),
         pytest.param({"hours": {HOURS[0]: {"group": "contrast"}}}, "band", id="missing-band"),
+        pytest.param(
+            {"hours": {HOURS[0]: GOOD | {"band": "evening"}}},
+            f"{HOURS[0]}: band 'evening' is not the hour's own",
+            id="band-not-the-hours-own",
+        ),
     ],
 )
 def test_a_bad_selection_file_exits_with_one_clear_line_and_writes_nothing(
@@ -1547,3 +1556,85 @@ def test_select_logs_the_subset_and_corpus_shortfalls(
     run_select(tmp_path, pool_db, tmp_path / "frozen")
     assert "selection shortfall subset/canonical-low: 1" in caplog.text
     assert "selection shortfall canonical-high/overnight: 3" in caplog.text
+
+
+def test_a_relative_pool_db_given_to_select_is_recorded_absolute(
+    tmp_path: Path, pool_db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    select_export(tmp_path)
+    monkeypatch.chdir(pool_db.parent)
+    out = tmp_path / "frozen"
+    corpus.main(["select", "--export", str(tmp_path / "export"), "--pool-db", pool_db.name,
+                 "--out-dir", str(out)])  # fmt: skip
+    assert json.loads((out / "selection.json").read_text())["pool_db"] == str(pool_db.resolve())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    caplog.set_level(logging.WARNING, logger=corpus.log.name)
+    assert plays_main(tmp_path, pool_db, "--selection", str(out / "selection.json"))
+    assert "selection.json was made from" not in caplog.text
+
+
+def test_plays_warn_once_naming_each_hour_the_pool_moved(
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = tmp_path / "frozen"
+    run_select(tmp_path, pool_db, out)
+    db = sqlite3.connect(pool_db)
+    db.execute("DELETE FROM files WHERE artist = 'Juana Molina'")
+    db.commit()
+    db.close()
+    caplog.set_level(logging.WARNING, logger=corpus.log.name)
+    plays = plays_main(tmp_path, pool_db, "--selection", str(out / "selection.json"))
+    assert {p["hour_key"] for p in plays} == set(HOURS)  # the selection is unchanged
+    moved = [r.getMessage() for r in caplog.records if "ranking basis" in r.getMessage()]
+    assert len(moved) == 1
+    assert all(f"{k} (track_rows 8 -> 8, in_pool 8 -> 0)" in moved[0] for k in HOURS)
+
+
+@pytest.mark.parametrize(
+    ("basis", "warning"),
+    [
+        pytest.param(BASIS, None, id="unchanged"),
+        pytest.param(
+            {"in_pool": 7, "track_rows": 8}, "track_rows 8 -> 8, in_pool 7 -> 8", id="in-pool"
+        ),
+        pytest.param(
+            {"in_pool": 8, "track_rows": 9}, "track_rows 9 -> 8, in_pool 8 -> 8", id="tracks"
+        ),
+        pytest.param({}, "cannot be checked", id="no-counts"),
+    ],
+)
+def test_plays_compare_the_recorded_basis_with_the_recomputed_one(
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture,
+    basis: dict[str, int], warning: str | None,
+) -> None:  # fmt: skip
+    select_export(tmp_path)
+    sel = write_selection_json(
+        tmp_path / "selection.json",
+        pool_db,
+        {HOURS[0]: GOOD | basis, HOURS[2]: GOOD | {"band": "evening"} | basis},
+    )
+    caplog.set_level(logging.WARNING, logger=corpus.log.name)
+    assert plays_main(tmp_path, pool_db, "--selection", str(sel))
+    warned = [r.getMessage() for r in caplog.records if "ranking basis" in r.getMessage()]
+    assert len(warned) == (warning is not None)
+    if warning:
+        assert warning in warned[0]
+
+
+@pytest.mark.parametrize("where", ["inside", "relative"])
+@pytest.mark.parametrize("cli", ["select", "plays"])
+def test_each_cli_checks_its_output_path_before_it_opens_the_export(
+    tmp_path: Path, pool_db: Path, cli: str, where: str
+) -> None:
+    out = {"inside": paths.CHECKOUT / "unwritten", "relative": Path("unwritten")}[where]
+    common = ["--export", str(tmp_path / "no-such-export"), "--pool-db", str(tmp_path / "no.db")]
+    argv = (
+        ["select", *common, "--out-dir", str(out)]
+        if cli == "select"
+        else [*common, "--hours", str(tmp_path / "no-hours.txt"), "--out", str(out)]
+    )
+    with pytest.raises(paths.DataPathError):
+        corpus.main(argv)
+    assert not out.exists() and not (paths.CHECKOUT / "unwritten").exists()
