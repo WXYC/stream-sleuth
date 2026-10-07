@@ -13,7 +13,7 @@ from evaluation.clips import hour_addresses
 from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, main
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
-from tests.unit.test_shazam_eval import HTML_429, FakeShazam, _json
+from tests.shazam_fake import HTML_429, FakeShazam, json_response
 
 pytestmark = pytest.mark.ffmpeg
 
@@ -76,7 +76,7 @@ def _explicit_paths(tmp_path: Path) -> list[str]:
 
 def test_a_short_hour_is_queried_only_at_the_addresses_that_fit(tmp_path: Path) -> None:
     _make_hour(tmp_path / "archive", HOUR, 40)  # 12 s clips fit at 0 and 15 s, not at 30 s
-    fake = FakeShazam([_json(200, JESSICA_PRATT), _json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, JESSICA_PRATT), json_response(200, NO_MATCH)])
     try:
         assert main([*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)]) == 0
     finally:
@@ -93,7 +93,7 @@ def test_a_short_hour_is_queried_only_at_the_addresses_that_fit(tmp_path: Path) 
 
 def test_a_repeated_hour_key_in_the_hours_file_is_queried_once(tmp_path: Path) -> None:
     _make_hour(tmp_path / "archive", HOUR, 40)  # two clips: 0 and 15 s
-    fake = FakeShazam([_json(200, JESSICA_PRATT), _json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, JESSICA_PRATT), json_response(200, NO_MATCH)])
     try:
         assert main([*_flags(tmp_path, fake, HOUR, HOUR), *_explicit_paths(tmp_path)]) == 0
     finally:
@@ -104,7 +104,7 @@ def test_a_repeated_hour_key_in_the_hours_file_is_queried_once(tmp_path: Path) -
 
 def test_a_429_stops_the_cli_for_the_day(tmp_path: Path) -> None:
     _make_hour(tmp_path / "archive", HOUR, 60)
-    fake = FakeShazam([_json(200, JESSICA_PRATT), HTML_429])
+    fake = FakeShazam([json_response(200, JESSICA_PRATT), HTML_429])
     try:
         assert main([*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)]) == 0
     finally:
@@ -118,7 +118,7 @@ def test_the_end_summary_lists_addresses_that_are_out_of_retries(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     _make_hour(tmp_path / "archive", HOUR, 20)  # one clip: 0 s
-    fake = FakeShazam([_json(503, {})] * (1 + MAX_RETRIES))
+    fake = FakeShazam([json_response(503, {})] * (1 + MAX_RETRIES))
     argv = [*_flags(tmp_path, fake, HOUR), *_explicit_paths(tmp_path)]
     try:
         for _ in range(MAX_RETRIES):
@@ -143,7 +143,7 @@ def test_missing_and_unreadable_hours_are_logged_and_skipped_without_a_request(
     (tmp_path / "archive" / unreadable).parent.mkdir(parents=True)
     (tmp_path / "archive" / unreadable).write_bytes(b"not audio")
     _make_hour(tmp_path / "archive", NEXT_HOUR, 20)  # one clip: 0 s
-    fake = FakeShazam([_json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, NO_MATCH)])
     try:
         with caplog.at_level("WARNING"):
             assert (
@@ -173,7 +173,7 @@ def test_the_cli_refuses_a_path_in_the_checkout_before_any_request(
     bad = CHECKOUT / "shazam-guard-test" / "x" if where == "inside" else Path("x")
     paths = dict(zip(_explicit_paths(tmp_path)[::2], _explicit_paths(tmp_path)[1::2], strict=True))
     paths[flag] = str(bad)
-    fake = FakeShazam([_json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, NO_MATCH)])
     try:
         with pytest.raises(DataPathError):
             main([*_flags(tmp_path, fake, HOUR), *(p for pair in paths.items() for p in pair)])
@@ -188,7 +188,7 @@ def test_the_cli_refuses_a_path_in_the_checkout_before_any_request(
 
 def test_a_second_run_on_a_held_state_file_is_refused_before_any_request(tmp_path: Path) -> None:
     _make_hour(tmp_path / "archive", HOUR, 20)
-    fake = FakeShazam([_json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, NO_MATCH)])
     try:
         with Throttle(tmp_path / "throttle.json", 500, 20.0):  # the first run, still going
             with pytest.raises(ThrottleBusyError, match=re.escape(str(tmp_path / "throttle.json"))):
@@ -206,7 +206,7 @@ def test_paths_default_from_the_data_directory(
     data = tmp_path / "data"
     monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(data))
     _make_hour(tmp_path / "archive", HOUR, 20)
-    fake = FakeShazam([_json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, NO_MATCH)])
     try:
         assert main(_flags(tmp_path, fake, HOUR)) == 0
     finally:

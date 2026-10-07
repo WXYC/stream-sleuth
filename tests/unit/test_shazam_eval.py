@@ -10,16 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
-import struct
 import subprocess
 import sys
-import threading
-import wave
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import aiohttp
@@ -42,49 +37,16 @@ from evaluation.shazam_eval import (
 )
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JUANA_MOLINA, NO_MATCH
+from tests.shazam_fake import (
+    HTML_429,
+    FakeClock,
+    FakeShazam,
+    clock_at,
+    json_response,
+    write_tone,
+)
 
 HOUR = "2026/08/12/202608121600.mp3"
-
-
-class FakeShazam:
-    """A localhost server that answers each POST with the next scripted (status, body, type).
-
-    A fourth element overrides the declared Content-Length, so a body can end short.
-    """
-
-    def __init__(self, responses: list[tuple]) -> None:
-        self.responses = list(responses)
-        self.requests: list[str] = []
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.rfile.read(int(self.headers["Content-Length"]))
-                outer.requests.append(self.path)
-                status, body, ctype, *length = outer.responses.pop(0)
-                self.send_response(status)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(length[0] if length else len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args: object) -> None:
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-
-
-def _json(status: int, body: object) -> tuple[int, bytes, str]:
-    return status, json.dumps(body).encode(), "application/json"
-
-
-HTML_429 = (429, b"<html><body>Too Many Requests</body></html>", "text/html")
 
 
 class SimulatedCrashError(Exception):
@@ -102,44 +64,8 @@ def server() -> Iterator[list[FakeShazam]]:
 @pytest.fixture(scope="module")
 def tone(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("audio") / "tone.wav"
-    rate = 16000
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(
-            b"".join(
-                struct.pack(
-                    "<h",
-                    int(
-                        8000 * math.sin(2 * math.pi * 440 * i / rate)
-                        + 3000 * math.sin(2 * math.pi * 1234 * i / rate)
-                    ),
-                )
-                for i in range(rate * 12)
-            )
-        )
+    write_tone(path)
     return path
-
-
-class FakeClock:
-    """Wall clock plus a recording async sleep that advances it."""
-
-    def __init__(self, start: float) -> None:
-        self.now = start
-        self.slept: list[float] = []
-
-    def __call__(self) -> float:
-        return self.now
-
-    async def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        await asyncio.sleep(0)  # yield, as a real sleep would, before time moves on
-        self.now += seconds
-
-
-def _clock_at(iso: str) -> FakeClock:
-    return FakeClock(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp())
 
 
 def _addresses(n: int) -> list[ClipAddress]:
@@ -156,7 +82,7 @@ def _run(
     rate: int = 500,
     interval: float = 20.0,
 ) -> tuple[ResultStore, Throttle, CountingClient, str]:
-    clock = clock or _clock_at("2026-10-06T20:00:00")
+    clock = clock or clock_at("2026-10-06T20:00:00")
     store = ResultStore(tmp_path / "shazam.jsonl")
 
     @contextmanager
@@ -207,22 +133,22 @@ def test_a_match_carries_the_four_wire_fields() -> None:
 @pytest.mark.parametrize(
     ("response", "kind"),
     [
-        (_json(200, JUANA_MOLINA), "matched"),
-        (_json(200, NO_MATCH), "no_match"),
-        (_json(429, {"error": "rate limited"}), "rate_limited"),
+        (json_response(200, JUANA_MOLINA), "matched"),
+        (json_response(200, NO_MATCH), "no_match"),
+        (json_response(429, {"error": "rate limited"}), "rate_limited"),
         (HTML_429, "rate_limited"),
         ((429, b'{"error": "rate', "application/json", 100), "rate_limited"),  # body cut short
-        (_json(503, {"error": "busy"}), "server_error"),
+        (json_response(503, {"error": "busy"}), "server_error"),
         ((200, b"<html>maintenance</html>", "text/html"), "decode_error"),
-        (_json(200, {"track": "Juana Molina"}), "decode_error"),
+        (json_response(200, {"track": "Juana Molina"}), "decode_error"),
     ],
 )
 def test_each_response_is_one_request_and_one_stored_outcome(
     tmp_path: Path, tone: Path, server: list[FakeShazam], response: tuple, kind: str
 ) -> None:
-    fake = FakeShazam([response, _json(200, NO_MATCH)])
+    fake = FakeShazam([response, json_response(200, NO_MATCH)])
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     store, _, client, stop = _run(tmp_path, tone, fake, 2, clock=clock)
     stops = kind == "rate_limited"  # only a 429 ends the day; every other kind runs on
     assert stop == ("rate_limited" if stops else "done")
@@ -240,7 +166,7 @@ def test_each_response_is_one_request_and_one_stored_outcome(
 def test_matched_offset_is_extracted_from_the_wire(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([_json(200, JUANA_MOLINA)])
+    fake = FakeShazam([json_response(200, JUANA_MOLINA)])
     server.append(fake)
     store, *_ = _run(tmp_path, tone, fake, 1)
     assert store.records()[0]["offset_s"] == 41.2
@@ -249,21 +175,21 @@ def test_matched_offset_is_extracted_from_the_wire(
 def test_requests_are_spaced_by_the_minimum_interval(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([_json(200, NO_MATCH)] * 3)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 3)
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     _run(tmp_path, tone, fake, 3, clock=clock, interval=20.0)
     assert clock.slept == [20.0, 20.0]
     assert len(fake.requests) == 3
 
 
-@pytest.mark.parametrize("response", [_json(429, {"error": "rate limited"}), HTML_429])
+@pytest.mark.parametrize("response", [json_response(429, {"error": "rate limited"}), HTML_429])
 def test_a_429_stops_the_day_and_survives_a_restart(
     tmp_path: Path, tone: Path, server: list[FakeShazam], response: tuple
 ) -> None:
-    fake = FakeShazam([_json(200, NO_MATCH), response, _json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(200, NO_MATCH), response, json_response(200, NO_MATCH)])
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     store, _, _, stop = _run(tmp_path, tone, fake, 3, clock=clock)
     assert stop == "rate_limited"
     assert len(fake.requests) == 2
@@ -291,9 +217,9 @@ def test_a_429_stop_is_persisted_before_its_record(
 def test_the_daily_cap_counts_requests_across_restarts(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([_json(200, NO_MATCH)] * 3)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 3)
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     _, _, _, stop = _run(tmp_path, tone, fake, 2, clock=clock, rate=3)
     assert stop == "done"
     store, _, client, stop = _run(tmp_path, tone, fake, 5, clock=clock, rate=3)
@@ -304,9 +230,9 @@ def test_the_daily_cap_counts_requests_across_restarts(
 def test_a_new_utc_day_resets_the_cap_and_the_stop(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([HTML_429, _json(200, NO_MATCH)])
+    fake = FakeShazam([HTML_429, json_response(200, NO_MATCH)])
     server.append(fake)
-    clock = _clock_at("2026-10-06T23:59:00")
+    clock = clock_at("2026-10-06T23:59:00")
     _run(tmp_path, tone, fake, 1, clock=clock)
     clock.now += 120  # 00:01 UTC on 2026-10-07
     store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
@@ -333,17 +259,17 @@ def test_a_restart_honors_the_persisted_interval_and_count(
     rate: int,
     slept: list[float],
 ) -> None:
-    fake = FakeShazam([_json(200, NO_MATCH)] * (first_n + 1))
+    fake = FakeShazam([json_response(200, NO_MATCH)] * (first_n + 1))
     server.append(fake)
-    _run(tmp_path, tone, fake, first_n, clock=_clock_at(first_at), rate=rate)
-    restarted = _clock_at(restart_at)  # a new process: a new clock, nothing in memory
+    _run(tmp_path, tone, fake, first_n, clock=clock_at(first_at), rate=rate)
+    restarted = clock_at(restart_at)  # a new process: a new clock, nothing in memory
     _, _, client, stop = _run(tmp_path, tone, fake, first_n + 3, clock=restarted, rate=rate)
     assert restarted.slept == slept
     assert (stop, client.requests, len(fake.requests)) == ("daily_cap", 1, first_n + 1)
 
 
 def test_the_interval_is_checked_again_after_every_sleep(tmp_path: Path) -> None:
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     sent: list[float] = []
 
     async def one(throttle: Throttle) -> None:
@@ -363,10 +289,10 @@ def test_the_interval_is_checked_again_after_every_sleep(tmp_path: Path) -> None
 def test_a_clock_stepped_back_across_midnight_keeps_the_later_days_stop(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([HTML_429, _json(200, NO_MATCH)])
+    fake = FakeShazam([HTML_429, json_response(200, NO_MATCH)])
     server.append(fake)
-    _run(tmp_path, tone, fake, 1, clock=_clock_at("2026-10-07T00:10:00"))
-    stepped_back = _clock_at("2026-10-06T23:58:00")
+    _run(tmp_path, tone, fake, 1, clock=clock_at("2026-10-07T00:10:00"))
+    stepped_back = clock_at("2026-10-06T23:58:00")
     _, _, client, stop = _run(tmp_path, tone, fake, 1, clock=stepped_back)
     assert (stop, client.requests, len(fake.requests)) == ("rate_limited", 0, 1)
     assert stepped_back.slept == []  # refused at once, not after sleeping into the later day
@@ -381,7 +307,7 @@ def test_a_future_dated_last_is_refused_with_one_error_and_no_sleep(
     tmp_path: Path, ahead: float
 ) -> None:
     state = tmp_path / "throttle.json"
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
         asyncio.run(throttle.acquire())
     last = clock()
@@ -408,7 +334,7 @@ def test_a_wait_longer_than_the_interval_is_logged_before_sleeping(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, elapsed: float, slept: float, logged: bool
 ) -> None:
     state = tmp_path / "throttle.json"
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     with Throttle(state, 500, 20.0, clock=clock, sleep=clock.sleep) as throttle:
         asyncio.run(throttle.acquire())
         clock.slept.clear()
@@ -424,10 +350,15 @@ def test_resume_skips_scoring_outcomes_and_retries_errors(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     fake = FakeShazam(
-        [_json(200, JUANA_MOLINA), _json(503, {}), _json(200, NO_MATCH), _json(200, NO_MATCH)]
+        [
+            json_response(200, JUANA_MOLINA),
+            json_response(503, {}),
+            json_response(200, NO_MATCH),
+            json_response(200, NO_MATCH),
+        ]
     )
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")  # shared: a restart's clock never runs behind the file
+    clock = clock_at("2026-10-06T20:00:00")  # shared: a restart's clock never runs behind the file
     _run(tmp_path, tone, fake, 3, clock=clock)
     store, _, client, _ = _run(tmp_path, tone, fake, 3, clock=clock)
     assert client.requests == 1  # only the 503 address is retried
@@ -439,9 +370,9 @@ def test_resume_skips_scoring_outcomes_and_retries_errors(
 def test_a_clip_error_skips_that_address_without_a_query_or_a_record(
     tmp_path: Path, tone: Path, server: list[FakeShazam], caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 2)
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     throttle = Throttle(tmp_path / "throttle.json", 500, 20.0, clock=clock, sleep=clock.sleep)
     client = CountingClient(throttle, base_url=fake.url)
     store = ResultStore(tmp_path / "shazam.jsonl")
@@ -522,7 +453,7 @@ def test_a_streak_of_non_scoring_outcomes_stops_the_day(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     n = MAX_FAILURE_STREAK + 5
-    fake = FakeShazam([_json(503, {"error": "busy"})] * n)
+    fake = FakeShazam([json_response(503, {"error": "busy"})] * n)
     server.append(fake)
     store, throttle, client, stop = _run(tmp_path, tone, fake, n)
     assert (stop, client.requests) == ("failure_streak", MAX_FAILURE_STREAK)
@@ -535,10 +466,12 @@ def test_never_tried_addresses_go_before_retries_so_a_bad_stretch_cannot_stall_t
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     n = MAX_FAILURE_STREAK + 3
-    fake = FakeShazam([_json(503, {})] * MAX_FAILURE_STREAK + [_json(200, NO_MATCH)] * n)
+    fake = FakeShazam(
+        [json_response(503, {})] * MAX_FAILURE_STREAK + [json_response(200, NO_MATCH)] * n
+    )
     server.append(fake)
     _run(tmp_path, tone, fake, n)  # day one: the first 20 fail and the streak stops the day
-    store, _, _, stop = _run(tmp_path, tone, fake, n, clock=_clock_at("2026-10-07T20:00:00"))
+    store, _, _, stop = _run(tmp_path, tone, fake, n, clock=clock_at("2026-10-07T20:00:00"))
     day_two = [r["address"] for r in store.records()][MAX_FAILURE_STREAK:]
     expected = _addresses(n)[MAX_FAILURE_STREAK:] + _addresses(n)[:MAX_FAILURE_STREAK]
     assert (stop, day_two) == ("done", [str(a) for a in expected])
@@ -553,9 +486,9 @@ def test_an_address_is_retried_at_most_max_retries_times_then_not_queried(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     attempts = 1 + MAX_RETRIES
-    fake = FakeShazam([_json(503, {})] * attempts + [_json(200, NO_MATCH)])
+    fake = FakeShazam([json_response(503, {})] * attempts + [json_response(200, NO_MATCH)])
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     for _ in range(attempts):
         store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=clock)
         assert (stop, client.requests) == ("done", 1)
@@ -567,9 +500,11 @@ def test_an_address_is_retried_at_most_max_retries_times_then_not_queried(
 def test_an_exhausted_address_does_not_block_the_others(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([_json(503, {})] * (1 + MAX_RETRIES) + [_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam(
+        [json_response(503, {})] * (1 + MAX_RETRIES) + [json_response(200, NO_MATCH)] * 2
+    )
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     for _ in range(1 + MAX_RETRIES):
         _run(tmp_path, tone, fake, 1, clock=clock)
     store, _, client, stop = _run(tmp_path, tone, fake, 3, clock=clock)
@@ -581,9 +516,11 @@ def test_an_exhausted_address_does_not_block_the_others(
 def test_a_stop_status_is_the_load_or_the_policy_not_the_addresss_fault(
     tmp_path: Path, tone: Path, server: list[FakeShazam], status: int
 ) -> None:
-    fake = FakeShazam([_json(status, {})] * (1 + MAX_RETRIES) + [_json(200, NO_MATCH)])
+    fake = FakeShazam(
+        [json_response(status, {})] * (1 + MAX_RETRIES) + [json_response(200, NO_MATCH)]
+    )
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     for _ in range(1 + MAX_RETRIES):
         _run(tmp_path, tone, fake, 1, clock=_later(clock))
     store, _, client, stop = _run(tmp_path, tone, fake, 1, clock=_later(clock))
@@ -626,9 +563,11 @@ def test_the_history_is_the_one_source_of_scored_last_status_and_exhausted(tmp_p
 def test_a_403_stops_the_day_as_forbidden_after_one_request(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    fake = FakeShazam([_json(403, {"error": "forbidden"})] + [_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam(
+        [json_response(403, {"error": "forbidden"})] + [json_response(200, NO_MATCH)] * 2
+    )
     server.append(fake)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     store, throttle, client, stop = _run(tmp_path, tone, fake, 3, clock=clock)
     assert (stop, client.requests, len(fake.requests)) == ("forbidden", 1, 1)
     assert [(r["status"], r["kind"]) for r in store.records()] == [(403, "server_error")]
@@ -641,8 +580,8 @@ def test_a_403_stops_the_day_as_forbidden_after_one_request(
 def test_a_scoring_outcome_resets_the_failure_streak(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
-    almost = [_json(503, {})] * (MAX_FAILURE_STREAK - 1)
-    fake = FakeShazam([*almost, _json(200, NO_MATCH), *almost])
+    almost = [json_response(503, {})] * (MAX_FAILURE_STREAK - 1)
+    fake = FakeShazam([*almost, json_response(200, NO_MATCH), *almost])
     server.append(fake)
     _, _, client, stop = _run(tmp_path, tone, fake, 2 * MAX_FAILURE_STREAK - 1)
     assert (stop, client.requests) == ("done", 2 * MAX_FAILURE_STREAK - 1)
@@ -693,7 +632,7 @@ def test_a_request_is_counted_before_it_is_sent(
         raise SimulatedCrashError
 
     monkeypatch.setattr(aiohttp.ClientSession, "request", crash)
-    clock = _clock_at("2026-10-06T20:00:00")
+    clock = clock_at("2026-10-06T20:00:00")
     with Throttle(tmp_path / "throttle.json", 500, 20.0, clock=clock, sleep=clock.sleep) as t:
         with pytest.raises(SimulatedCrashError):
             asyncio.run(CountingClient(t, base_url="http://127.0.0.1:9").request("POST", "/x"))
@@ -714,7 +653,7 @@ def _go(
     clock: FakeClock | None = None,
 ) -> tuple[ResultStore, CountingClient, str]:
     """``run`` over exactly ``addresses`` (``_run`` always builds a prefix of the grid)."""
-    clock = clock or _clock_at("2026-10-06T20:00:00")
+    clock = clock or clock_at("2026-10-06T20:00:00")
     store = store or ResultStore(tmp_path / "shazam.jsonl")
 
     @contextmanager
@@ -732,7 +671,13 @@ def test_a_repeated_address_is_queried_and_stored_once(
     tmp_path: Path, tone: Path, server: list[FakeShazam]
 ) -> None:
     a, b, _ = _addresses(3)
-    fake = FakeShazam([_json(200, NO_MATCH), _json(200, JUANA_MOLINA), _json(200, NO_MATCH)])
+    fake = FakeShazam(
+        [
+            json_response(200, NO_MATCH),
+            json_response(200, JUANA_MOLINA),
+            json_response(200, NO_MATCH),
+        ]
+    )
     server.append(fake)
     store, client, stop = _go(tmp_path, tone, fake, [a, b, a])
     assert (stop, client.requests, len(fake.requests)) == ("done", 2, 2)
@@ -754,7 +699,7 @@ def test_the_pending_filter_builds_no_union_per_address(
             scored, last, exhausted = super().history()
             return _NoUnionSet(scored), last, _NoUnionSet(exhausted)
 
-    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 2)
     server.append(fake)
     _, client, stop = _go(tmp_path, tone, fake, _addresses(2), Store(tmp_path / "shazam.jsonl"))
     assert (stop, client.requests) == ("done", 2)
@@ -769,7 +714,7 @@ def test_an_address_whose_last_answer_was_a_stop_status_goes_after_the_other_ret
     store.append(str(flaky), who, ShazamOutcome(503, "server_error"))
     store.append(str(denied), who, ShazamOutcome(403, "server_error"))  # the day's first request
     store.append(str(slow), who, ShazamOutcome(503, "server_error"))
-    fake = FakeShazam([_json(200, NO_MATCH)] * 3)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 3)
     server.append(fake)
     store, _, stop = _go(tmp_path, tone, fake, [denied, flaky, slow], store)
     assert stop == "done"
@@ -786,7 +731,7 @@ def test_stop_status_addresses_go_least_recently_tried_first(
     store.append(str(always), who, ShazamOutcome(403, "server_error"))
     store.append(str(once), who, ShazamOutcome(403, "server_error"))
     store.append(str(always), who, ShazamOutcome(403, "server_error"))  # denied again, later
-    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 2)
     server.append(fake)
     store, _, stop = _go(tmp_path, tone, fake, [always, once], store)
     assert stop == "done"
@@ -802,7 +747,7 @@ def test_a_stop_status_that_was_later_answered_otherwise_no_longer_trails(
     store.append(str(first), who, ShazamOutcome(403, "server_error"))
     store.append(str(first), who, ShazamOutcome(503, "server_error"))  # the last word
     store.append(str(second), who, ShazamOutcome(503, "server_error"))
-    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 2)
     server.append(fake)
     store, _, _ = _go(tmp_path, tone, fake, [first, second], store)
     assert [r["address"] for r in store.records()][3:] == [str(first), str(second)]
