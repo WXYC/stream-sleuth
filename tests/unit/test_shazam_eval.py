@@ -28,10 +28,12 @@ from evaluation.shazam_eval import (
     ResultStore,
     ShazamOutcome,
     Throttle,
+    main,
     outcome_from,
     recognizer_identity,
     run,
 )
+from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JUANA_MOLINA, NO_MATCH
 
 HOUR = "2026/08/12/202608121600.mp3"
@@ -307,6 +309,37 @@ def test_a_clip_error_skips_that_address_without_a_query_or_a_record(
     ]
     assert str(bad) in caplog.text
     assert clock.slept == [20.0]  # the skipped address spent neither a query nor an interval
+
+
+@pytest.mark.parametrize("flag", ["--store", "--state", "--work-dir"])
+@pytest.mark.parametrize("where", ["inside", "relative"])
+def test_the_cli_refuses_a_path_in_the_checkout_before_any_request(
+    tmp_path: Path, server: list[FakeShazam], flag: str, where: str
+) -> None:
+    fake = FakeShazam([_json(200, NO_MATCH)])
+    server.append(fake)
+    bad = CHECKOUT / "shazam-guard-test" / "x" if where == "inside" else Path("x")
+    args = {
+        "--store": str(tmp_path / "shazam.jsonl"),
+        "--state": str(tmp_path / "throttle.json"),
+        "--work-dir": str(tmp_path / "work"),
+    } | {flag: str(bad)}
+    (tmp_path / "hours.txt").write_text(HOUR + "\n")
+    argv = ["--hours", str(tmp_path / "hours.txt"), "--archive-dir", str(tmp_path)]
+    argv += ["--base-url", fake.url]
+    argv += [part for pair in args.items() for part in pair]
+    with pytest.raises(DataPathError):
+        main(argv)
+    assert fake.requests == []
+    assert not (CHECKOUT / "shazam-guard-test").exists()
+    assert not (tmp_path / "work").exists()  # nothing was created for the other paths either
+
+
+def test_the_writers_refuse_a_path_in_the_checkout(tmp_path: Path) -> None:
+    with pytest.raises(DataPathError):
+        ResultStore(CHECKOUT / "results.jsonl")
+    with pytest.raises(DataPathError):
+        Throttle(CHECKOUT / "throttle.json", 500, 20.0)
 
 
 def test_the_store_only_appends(tmp_path: Path) -> None:
