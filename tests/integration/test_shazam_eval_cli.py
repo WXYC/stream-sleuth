@@ -99,7 +99,7 @@ def test_a_429_stops_the_cli_for_the_day(tmp_path: Path) -> None:
         fake.close()
     assert [r["kind"] for r in _records(tmp_path / "shazam.jsonl")] == ["matched", "rate_limited"]
     assert len(fake.requests) == 2
-    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] is True
+    assert json.loads((tmp_path / "throttle.json").read_text())["stopped"] == "rate_limited"
 
 
 def test_missing_and_unreadable_hours_are_logged_and_skipped_without_a_request(
