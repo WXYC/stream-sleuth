@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from evaluation import corpus
+from evaluation import corpus, names
 from evaluation.pool import SCHEMA
 from evaluation.run import read_hours
 from stream_sleuth import paths
@@ -287,6 +287,25 @@ def test_version_qualified_plays_do_not_join_the_studio_title(
     pool_db: Path, title: str, tier: str | None
 ) -> None:
     assert corpus.PoolIndex.load(pool_db).tier("Jessica Pratt", "Other", title) == tier
+
+
+@pytest.mark.parametrize("artist", [a for a, *_ in POOL if a] + ["jessica pratt", "Stereolab"])
+@pytest.mark.parametrize(
+    "title",
+    [t or "" for _, _, t, _ in POOL]
+    + ["BACK BABY", "Back, Baby (Live)", "Brakhage (feat. Someone)", "Brakhage [Remixed]", ""],
+)
+def test_the_title_tier_is_names_title_tier(pool_db: Path, artist: str, title: str) -> None:
+    """The join's title tier and the shared predicate agree for every pool file, so a scorer
+    calling the predicate stands where the join does."""
+    files = sqlite3.connect(f"{pool_db.as_uri()}?mode=ro", uri=True)
+    rows = files.execute("SELECT artist, album_artist, album, title FROM files").fetchall()
+    files.close()
+    expected = any(
+        names.title_tier(artist, "Other", title, [a, aa], album, t) for a, aa, album, t in rows
+    )
+
+    assert (corpus.PoolIndex.load(pool_db).tier(artist, "Other", title) == "title") == expected
 
 
 def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Path:

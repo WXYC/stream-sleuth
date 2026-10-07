@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from evaluation.archive import EASTERN, hour_key, hour_start
-from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers
+from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers, title_keys
 from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
@@ -135,10 +135,10 @@ class PoolIndex:
         candidates = [
             ("exact", self.album, (fold(artist), album_key(album))),
             ("fuzzy", self.album_fuzzy, (fuzzy(artist), fuzzy(album))),
-            ("title", self.title, (fold(artist), album_key(title))),
-            ("title", self.title_fuzzy, (fuzzy(artist), fuzzy(title))),
         ]
-        return [(tier, keys, k) for tier, keys, k in candidates if all(k)]
+        title_maps = {"exact": self.title, "fuzzy": self.title_fuzzy}
+        found = [(tier, keys, k) for tier, keys, k in candidates if all(k)]
+        return found + [("title", title_maps[kind], k) for kind, k in title_keys(artist, title)]
 
     def match(self, artist: str, album: str, title: str) -> tuple[str, str] | None:
         """``(tier, format)`` of the first file by key at the best matching tier, else None.

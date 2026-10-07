@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 
 # A featuring or edition clause. The edition phrases of SAME_RECORDING that end in "version"
 # go wherever they sit in the clause ("2011 Deluxe Version"); the other edition words only
@@ -127,3 +128,41 @@ def named_qualifiers(album: str | None, title: str | None) -> frozenset[str]:
     suffix = re.split(r" [-\u2010-\u2015] ", outside(title), maxsplit=1)[1:]
     words = _words(outside(album)) + _words(" ".join(suffix))
     return qualifiers(album, title) | (frozenset(_stem(w) for w in words) & VERSION_QUALIFIERS)
+
+
+def title_keys(artist: str | None, title: str | None) -> list[tuple[str, tuple[str, str]]]:
+    """The title-tier join keys of one recording or play, as ``(kind, key)`` in kind order.
+
+    ``exact`` is ``(fold(artist), album_key(title))`` and ``fuzzy`` is ``(fuzzy(artist),
+    fuzzy(title))``. A key with an empty part (a missing tag, or a name that normalizes to
+    nothing) is left out: it never joins.
+    """
+    candidates = [
+        ("exact", (fold(artist), album_key(title))),
+        ("fuzzy", (fuzzy(artist), fuzzy(title))),
+    ]
+    return [(kind, key) for kind, key in candidates if all(key)]
+
+
+def title_tier(
+    play_artist: str | None,
+    play_album: str | None,
+    play_title: str | None,
+    artists: Iterable[str | None],
+    album: str | None,
+    title: str | None,
+) -> str | None:
+    """``exact``, ``fuzzy``, or None: whether a play's title keys meet one recording's.
+
+    The recording is named by ``album``, ``title`` and any of ``artists`` (a pool file passes
+    its artist and album artist, an emission its one artist). The play and the recording
+    join when their title keys are equal and the recording names each version qualifier
+    the play names in a bracketed clause of its album or title (:func:`qualifiers` against
+    :func:`named_qualifiers`), so a play logged "(Live)" never meets the studio recording.
+    """
+    if not qualifiers(play_album, play_title) <= named_qualifiers(album, title):
+        return None
+    have = {key for artist in artists for key in title_keys(artist, title)}
+    return next(
+        (kind for kind, key in title_keys(play_artist, play_title) if (kind, key) in have), None
+    )
