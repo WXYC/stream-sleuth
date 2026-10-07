@@ -249,3 +249,46 @@ def test_fetch_rejects_keys_that_are_not_attributable_hours(tmp_path, key):
 def test_fetch_all_stops_on_an_error_that_would_fail_every_hour(tmp_path):
     with pytest.raises(Exception, match="NoSuchBucket"):
         archive.fetch_all([SUMMER_KEY, WINTER_KEY], archive_dir=tmp_path, bucket="no-such-bucket")
+
+
+class _ServiceError(Exception):
+    """Shaped like botocore's errors: ``response`` is ``None`` for a connection failure."""
+
+    def __init__(self, response):
+        super().__init__(response)
+        self.response = response
+
+
+class _Failing:
+    """The guarded client, but one method raises ``error``."""
+
+    def __init__(self, client, method, error):
+        self._client, self._method, self._error = client, method, error
+
+    def __getattr__(self, name):
+        if name == self._method:
+            raise self._error
+        return getattr(self._client, name)
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+@pytest.mark.parametrize(
+    ("method", "error"),
+    [
+        # Real S3 answers HeadObject on a missing bucket with a bodiless 404, code "404".
+        ("head_object", _ServiceError({"Error": {"Code": "404"}})),
+        # ConnectionClosedError and its siblings carry no response.
+        ("get_object", _ServiceError(None)),
+        # A ValueError that is not about the key is a bug, not a missing hour.
+        ("get_object", ValueError("I/O operation on closed file")),
+    ],
+)
+def test_fetch_all_propagates_errors_that_are_not_about_one_hour(tmp_path, method, error):
+    (tmp_path / SUMMER_KEY).parent.mkdir(parents=True)
+    (tmp_path / SUMMER_KEY).write_bytes(HOURS[SUMMER_KEY])
+    client = _Failing(archive_client(), method, error)
+
+    with pytest.raises(type(error)) as raised:
+        archive.fetch_all([SUMMER_KEY, WINTER_KEY], archive_dir=tmp_path, client=client)
+
+    assert raised.value is error
