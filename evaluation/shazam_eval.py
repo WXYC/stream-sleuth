@@ -16,8 +16,9 @@ ever appends to.
 The result store, the throttle state, and the clip work directory are research
 data: each is checked with ``stream_sleuth.paths.require_outside_checkout`` before
 anything is created, and each defaults to a path under ``data_dir()``. This module
-imports nothing else from ``stream_sleuth``; ``outcome_from`` repeats
-``recognizer.parse()``'s field extraction and adds Shazam's match offset.
+imports only ``stream_sleuth.paths`` and ``stream_sleuth.recognizers.shazam.parse`` from
+``stream_sleuth``: ``outcome_from`` takes the four wire fields from the live recognizer's
+``parse`` (one extraction, so the study scores what WXDU posts) and adds Shazam's match offset.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from shazamio.interfaces.client import HTTPClientInterface
 
 from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
 from stream_sleuth.paths import data_dir, require_outside_checkout
+from stream_sleuth.recognizers.shazam import parse
 
 log = logging.getLogger(__name__)
 
@@ -103,22 +105,13 @@ def outcome_from(status: int, body: dict[str, Any] | None) -> ShazamOutcome:
 
 
 def _match(status: int, body: dict[str, Any]) -> ShazamOutcome:
-    track = body.get("track")
-    if not track:
+    fields = parse(body)  # the live recognizer's extraction, so the study scores what it posts
+    if fields is None:
         return ShazamOutcome(status, "no_match")
-    fields = {"album": "", "label": ""}
-    for section in track.get("sections", []) or []:
-        for md in section.get("metadata", []) or []:
-            key = (md.get("title") or "").strip().lower()
-            if key in fields and not fields[key]:
-                fields[key] = md.get("text", "") or ""
-    matches = body.get("matches") or [{}]
-    offset = matches[0].get("offset")
+    offset = (body.get("matches") or [{}])[0].get("offset")
     return ShazamOutcome(
         status,
         "matched",
-        artist=track.get("subtitle", "") or "",
-        song=track.get("title", "") or "",
         offset_s=float(offset) if offset is not None else None,
         **fields,
     )
