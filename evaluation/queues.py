@@ -295,12 +295,14 @@ def _key(row: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def _extent(row: Mapping[str, str]) -> tuple[str, str]:
-    """A row's ``(last_address, emissions)`` as a spreadsheet may have left them: blanks stripped, and an
-    ``emissions`` of ``3.0`` or ``03`` read as ``3`` (anything that is not a number stays as written)."""
+    """A row's ``(last_address, emissions)`` as a spreadsheet may have left them: blanks stripped, and a
+    whole-number ``emissions`` such as ``3.0`` or ``03`` read as ``3``. Anything else (``2.9``, text) stays
+    as written, so it can never equal a count: a half-edited cell is a mismatch, not a truncation."""
     count = row.get("emissions", "").strip()
     try:
-        count = str(int(float(count)))
-    except (ValueError, OverflowError):
+        if float(count).is_integer():
+            count = str(int(float(count)))
+    except ValueError:
         pass
     return row.get("last_address", "").strip(), count
 
