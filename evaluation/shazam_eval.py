@@ -35,7 +35,7 @@ import aiohttp
 from shazamio import Shazam
 from shazamio.interfaces.client import HTTPClientInterface
 
-from evaluation.clips import ClipAddress, cut, grid
+from evaluation.clips import ClipAddress, ClipError, cut, grid, hour_duration
 
 log = logging.getLogger(__name__)
 
@@ -230,6 +230,9 @@ async def run(
             outcome = outcome_from(*client.last)
         except DayStoppedError as stop:
             return str(stop.args[0])
+        except ClipError as exc:  # no clip, so no query and nothing stored
+            log.warning("skipped %s: %s", address, exc)
+            continue
         except (aiohttp.ClientError, asyncio.TimeoutError):
             outcome = ShazamOutcome(0, "server_error")
         store.append(str(address), identity, outcome)
@@ -237,6 +240,25 @@ async def run(
             client.throttle.stop_for_day()
             return "rate_limited"
     return "done"
+
+
+def hour_addresses(
+    keys: Iterable[str], archive_dir: Path, length_s: int, profile: str
+) -> list[ClipAddress]:
+    """Every clip address that fits each hour's decoded length, in ``keys`` order.
+
+    An hour that is missing or unreadable is logged and contributes nothing, so
+    one bad hour never stops the run; a short hour yields only the clips that fit.
+    """
+    addresses: list[ClipAddress] = []
+    for key in keys:
+        try:
+            hour_s = hour_duration(archive_dir / key)
+        except ClipError as exc:
+            log.warning("skipped hour %s: %s", key, exc)
+            continue
+        addresses += grid(key, length_s, profile, hour_s=hour_s)
+    return addresses
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -259,9 +281,9 @@ def main(argv: list[str] | None = None) -> int:
         float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
     )
     client = CountingClient(throttle, base_url=args.base_url)
-    addresses = [
-        a for key in args.hours.read_text().split() for a in grid(key, args.length, args.profile)
-    ]
+    addresses = hour_addresses(
+        args.hours.read_text().split(), args.archive_dir, args.length, args.profile
+    )
     stop = asyncio.run(
         run(
             addresses,

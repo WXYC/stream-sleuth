@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from evaluation.clips import ClipAddress
+from evaluation.clips import ClipAddress, ClipError
 from evaluation.shazam_eval import (
     CountingClient,
     ResultStore,
@@ -280,6 +280,33 @@ def test_resume_skips_scoring_outcomes_and_retries_errors(
     kinds = [(r["address"], r["kind"]) for r in store.records()]
     second = str(_addresses(3)[1])
     assert kinds[1] == (second, "server_error") and kinds[3] == (second, "no_match")
+
+
+def test_a_clip_error_skips_that_address_without_a_query_or_a_record(
+    tmp_path: Path, tone: Path, server: list[FakeShazam], caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakeShazam([_json(200, NO_MATCH)] * 2)
+    server.append(fake)
+    clock = _clock_at("2026-10-06T20:00:00")
+    throttle = Throttle(tmp_path / "throttle.json", 500, 20.0, clock=clock, sleep=clock.sleep)
+    client = CountingClient(throttle, base_url=fake.url)
+    store = ResultStore(tmp_path / "shazam.jsonl")
+    bad = _addresses(3)[1]
+
+    @contextmanager
+    def open_clip(address: ClipAddress) -> Iterator[Path]:
+        if address == bad:
+            raise ClipError(f"{address} runs past the end")
+        yield tone
+
+    with caplog.at_level("WARNING"):
+        stop = asyncio.run(run(_addresses(3), open_clip, store, client))
+    assert (stop, client.requests, len(fake.requests)) == ("done", 2, 2)
+    assert [r["address"] for r in store.records()] == [
+        str(a) for a in (_addresses(3)[0], _addresses(3)[2])
+    ]
+    assert str(bad) in caplog.text
+    assert clock.slept == [20.0]  # the skipped address spent neither a query nor an interval
 
 
 def test_the_store_only_appends(tmp_path: Path) -> None:
