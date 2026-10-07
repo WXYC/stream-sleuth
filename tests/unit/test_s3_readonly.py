@@ -40,16 +40,13 @@ def isolated_aws(aws_isolated_env):
     aws_isolated_env.allow_custom_endpoints(POOL_ENDPOINT)
 
 
-def _archive(monkeypatch):
+def _archive(monkeypatch, aws_env):
     monkeypatch.setenv("STREAM_SLEUTH_ARCHIVE_AWS_PROFILE", "synthetic-archive")
     return s3_readonly.archive_client()
 
 
-def _pool(monkeypatch):
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_ENDPOINT", POOL_ENDPOINT)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", BUCKET)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_SECRET", "testing")
+def _pool(monkeypatch, aws_env):
+    aws_env.use_pool(POOL_ENDPOINT, BUCKET)
     return s3_readonly.pool_client()
 
 
@@ -78,8 +75,8 @@ def _seed(client):
 
 @CONSTRUCTORS
 @mock_aws
-def test_reads_succeed(monkeypatch, tmp_path, build):
-    client = build(monkeypatch)
+def test_reads_succeed(monkeypatch, aws_isolated_env, tmp_path, build):
+    client = build(monkeypatch, aws_isolated_env)
     _seed(client)
 
     listed = client.list_objects_v2(Bucket=BUCKET)
@@ -129,8 +126,10 @@ WRITES = {
 @CONSTRUCTORS
 @pytest.mark.parametrize("operation, call", WRITES.values(), ids=list(WRITES))
 @mock_aws
-def test_writes_are_refused_and_never_reach_the_store(monkeypatch, build, operation, call):
-    client = build(monkeypatch)
+def test_writes_are_refused_and_never_reach_the_store(
+    monkeypatch, aws_isolated_env, build, operation, call
+):
+    client = build(monkeypatch, aws_isolated_env)
     raw = _seed(client)
 
     with pytest.raises(S3WriteRefused, match=operation):
@@ -143,13 +142,13 @@ def test_writes_are_refused_and_never_reach_the_store(monkeypatch, build, operat
 @CONSTRUCTORS
 @mock_aws
 def test_without_its_handler_the_factory_client_writes_so_the_guard_is_what_refuses(
-    monkeypatch, build
+    monkeypatch, aws_isolated_env, build
 ):
     # The tamper check: take a client from the factory and remove only the guard's
     # handler, by the event name it is registered under. moto then accepts the write
     # that test_writes_are_refused_and_never_reach_the_store expects to be refused,
     # so it is the guard, not moto or the client's setup, that refuses.
-    client = build(monkeypatch)
+    client = build(monkeypatch, aws_isolated_env)
     _seed(client)
     client.meta.events.unregister("before-call.s3", s3_readonly._refuse_non_reads)
 

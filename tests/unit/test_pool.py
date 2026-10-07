@@ -39,11 +39,7 @@ SYNTHETIC_TAGS = {
 
 @pytest.fixture(autouse=True)
 def synthetic_pool(monkeypatch, aws_isolated_env):
-    aws_isolated_env.allow_custom_endpoints(ENDPOINT)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_ENDPOINT", ENDPOINT)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", BUCKET)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_SECRET", "testing")
+    aws_isolated_env.use_pool(ENDPOINT, BUCKET)
     monkeypatch.setattr(pool, "read_tags", lambda path, fmt: dict(SYNTHETIC_TAGS))
     with mock_aws():
         seed_objects(ENDPOINT, BUCKET, OBJECTS)
