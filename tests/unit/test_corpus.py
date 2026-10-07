@@ -31,10 +31,14 @@ COLUMNS = [
     "rotation_id",
     "album_id",
 ]
-POOL = [
-    ("Juana Molina", "DOGA", "la paradoja"),
-    ("Jessica Pratt", "On Your Own Love Again", "Back, Baby"),
-    ("Chuquimamani-Condori", "Edits", "Call Your Name"),
+POOL: list[tuple[str, str | None, str | None, str]] = [
+    ("Juana Molina", "DOGA", "la paradoja", "mp3"),
+    ("Jessica Pratt", "On Your Own Love Again", "Back, Baby", "flac"),
+    ("Chuquimamani-Condori", "Edits", "Call Your Name", "mp4"),
+    # Untagged album and title: joinable on neither.
+    ("Hermanos Gutiérrez", None, None, "wav"),
+    # Japanese script: its fuzzy keys are real, never empty.
+    ("ジェシカ・プラット", "ザ・ワーム", "ザ・ワーム", "aac"),
 ]
 
 
@@ -63,7 +67,7 @@ def row(id_: int, add_time: str, entry_type: str = "track", **kw: object) -> dic
 def write_export(tmp_path: Path, rows: list[dict[str, object]], last_run: str) -> Path:
     export = tmp_path / "export"
     export.mkdir()
-    with open(export / "flowsheet.csv", "w", newline="") as f:
+    with open(export / "flowsheet.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
@@ -76,11 +80,11 @@ def pool_db(tmp_path: Path) -> Path:
     path = tmp_path / "pool.db"
     db = sqlite3.connect(path)
     db.execute(SCHEMA)
-    for i, (artist, album, title) in enumerate(POOL):
+    for i, (artist, album, title, fmt) in enumerate(POOL):
         db.execute(
             "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
-            " VALUES (?, ?, 'rotation/', 'mp3', 1, ?, ?, ?, 'indexed')",
-            (f"rotation/{i}.mp3", f"{i:040x}", artist, album, title),
+            " VALUES (?, ?, 'rotation/', ?, 1, ?, ?, ?, 'indexed')",
+            (f"rotation/{i}.{fmt}", f"{i:040x}", fmt, artist, album, title),
         )
     db.commit()
     db.close()
@@ -129,6 +133,15 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
         ),
         ("Back, Baby", "back, baby", "back, baby", "back baby"),
         (None, "", "", ""),
+        # Letters and digits of any script survive the fuzzy key; diacritics still fold.
+        (
+            "The Worm（ザ・ワーム）",
+            "the worm(サ・ワーム)",
+            "the worm（ザ・ワーム）",
+            "the worm サ ワーム",
+        ),
+        ("Хуана Молина", "хуана молина", "хуана молина", "хуана молина"),
+        ("Csillagrablók_2", "csillagrablok_2", "csillagrablók_2", "csillagrablok 2"),
     ],
 )
 def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> None:
@@ -138,21 +151,53 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
 
 
 @pytest.mark.parametrize(
-    ("artist", "album", "title", "tier"),
+    ("artist", "album", "title", "tier", "pool_format"),
     [
-        ("Juana Molina", "DOGA", "anything", "exact"),
-        ("juana molina", "DOGA (Deluxe Edition)", "anything", "exact"),
-        ("Jessica Pratt", "On Your Own Love Again!", "anything", "fuzzy"),
-        ("Chuquimamani-Condori", "Some Compilation", "Call Your Name", "title"),
-        ("Chuquimamani Condori", "Some Compilation", "call your name", "title"),
-        ("Juana Molina", "Halo", "Paraguaya", None),
-        ("", "", "", None),
+        ("Juana Molina", "DOGA", "anything", "exact", "mp3"),
+        ("juana molina", "DOGA (Deluxe Edition)", "anything", "exact", "mp3"),
+        ("Jessica Pratt", "On Your Own Love Again!", "anything", "fuzzy", "flac"),
+        ("Chuquimamani-Condori", "Some Compilation", "Call Your Name", "title", "mp4"),
+        ("Chuquimamani Condori", "Some Compilation", "call your name", "title", "mp4"),
+        ("Juana Molina", "Halo", "Paraguaya", None, None),
+        ("", "", "", None, None),
+        # An empty key never joins, on the play's side or the pool file's.
+        ("Hermanos Gutiérrez", "", "", None, None),
+        ("Hermanos Gutiérrez", "", "Hijo del Sol", None, None),
+        ("Hermanos Gutiérrez", "Hijo del Sol", "", None, None),
+        # Non-Latin scripts keep real keys: an unrelated Cyrillic play never joins.
+        ("Хуана Молина", "Сон", "Сон", None, None),
+        ("ジェシカ・プラット", "ザ・ワーム!", "x", "fuzzy", "aac"),
+        ("ジェシカ・プラット", "Other", "ザ・ワーム", "title", "aac"),
     ],
 )
 def test_pool_index_tiers(
-    pool_db: Path, artist: str, album: str, title: str, tier: str | None
+    pool_db: Path, artist: str, album: str, title: str, tier: str | None, pool_format: str | None
 ) -> None:
-    assert corpus.PoolIndex.load(pool_db).tier(artist, album, title) == tier
+    index = corpus.PoolIndex.load(pool_db)
+    assert index.tier(artist, album, title) == tier
+    assert index.match(artist, album, title) == ((tier, pool_format) if tier else None)
+
+
+def test_pool_format_is_the_first_matching_file_by_key(tmp_path: Path) -> None:
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    for i, (key, fmt) in enumerate([("rotation/b.mp3", "mp3"), ("rotation/a.wav", "wav")]):
+        db.execute(
+            "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+            " VALUES (?, ?, 'rotation/', ?, 1, 'Nilüfer Yanya', 'PAINLESS', 't', 'indexed')",
+            (key, f"{i:040x}", fmt),
+        )
+    db.commit()
+    db.close()
+    assert corpus.PoolIndex.load(path).match("Nilüfer Yanya", "PAINLESS", "t") == ("exact", "wav")
+
+
+def test_pool_index_never_creates_a_missing_pool_db(tmp_path: Path) -> None:
+    missing = tmp_path / "pool.db"  # its directory exists, so a writable open would create it
+    with pytest.raises(sqlite3.OperationalError):
+        corpus.PoolIndex.load(missing)
+    assert not missing.exists()
 
 
 def test_pool_index_matches_album_artist(tmp_path: Path) -> None:
@@ -189,7 +234,7 @@ def test_failed_pool_rows_are_not_in_pool(tmp_path: Path) -> None:
 
 
 def read_plays(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_plays_windows_pads_and_carryover(tmp_path: Path, pool_db: Path) -> None:
@@ -225,20 +270,57 @@ def test_plays_windows_pads_and_carryover(tmp_path: Path, pool_db: Path) -> None
         0.0,
         2400.0 + 180.0,
     )
-    assert (first["in_pool"], first["pool_match_tier"], first["rotation"], first["pad_s"]) == (
-        True,
-        "exact",
-        True,
-        180.0,
-    )
+    assert (
+        first["in_pool"],
+        first["pool_match_tier"],
+        first["pool_format"],
+        first["rotation"],
+        first["pad_s"],
+    ) == (True, "exact", "mp3", True, 180.0)
     assert (last["window_start_s"], last["window_end_s"]) == (2400.0 - 180.0, 3600.0)
-    assert (last["in_pool"], last["pool_match_tier"], last["rotation"]) == (False, None, False)
+    assert (last["in_pool"], last["pool_match_tier"], last["pool_format"], last["rotation"]) == (
+        False,
+        None,
+        None,
+        False,
+    )
     assert (first["track_rows"], first["talk_rows"], first["era"]) == (2, 1, "canonical")
     assert set(first) == {
         "hour_key", "play_id", "t_offset_s", "window_start_s", "window_end_s", "artist", "title", "album",
-        "era", "pad_s", "in_pool", "pool_match_tier", "rotation", "reorder_flag", "play_order_status",
-        "carryover", "track_rows", "talk_rows",
+        "era", "pad_s", "in_pool", "pool_match_tier", "pool_format", "rotation", "reorder_flag",
+        "play_order_status", "carryover", "track_rows", "talk_rows",
     }  # fmt: skip
+
+
+def test_a_play_without_an_artist_has_unknown_pool_status(tmp_path: Path, pool_db: Path) -> None:
+    export = write_export(tmp_path, [row(1, ts(20, 10), artist="")], "2026-08-09 05:00:43+00")
+    out = tmp_path / "plays.jsonl"
+    corpus.write_plays(
+        out,
+        ["2026/08/12/202608121600.mp3"],
+        corpus.Flowsheet.load(export),
+        corpus.PoolIndex.load(pool_db),
+    )
+    (play,) = read_plays(out)
+    assert (play["in_pool"], play["pool_match_tier"], play["pool_format"]) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("delta", "era"),
+    [
+        (timedelta(microseconds=-1), "etl"),
+        (timedelta(0), "canonical"),
+        (timedelta(seconds=1), "canonical"),
+    ],
+)
+def test_era_boundary_is_etl_stop(tmp_path: Path, delta: timedelta, era: str) -> None:
+    stop = datetime(2026, 8, 9, 5, 30, 43, tzinfo=UTC)  # last_run plus 30 minutes
+    add_time = (stop + delta).strftime("%Y-%m-%d %H:%M:%S.%f+00")
+    sheet = corpus.Flowsheet.load(
+        write_export(tmp_path, [row(1, add_time)], "2026-08-09 05:00:43+00")
+    )
+    assert sheet.stop == stop
+    assert sheet.era(sheet.rows[0].add_time) == era
 
 
 def test_etl_era_uses_its_pad(tmp_path: Path, pool_db: Path) -> None:
