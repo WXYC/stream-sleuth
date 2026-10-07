@@ -54,7 +54,11 @@ def select_output() -> tuple[Output, str]:
     """The output ``STREAM_SLEUTH_OUTPUT`` names, and where it delivers to, for the banner.
 
     Refuses to run (stderr, exit 1) when the chosen output is incomplete: the HTTP
-    output needs the shared secret, with WXDU's original message; JSONL needs a path.
+    output needs the shared secret, with WXDU's original message; JSONL needs an
+    absolute path in an existing directory, so a run started from the checkout
+    (``run.sh`` ``cd``s there) or under launchd (working directory ``/``) never
+    writes somewhere unintended, and a missing directory fails at startup rather
+    than on every emission.
     """
     if OUTPUT == "http":
         if not API_SECRET:
@@ -63,6 +67,11 @@ def select_output() -> tuple[Output, str]:
     if OUTPUT == "jsonl":
         if not OUTPUT_PATH:
             _refuse("STREAM_SLEUTH_OUTPUT_PATH is not set")
+        path = Path(OUTPUT_PATH)
+        if not path.is_absolute():
+            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH must be an absolute path, not {OUTPUT_PATH!r}")
+        if not path.parent.is_dir():
+            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH's directory {path.parent} does not exist")
         return JsonlOutput(OUTPUT_PATH), OUTPUT_PATH
     _refuse(f"STREAM_SLEUTH_OUTPUT must be http or jsonl, not {OUTPUT!r}")
 

@@ -29,7 +29,6 @@ SETTINGS = [
     ("INTERVAL_GAP", "INTERVAL_GAP", "5", "6", 5, 6),
     ("CAPTURE_FAST", "CAPTURE_FAST", "7", "8", 7, 8),
     ("CAPTURE_SLOW", "CAPTURE_SLOW", "14", "15", 14, 15),
-    ("VERBOSE", "VERBOSE", "1", "0", True, False),
 ]
 
 
@@ -55,6 +54,28 @@ def test_each_setting_reads_the_new_name_then_the_wxdu_alias(
     recognizer = fresh_recognizer(**env(name, new, alias))
 
     assert getattr(recognizer, constant) == (new_value if expect == "new" else alias_value)
+
+
+# VERBOSE is a boolean that defaults to off, so one (new, alias) pair cannot make every
+# row above fail in the direction it exists for; each case here differs from the default
+# or from the value the wrong precedence would give.
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"STREAM_SLEUTH_VERBOSE": "1"}, True),
+        ({"WXDU_VERBOSE": "1"}, True),
+        ({"STREAM_SLEUTH_VERBOSE": "0", "WXDU_VERBOSE": "1"}, False),
+        ({"STREAM_SLEUTH_VERBOSE": "", "WXDU_VERBOSE": "1"}, True),
+    ],
+    ids=[
+        "new-name-alone",
+        "wxdu-alias-alone",
+        "new-name-wins-over-alias",
+        "empty-new-name-falls-back",
+    ],
+)
+def test_verbose_reads_the_new_name_then_the_wxdu_alias(fresh_recognizer, env, expected):
+    assert fresh_recognizer(**env).VERBOSE is expected
 
 
 class LoopStarted(BaseException):
@@ -94,8 +115,13 @@ def test_the_wxdu_default_still_refuses_without_a_secret(start, capsys):
     assert out.out == ""
 
 
-def test_http_output_with_a_secret_posts(start):
-    calls = start(STREAM_SLEUTH_SHAZAM_SECRET="not-a-real-secret")
+@pytest.mark.parametrize(
+    "output",
+    [{}, {"STREAM_SLEUTH_OUTPUT": "http"}, {"STREAM_SLEUTH_OUTPUT": ""}],
+    ids=["unset", "http", "empty-counts-as-unset"],
+)
+def test_http_output_with_a_secret_posts(start, output):
+    calls = start(STREAM_SLEUTH_SHAZAM_SECRET="not-a-real-secret", **output)
     outputs = importlib.import_module("stream_sleuth.outputs")
 
     assert [type(o) for o in calls] == [outputs.HttpPostOutput]
@@ -119,6 +145,11 @@ def test_jsonl_output_needs_no_secret(start, tmp_path, capsys):
             "STREAM_SLEUTH_OUTPUT_PATH is not set; refusing to run.\n",
         ),
         (
+            {"STREAM_SLEUTH_OUTPUT": "jsonl", "STREAM_SLEUTH_OUTPUT_PATH": "wxyc-emissions.jsonl"},
+            "STREAM_SLEUTH_OUTPUT_PATH must be an absolute path, not 'wxyc-emissions.jsonl';"
+            " refusing to run.\n",
+        ),
+        (
             {"STREAM_SLEUTH_OUTPUT": "carrier-pigeon"},
             "STREAM_SLEUTH_OUTPUT must be http or jsonl, not 'carrier-pigeon'; refusing to run.\n",
         ),
@@ -130,3 +161,15 @@ def test_refuses_an_incomplete_or_unknown_output(start, capsys, env, message):
 
     assert exit_info.value.code == 1
     assert capsys.readouterr().err == message
+
+
+def test_refuses_a_jsonl_path_whose_directory_is_missing(start, tmp_path, capsys):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(SystemExit) as exit_info:
+        start(STREAM_SLEUTH_OUTPUT="jsonl", STREAM_SLEUTH_OUTPUT_PATH=str(missing / "e.jsonl"))
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == (
+        f"STREAM_SLEUTH_OUTPUT_PATH's directory {missing} does not exist; refusing to run.\n"
+    )
