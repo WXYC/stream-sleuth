@@ -511,7 +511,8 @@ def _same(a: str | None, b: str | None) -> bool:
 
 
 def _tokens(artist: str | None, title: str | None) -> set[str]:
-    return set(names.fuzzy(f"{artist or ''} {title or ''}").split())
+    """The fuzzy tokens of each field, keyed alone so a credit in one never reaches the other."""
+    return set(names.fuzzy(artist).split()) | set(names.fuzzy(title).split())
 
 
 def _nearness(p: Play, f: EvalIdentification, artists: Sequence[str]) -> tuple[list[str], float]:

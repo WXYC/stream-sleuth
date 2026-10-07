@@ -453,6 +453,15 @@ def test_the_same_qualifier_on_both_sides_joins(
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus (Live)", "title"),
         ("Hibiscus feat. Bbyafricka", "Hibiscus feat. Bbyafricka (Live)", None),
         ("Hibiscus feat. Bbyafricka - Live", "Hibiscus (Live)", "title"),
+        # ...and in full-width brackets, and inside a version clause.
+        ("Hibiscus feat. Bbyafricka（Live）", "Hibiscus", None),
+        ("Hibiscus", "Hibiscus feat. Bbyafricka（Live）", None),
+        ("Hibiscus (Radio Edit feat. Bbyafricka)", "Hibiscus", "title"),
+        ("Hibiscus (Live feat. Bbyafricka)", "Hibiscus", None),
+        ("Hibiscus", "Hibiscus (Live feat. Bbyafricka)", None),
+        # A word that is no credit is kept.
+        ("Six Ft. Under", "Six Ft. Deep", None),
+        ("Little Feat", "Little", None),
     ],
 )
 def test_an_unbracketed_featuring_credit_joins_through_the_pool_index(

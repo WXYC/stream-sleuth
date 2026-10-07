@@ -383,6 +383,19 @@ def test_among_near_plays_the_most_similar_is_chosen() -> None:
     assert (row["play_id"], row["matched_on"]) == (2, "artist")
 
 
+def test_an_artist_credit_does_not_swallow_the_title_in_the_similarity() -> None:
+    """Each field is keyed alone: an inline credit in the artist never reaches the title."""
+    records = one_play(
+        "Carré feat. Zeta",
+        "Totally Other Thing",
+        (2, 200.0, "Carré", "Hibiscus Pt. 2 (Edit)"),
+    )
+
+    [row] = near_misses([_hit(("Carré feat. Bbyafricka", "Hibiscus Pt 2", ""), 195.0)], records)
+
+    assert (row["play_id"], row["matched_on"]) == (2, "artist")
+
+
 def test_a_near_miss_under_olaf_references_names_every_artist_tag_of_its_file() -> None:
     address = ClipAddress(HOUR, 195, 12)
     found = _found(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
