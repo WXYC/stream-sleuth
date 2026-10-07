@@ -8,9 +8,14 @@ class, which delegates to the function moved out of ``recognizer.py``.
 from __future__ import annotations
 
 import importlib
+from typing import TYPE_CHECKING
 
 import pytest
 import shazamio
+
+if TYPE_CHECKING:
+    from stream_sleuth.outputs import Output
+    from stream_sleuth.recognizers.base import Recognizer
 
 
 @pytest.fixture
@@ -52,7 +57,13 @@ def test_each_protocol_has_a_conforming_class(shim, protocol, implementation):
         module, name = ref.split(":")
         return getattr(load(module), name)
 
-    assert isinstance(resolve(implementation)(), resolve(protocol))
+    proto, impl = resolve(protocol), resolve(implementation)
+    # The class subclasses its protocol, so isinstance() alone would pass on the
+    # protocol's inherited stub; each method must be the class's own.
+    methods = {name for name, value in vars(proto).items() if callable(value) and name[0] != "_"}
+    assert methods
+    assert methods <= set(vars(impl))
+    assert isinstance(impl(), proto)
 
 
 def test_icecast_source_captures_with_the_moved_function(shim, monkeypatch):
@@ -83,6 +94,34 @@ def test_http_post_output_emits_with_the_moved_function(shim, monkeypatch):
     monkeypatch.setattr(outputs, "post", lambda t: 201 if t is track else 500)
 
     assert outputs.HttpPostOutput().emit(track) == 201
+
+
+def _recognize_and_emit(recognizer: Recognizer, output: Output, wav_path: str) -> object:
+    """Join the two seams the way the loop will, with no cast.
+
+    This is a type check as much as a test: mypy rejects it if ``Output.emit``
+    cannot take the ``Identification`` that ``Recognizer.recognize`` returns.
+    """
+    identification = recognizer.recognize(wav_path)
+    return output.emit(identification) if identification else None
+
+
+def test_a_recognizers_identification_reaches_the_output(shim, monkeypatch):
+    async def recognize(self, data, *args, **kwargs):
+        return {"track": {"subtitle": "Hermanos Gutiérrez", "title": "El Bueno y el Malo"}}
+
+    monkeypatch.setattr(shazamio.Shazam, "recognize", recognize)
+    outputs = load("stream_sleuth.outputs")
+    posted = []
+    monkeypatch.setattr(outputs, "post", lambda t: posted.append(t) or 201)
+    shazam = load("stream_sleuth.recognizers.shazam")
+
+    status = _recognize_and_emit(shazam.ShazamRecognizer(), outputs.HttpPostOutput(), "clip.wav")
+
+    assert status == 201
+    assert posted == [
+        {"artist": "Hermanos Gutiérrez", "song": "El Bueno y el Malo", "album": "", "label": ""}
+    ]
 
 
 def test_identification_has_exactly_the_four_wire_keys(shim):
