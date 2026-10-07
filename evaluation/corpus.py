@@ -58,8 +58,12 @@ CONTRAST_HOURS = 4
 TALK_TYPES = {"talkset", "message"}
 
 _TIME = re.compile(r"(.{19})(?:\.(\d+))?([+-]\d{2})(?::?(\d{2}))?")
+# A featuring or edition clause. The edition phrases of SAME_RECORDING that end in "version"
+# go wherever they sit in the clause ("2011 Deluxe Version"); the other edition words only
+# when they lead it.
 _CRUFT = re.compile(
-    r"\s*[\(\[](?:feat|ft|featuring|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b[^\)\]]*[\)\]]",
+    r"\s*[\(\[](?:(?:feat|ft|featuring|with|deluxe|remaster(?:ed)?|expanded|anniversary|bonus)\b"
+    r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
 _FEATURING = frozenset({"feat", "ft", "featuring", "with"})
@@ -139,9 +143,12 @@ def fold(s: str | None) -> str:
 def album_key(s: str | None) -> str:
     """Lowercase, drop featuring and edition cruft, collapse whitespace.
 
-    A featuring clause always goes. An edition clause stays only when it names another
-    recording by more than the generic "version": "(Deluxe Version)" and "(Remastered
-    2011 Version)" go, "(Bonus Live Track)" stays.
+    A featuring clause ("feat.", "ft.", "featuring", "with") always goes. An edition clause
+    (one led by "Deluxe", "Remastered", ..., or holding a "Deluxe", "Expanded",
+    "Anniversary", "Bonus Track" or "Special" "Version" phrase) stays only when it names
+    another recording by more than the generic "version": "(Deluxe Version)", "(2011 Deluxe
+    Version)" and "(Remastered 2011 Version)" go, "(Bonus Live Track)" stays. Only ASCII
+    ``(...)`` and ``[...]`` clauses are seen: the fuzzy keys fold full-width brackets first.
     """
 
     def drop_unless_version(m: re.Match[str]) -> str:
@@ -185,14 +192,15 @@ def named_qualifiers(album: str | None, title: str | None) -> frozenset[str]:
     """The stemmed qualifiers a pool file's album and title name: what a pool file has.
 
     :func:`qualifiers` plus the qualifier words outside brackets: an album's anywhere
-    ("Live at KEXP"), a title's only after a " - " ("Back, Baby - Live"), so a title like
-    "Live Forever" names nothing.
+    ("Live at KEXP"), a title's only after a spaced hyphen, en dash or em dash ("Back, Baby
+    - Live"), so a title like "Live Forever" names nothing.
     """
 
     def outside(s: str | None) -> str:
         return _BRACKETED.sub(" ", album_key(fold(s)))
 
-    words = _words(outside(album)) + _words(outside(title).partition(" - ")[2])
+    suffix = re.split(r" [-\u2010-\u2015] ", outside(title), maxsplit=1)[1:]
+    words = _words(outside(album)) + _words(" ".join(suffix))
     return qualifiers(album, title) | (frozenset(_stem(w) for w in words) & VERSION_QUALIFIERS)
 
 
@@ -251,9 +259,10 @@ class PoolIndex:
         """``(tier, format)`` of the first file by key at the best matching tier, else None.
 
         Tiers: ``exact`` or ``fuzzy`` on (artist, album), else ``title`` on (artist, title).
-        On every tier a file joins only when its album or title names, anywhere, each
-        qualifier the play's album or title names in a version clause, so a live play never
-        joins the studio file.
+        On every tier a file joins only when its album or title names each qualifier the
+        play's album or title names in a version clause (:func:`named_qualifiers`: in its
+        album anywhere, in its title bracketed or after a dash), so a live play never joins
+        the studio file.
         """
         need = qualifiers(album, title)
         hits = [
