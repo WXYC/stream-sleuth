@@ -1,7 +1,7 @@
 """The read side of the result stores: matched records to ``EvalIdentification``, and what is uncovered.
 
-No test contacts Shazam or runs Olaf; every store is a JSONL file written by hand or through
-``ResultStore.append``.
+No test contacts Shazam or runs Olaf. Every store is filed through the writers (``tests.stores``),
+except ``MERGED_LINE``, the literal that pins the on-disk format the first legs wrote.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,11 +26,14 @@ from evaluation.results import (
     to_identification,
 )
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+from tests.stores import olaf_record, shazam_record
 
 HOUR = "2026/08/12/202608121600.mp3"
 OTHER = "2026/08/12/202608121700.mp3"
 SHAZAM = "shazam@0.8.1, segment=12"
-KEY = (f"{HOUR}#45+12@128k", SHAZAM)
+ADDRESS = f"{HOUR}#45+12@128k"
+KEY = (ADDRESS, SHAZAM)
+TRACKS = [("Juana Molina", f"take {i}", "DOGA") for i in range(3)]
 
 # A line in the merged Shazam store format, as the first legs wrote it.
 MERGED_LINE = (
@@ -40,14 +44,32 @@ MERGED_LINE = (
 )
 
 
-def _record(kind: str, **fields: object) -> dict:
-    return {**json.loads(MERGED_LINE), "kind": kind, **fields}
+def _record(kind: str, **fields: Any) -> tuple[str, dict[str, Any]]:
+    """A record to file with :func:`_store`: its kind and the writer helper's keyword arguments."""
+    return kind, fields
 
 
-def _store(tmp_path: Path, *records: dict) -> ResultStore:
-    path = tmp_path / "results.jsonl"
-    path.write_text("".join(json.dumps(r) + "\n" for r in records))
-    return ResultStore(path)
+def _file(store: ResultStore, spec: tuple[str, dict[str, Any]]) -> None:
+    kind, fields = spec
+    fields = {"address": ADDRESS, "identity": SHAZAM, **fields}
+    # An Olaf identity files through OlafOutcome, which writes only matches and misses.
+    file = olaf_record if fields["identity"].startswith("olaf@") else shazam_record
+    file(store, fields.pop("address"), kind, **fields)
+
+
+def _store(
+    tmp_path: Path, *records: tuple[str, dict[str, Any]], name: str = "results.jsonl"
+) -> ResultStore:
+    store = ResultStore(tmp_path / name)
+    for spec in records:
+        _file(store, spec)
+    return store
+
+
+def _stored(tmp_path: Path, record: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+    """The one dict ``ResultStore.records`` reads back for ``record``."""
+    [stored] = _store(tmp_path, record).records()
+    return stored
 
 
 def test_a_line_in_the_merged_store_format_reads_back_and_converts(tmp_path: Path) -> None:
@@ -74,20 +96,36 @@ def test_a_line_in_the_merged_store_format_reads_back_and_converts(tmp_path: Pat
     ]
 
 
-def test_a_shazam_answer_with_no_offset_carries_neither_offset() -> None:
-    converted = to_identification(_record("matched", offset_s=None))
+def test_the_helpers_shazam_record_has_the_merged_formats_keys_and_reads_back_the_same(
+    tmp_path: Path,
+) -> None:
+    """The literal pin and the writer cannot drift apart: both are read, and both must agree."""
+    pinned = tmp_path / "pinned.jsonl"
+    pinned.write_text(MERGED_LINE)
+    written = _store(
+        tmp_path, _record("matched", label="Sonamos", offset_s=41.2), name="written.jsonl"
+    )
+    [literal] = ResultStore(pinned).records()
+    [filed] = written.records()
+    assert list(filed) == list(literal)  # the same keys, in the same order
+    assert {**filed, "recorded_at": None} == {**literal, "recorded_at": None}
+    assert read_results([written], {SHAZAM}) == read_results([ResultStore(pinned)], {SHAZAM})
+
+
+def test_a_shazam_answer_with_no_offset_carries_neither_offset(tmp_path: Path) -> None:
+    converted = to_identification(_stored(tmp_path, _record("matched")))
     assert converted is not None
     ident = converted.found
     assert "query_offset_s" not in ident and "ref_start_s" not in ident
     assert (ident["at"], ident["source"]) == (45.0, "shazam")
 
 
-def test_an_olaf_answer_is_local_with_its_confidence_offsets_and_ref_key() -> None:
+def test_an_olaf_answer_is_local_with_its_confidence_offsets_and_ref_key(tmp_path: Path) -> None:
     record = _record(
-        "matched", recognizer=olaf_identity("rotation"), offset_s=None, confidence=42.0,
+        "matched", identity=olaf_identity("rotation"), label="Sonamos", confidence=42.0,
         ref_key="ab" * 20, query_offset_s=3.5, ref_start_s=61.0,
     )  # fmt: skip
-    assert to_identification(record) == Emission(
+    assert to_identification(_stored(tmp_path, record)) == Emission(
         (f"{HOUR}#45+12@128k", olaf_identity("rotation")),
         ClipAddress(HOUR, 45, 12, "128k"),
         {
@@ -106,8 +144,8 @@ def test_an_olaf_answer_is_local_with_its_confidence_offsets_and_ref_key() -> No
 
 
 @pytest.mark.parametrize("kind", ["no_match", "rate_limited", "server_error", "decode_error"])
-def test_only_a_matched_record_converts(kind: str) -> None:
-    assert to_identification(_record(kind)) is None
+def test_only_a_matched_record_converts(tmp_path: Path, kind: str) -> None:
+    assert to_identification(_stored(tmp_path, _record(kind))) is None
 
 
 def test_an_address_with_only_error_records_is_uncovered_with_its_latest_kind(
@@ -115,7 +153,7 @@ def test_an_address_with_only_error_records_is_uncovered_with_its_latest_kind(
 ) -> None:
     store = _store(
         tmp_path,
-        _record("rate_limited", status=429),
+        _record("rate_limited"),
         _record("server_error", status=403),
         _record("no_match", address=f"{OTHER}#0+12@128k"),
     )
@@ -130,12 +168,12 @@ def test_a_no_match_address_is_scored_and_a_never_tried_one_is_in_neither_set(
 ) -> None:
     result = read_results([_store(tmp_path, _record("no_match"))], {SHAZAM})
     assert (result.emissions, result.scored, result.uncovered) == ([], {KEY}, {})
-    empty = read_results([_store(tmp_path)], {SHAZAM})
+    empty = read_results([_store(tmp_path, name="empty.jsonl")], {SHAZAM})
     assert (empty.emissions, empty.scored, empty.uncovered) == ([], set(), {})
 
 
 def test_an_address_scored_after_a_failure_is_covered(tmp_path: Path) -> None:
-    store = _store(tmp_path, _record("server_error", status=503), _record("no_match"))
+    store = _store(tmp_path, _record("server_error"), _record("no_match"))
     result = read_results([store], {SHAZAM})
     assert (result.scored, result.uncovered) == ({KEY}, {})
 
@@ -146,7 +184,7 @@ def test_legs_at_one_offset_keep_their_own_keys(tmp_path: Path) -> None:
         tmp_path,
         _record("matched"),
         _record("matched", address=f"{HOUR}#45+12@320k"),
-        _record("matched", address=f"{HOUR}#45+6@128k", recognizer=six),
+        _record("matched", address=f"{HOUR}#45+6@128k", identity=six),
     )
     keys = {e.key for e in read_results([store], {SHAZAM, six}).emissions}
     assert keys == {
@@ -168,7 +206,7 @@ def test_legs_at_one_offset_keep_their_own_keys(tmp_path: Path) -> None:
 def test_the_first_scoring_record_per_key_wins(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, kinds: list[str], emitted: int
 ) -> None:
-    store = _store(tmp_path, *(_record(k, song=f"take {i}") for i, k in enumerate(kinds)))
+    store = _store(tmp_path, *(_record(k, track=TRACKS[i]) for i, k in enumerate(kinds)))
     with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([store], {SHAZAM})
     assert len(result.emissions) == emitted
@@ -183,8 +221,7 @@ def test_a_key_scored_in_one_store_is_not_uncovered_for_another_store_error(
     tmp_path: Path,
 ) -> None:
     first = _store(tmp_path, _record("matched"))
-    second = ResultStore(tmp_path / "copy.jsonl")
-    second.path.write_text(json.dumps(_record("server_error", status=503)) + "\n")
+    second = _store(tmp_path, _record("server_error"), name="copy.jsonl")
     result = read_results([first, second], {SHAZAM})
     assert (len(result.emissions), result.scored, result.uncovered) == (1, {KEY}, {})
 
@@ -193,9 +230,10 @@ def test_a_key_scored_in_one_store_is_not_uncovered_for_another_store_error(
 def test_the_first_scoring_record_wins_across_stores(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, second: str
 ) -> None:
-    first = _store(tmp_path, _record("matched", song="first store"))
-    copy = ResultStore(tmp_path / "copy.jsonl")
-    copy.path.write_text(json.dumps(_record(second, song="second store")) + "\n")
+    first = _store(tmp_path, _record("matched", track=("Juana Molina", "first store", "DOGA")))
+    copy = _store(
+        tmp_path, _record(second, track=("Juana Molina", "second store", "DOGA")), name="copy.jsonl"
+    )
     with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([first, copy], {SHAZAM})
     assert [e.found["song"] for e in result.emissions] == ["first store"]
@@ -203,34 +241,35 @@ def test_the_first_scoring_record_wins_across_stores(
 
 
 def test_the_union_over_stores_has_every_stores_keys(tmp_path: Path) -> None:
-    olaf = olaf_identity("rotation")
+    six = recognizer_identity(6)
     first = _store(tmp_path, _record("decode_error"))
-    second = ResultStore(tmp_path / "olaf.jsonl")
-    second.path.write_text(json.dumps(_record("server_error", recognizer=olaf)) + "\n")
-    result = read_results([first, second], {SHAZAM, olaf})
-    assert result.uncovered == {KEY: "decode_error", (KEY[0], olaf): "server_error"}
+    second = _store(tmp_path, _record("server_error", identity=six), name="six.jsonl")
+    result = read_results([first, second], {SHAZAM, six})
+    assert result.uncovered == {KEY: "decode_error", (ADDRESS, six): "server_error"}
 
 
 def test_a_result_filed_under_one_floor_is_not_returned_for_another(tmp_path: Path) -> None:
     loose, strict = olaf_identity("rotation", 5), olaf_identity("rotation", 12)
-    olaf = {"confidence": 9.0, "ref_key": "ab" * 20, "query_offset_s": 0.0, "ref_start_s": 1.0}
     records = [
-        _record("matched", recognizer=loose, **olaf),
-        _record("matched", recognizer=loose, address=f"{HOUR}#60+12@128k", **olaf),
-        _record("server_error", recognizer=loose, address=f"{OTHER}#0+12@128k"),
+        _record("matched", identity=loose),
+        _record("matched", identity=loose, address=f"{HOUR}#60+12@128k"),
+        _record("server_error", address=f"{OTHER}#0+12@128k"),  # Olaf files no errors: Shazam's
     ]
     store = _store(tmp_path, *records)
     nothing = read_results([store], {strict})
     assert (nothing.emissions, nothing.scored, nothing.uncovered) == ([], set(), {})  # all three
     result = read_results([store], {loose})
     assert len(result.emissions) == 2
-    assert result.uncovered == {(f"{OTHER}#0+12@128k", loose): "server_error"}
+    assert (result.scored, result.uncovered) == (
+        {(ADDRESS, loose), (f"{HOUR}#60+12@128k", loose)},
+        {},
+    )
 
 
 def test_a_bare_string_is_not_a_set_of_identities(tmp_path: Path) -> None:
     # A str is a Collection[str], and `in` on it is a substring test: "min=1" is inside "min=12".
     loose, strict = olaf_identity("rotation", 1), olaf_identity("rotation", 12)
-    store = _store(tmp_path, _record("no_match", recognizer=loose))
+    store = _store(tmp_path, _record("no_match", identity=loose))
     with pytest.raises(TypeError, match="set of identities"):
         read_results([store], strict)  # type: ignore[arg-type]
     assert read_results([store], {strict}).scored == set()  # the same request, as a set
@@ -240,7 +279,7 @@ def test_records_under_other_identities_are_counted_in_a_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     other = "shazam@9.9.9, segment=12"
-    store = _store(tmp_path, _record("matched"), _record("no_match", recognizer=other))
+    store = _store(tmp_path, _record("matched"), _record("no_match", identity=other))
     with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         result = read_results([store], {SHAZAM})
     assert len(result.emissions) == 1
@@ -252,10 +291,8 @@ def test_the_warning_counts_every_record_and_each_identity(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     a, b = "shazam@9.9.9, segment=12", "shazam@9.9.9, segment=6"
-    others = [
-        _record("no_match", recognizer=a, address=f"{HOUR}#{15 * i}+12@128k") for i in range(3)
-    ]
-    store = _store(tmp_path, _record("matched"), *others, _record("no_match", recognizer=b))
+    others = [_record("no_match", identity=a, address=f"{HOUR}#{15 * i}+12@128k") for i in range(3)]
+    store = _store(tmp_path, _record("matched"), *others, _record("no_match", identity=b))
     with caplog.at_level(logging.WARNING, logger="evaluation.results"):
         read_results([store], {SHAZAM})
     assert "4 record(s)" in caplog.text
@@ -281,7 +318,7 @@ def test_an_unparseable_address_raises_with_the_store_path_and_line(
 
 
 def test_an_unparseable_address_under_another_identity_is_not_read(tmp_path: Path) -> None:
-    store = _store(tmp_path, _record("matched", address="not-an-address", recognizer="x@1"))
+    store = _store(tmp_path, _record("matched", address="not-an-address", identity="x@1"))
     assert read_results([store], {SHAZAM}).emissions == []
 
 
