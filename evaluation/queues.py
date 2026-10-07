@@ -143,7 +143,7 @@ def _nearness(p: Play, f: EvalIdentification, artists: Sequence[str]) -> tuple[l
     fields = [
         field
         for field, hit in (
-            ("artist", any(_same(p.artist, a) for a in artists)),
+            ("artist", any(names.same_artist(p.artist, a) for a in artists)),
             ("title", _same(p.title, f["song"])),
         )
         if hit
@@ -227,14 +227,15 @@ def _agrees(
 ) -> bool:
     """Whether another recognizer's emission in the run's hour and span, ``[first at, last at +
     capture length)``, names the same song: titles equal under ``names.fuzzy`` and some artist of
-    either (:func:`_artists`, so an Olaf file's tags count) equal to some artist of the other."""
+    either (:func:`_artists`, so an Olaf file's tags count) sharing an artist key with some artist of
+    the other (:func:`names.same_artist`, so a co-credit in another order agrees)."""
     begin = run[0].emission.found["at"]
     end = run[-1].emission.found["at"] + run[-1].emission.address.length_s
     return any(
         begin <= o.found["at"] < end
         and _same(o.found["song"], v.emission.found["song"])
         and any(
-            _same(a, b)
+            names.same_artist(a, b)
             for a in _artists(v.emission.found, references)
             for b in _artists(o.found, references)
         )

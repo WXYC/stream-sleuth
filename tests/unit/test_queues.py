@@ -144,6 +144,14 @@ def test_an_artist_credit_does_not_swallow_the_title_in_the_similarity() -> None
     assert (row["play_id"], row["matched_on"]) == (2, "artist")
 
 
+def test_a_co_credit_in_another_order_is_the_same_artist_in_the_near_miss_label() -> None:
+    records = one_play("Cass McCombs & Chris Cohen", "la paradoja")
+
+    [row] = near_misses([_hit(("Chris Cohen, Cass McCombs", "Otra Cancion", ""), 120.0)], records)
+
+    assert (row["play_id"], row["matched_on"]) == (1, "artist")
+
+
 def test_a_near_miss_under_olaf_references_names_every_artist_tag_of_its_file() -> None:
     address = ClipAddress(HOUR, 195, 12)
     found = _found(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
@@ -357,6 +365,18 @@ def test_the_other_recognizer_naming_the_same_song_in_the_runs_span_is_preflagge
     rows = false_positives([unlogged(750.0), unlogged(765.0)], [other(track, at, hour)])
 
     assert [r["preflag"] for r in rows if r["recognizer"] == SHAZAM] == [preflag]
+
+
+def test_a_co_credit_in_another_order_agrees_across_recognizers() -> None:
+    shazam = ("Chris Cohen & Cass McCombs", UNLOGGED[1], UNLOGGED[2])
+    olaf = ("Cass McCombs, Chris Cohen", UNLOGGED[1], UNLOGGED[2])
+    different = ("Cass McCombs, Jessica Pratt", UNLOGGED[1], UNLOGGED[2])
+
+    agreed = false_positives([_hit(shazam, 750.0)], [other(olaf, 750.0)])
+    apart = false_positives([_hit(shazam, 750.0)], [other(different, 750.0)])
+
+    assert [r["preflag"] for r in agreed] == [LIKELY, LIKELY]
+    assert [r["preflag"] for r in apart] == ["", ""]
 
 
 def test_each_recognizers_run_is_flagged_by_the_other() -> None:

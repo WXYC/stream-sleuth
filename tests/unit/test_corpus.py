@@ -515,7 +515,7 @@ def test_a_co_credit_in_another_order_joins_through_the_pool_index(
     db.commit()
     db.close()
     found = corpus.PoolIndex.load(path).tier(play_artist, play_album, "Steel Reserve")
-    assert found == (None if tier is None else tier)
+    assert found == tier
 
 
 @pytest.mark.parametrize(

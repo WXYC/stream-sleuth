@@ -151,18 +151,30 @@ def fuzzy(s: str | None) -> str:
 
 # A co-credit separator: "&", "+", ",", ";" or "/" however spaced, or the whole word "and", "x",
 # "with" or "vs" ("vs." too) between spaces and before a name, so "Charli XCX" holds one name and
-# "Lil Nas X & Juana Molina" does not lose its X to a word separator. A separator inside a
-# bracketed clause is no separator.
-_CO_CREDIT = re.compile(
-    r"(?:\s*[&+,;/]\s*|\s+(?:and|x|with|vs\.?)\s+(?=[^\s&+,;/]))(?![^(\[{]*[)\]}])"
-)
+# "Lil Nas X & Juana Molina" does not lose its X to a word separator.
+_CO_CREDIT = re.compile(r"\s*[&+,;/]\s*|\s+(?:and|x|with|vs\.?)\s+(?=[^\s&+,;/])")
+
+
+def _names(text: str) -> list[str]:
+    """``text`` split on :data:`_CO_CREDIT`, except inside a balanced bracketed clause.
+
+    An unbalanced closer ("Sunn O)))") is part of a name and hides nothing: the clauses are
+    masked innermost first, and a separator is read from the masked text only.
+    """
+    masked = text
+    while (hidden := _BRACKETED.sub(lambda m: "\0" * len(m.group()), masked)) != masked:
+        masked = hidden
+    cuts = [m.span() for m in _CO_CREDIT.finditer(masked)]
+    starts = [0, *(end for _, end in cuts)]
+    ends = [*(start for start, _ in cuts), len(text)]
+    return [text[a:b] for a, b in zip(starts, ends, strict=True)]
 
 
 def artist_keys(artist: str | None) -> list[str]:
     """The fuzzy-tier artist keys of one artist field: :func:`fuzzy`, then a co-credit's order-free key.
 
-    A field naming two or more artists (split on :data:`_CO_CREDIT` after the cruft rules,
-    each name keyed by :func:`fuzzy`) also keys as its names' keys sorted and joined with
+    A field naming two or more artists (split by :func:`_names` after the cruft rules, each
+    name keyed by :func:`fuzzy`) also keys as its names' keys sorted and joined with
     ``|``, which no :func:`fuzzy` key holds. Two fields naming the same artists in any order,
     with any separators, share that key; a single name has only its own, so it never joins a
     reordering. The :func:`fuzzy` key stays first, so a field that joined before still does,
@@ -172,8 +184,14 @@ def artist_keys(artist: str | None) -> list[str]:
     key = fuzzy(artist)
     if not key:
         return []
-    names = sorted(k for k in map(fuzzy, _CO_CREDIT.split(album_key(fold(artist)))) if k)
+    names = sorted(k for k in map(fuzzy, _names(album_key(fold(artist)))) if k)
     return [key, "|".join(names)] if len(names) > 1 else [key]
+
+
+def same_artist(a: str | None, b: str | None) -> bool:
+    """Whether two artist fields share a fuzzy key (:func:`artist_keys`): the artist rule of
+    :func:`title_tier`, for a caller that compares two fields instead of joining a recording."""
+    return bool(set(artist_keys(a)) & set(artist_keys(b)))
 
 
 def qualifiers(*names: str | None) -> frozenset[str]:
