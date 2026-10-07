@@ -19,6 +19,14 @@ _CRUFT = re.compile(
     r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
+# An unbracketed featuring credit: the whole word feat, feat., ft, ft. or featuring after some
+# text (not "with", a title word, and not a field's first word), and the words after it. It
+# stops before a bracket or a spaced hyphen, en dash or em dash, so a version that follows
+# ("feat. X (Live)", "feat. X - Live") is still there for the version rules to read.
+_CREDIT = re.compile(
+    r"(?<=\S)\s+(?:feat|ft|featuring)\b\.?[^(\[{]*?(?=\s[-‐-―]\s|[(\[{]|$)",
+    re.IGNORECASE,
+)
 # A dotted initialism: two or more single letters, each followed by a period but the last,
 # whose period is optional. A letter inside a longer word, or beside a digit, is no initial;
 # an underscore is a separator, as in the keys, so it is no part of a word here.
@@ -84,13 +92,17 @@ def album_key(s: str | None) -> str:
     another recording by more than the generic "version": "(Deluxe Version)", "(2011 Deluxe
     Version)" and "(Remastered 2011 Version)" go, "(Bonus Live Track)" stays. Only ASCII
     ``(...)`` and ``[...]`` clauses are seen: the fuzzy keys fold full-width brackets first.
+
+    An unbracketed credit goes too (:data:`_CREDIT`): "Hibiscus Feat. Bbyafricka" keys as
+    "hibiscus", but "Dancing with Myself", "Featuring Ourselves" and "Theft" are untouched,
+    and a version after the credit ("Hibiscus feat. X (Live)") is kept.
     """
 
     def drop_unless_version(m: re.Match[str]) -> str:
         stems = {_stem(w) for w in _version_words(m.group())}
         return m.group() if stems & (VERSION_QUALIFIERS - {"version"}) else ""
 
-    return " ".join(_CRUFT.sub(drop_unless_version, (s or "").lower()).split())
+    return " ".join(_CREDIT.sub(" ", _CRUFT.sub(drop_unless_version, (s or "").lower())).split())
 
 
 def fuzzy(s: str | None) -> str:

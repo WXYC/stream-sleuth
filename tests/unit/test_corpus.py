@@ -438,6 +438,40 @@ def test_the_same_qualifier_on_both_sides_joins(
 
 
 @pytest.mark.parametrize(
+    ("pool_title", "play_title", "tier"),
+    [
+        # The Carré case (WXYC/stream-sleuth#115): the tag's inline credit, the log's bracketed.
+        ("Hibiscus Feat. Bbyafricka", "Hibiscus (feat Bbyafricka)", "title"),
+        ("Hibiscus (feat Bbyafricka)", "Hibiscus Feat. Bbyafricka", "title"),
+        ("Hibiscus ft. Bbyafricka", "Hibiscus", "title"),
+        ("Hibiscus", "Hibiscus featuring Bbyafricka", "title"),
+        # "with" and a leading word are no credit.
+        ("Dancing", "Dancing with Myself", None),
+        ("Hibiscus", "Featuring Hibiscus", None),
+        # A version after the credit is still a version, on both sides.
+        ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka (Live)", "title"),
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus (Live)", "title"),
+        ("Hibiscus feat. Bbyafricka", "Hibiscus feat. Bbyafricka (Live)", None),
+        ("Hibiscus feat. Bbyafricka - Live", "Hibiscus (Live)", "title"),
+    ],
+)
+def test_an_unbracketed_featuring_credit_joins_through_the_pool_index(
+    tmp_path: Path, pool_title: str, play_title: str, tier: str | None
+) -> None:
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    db.execute(
+        "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+        " VALUES ('k.mp3', ?, 'p/', 'mp3', 1, 'Carré', 'Bootleg', ?, 'indexed')",
+        (f"{0:040x}", pool_title),
+    )
+    db.commit()
+    db.close()
+    assert corpus.PoolIndex.load(path).tier("Carré", "Other", play_title) == tier
+
+
+@pytest.mark.parametrize(
     ("play_title", "match"),
     [("Back, Baby (Live)", ("exact", "flac")), ("Back, Baby", ("exact", "mp3"))],
 )
