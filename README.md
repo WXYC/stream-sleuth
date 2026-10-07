@@ -166,12 +166,17 @@ Freeze the selection once, before any query is spent, with `select`. It runs `ho
 
 ```sh
 DATA="${STREAM_SLEUTH_DATA_DIR:-$HOME/.local/share/stream-sleuth}"
+# select ranks against $DATA/pool.db: the Shazam leg freezes the selection before the
+# Olaf snapshot (and its own pool.db) exists, so that is the only basis there is yet.
 uv run --extra eval python -m evaluation.corpus select \
     --export "$DATA/exports/<date>" --pool-db "$DATA/pool.db" --out-dir "$DATA"
+# plays are written from the snapshot's pool.db, the one the study scores against.
 uv run --extra eval python -m evaluation.corpus \
-    --export "$DATA/exports/<date>" --pool-db "$DATA/pool.db" \
+    --export "$DATA/exports/<date>" --pool-db "$DATA/olaf/<snapshot>/pool.db" \
     --selection "$DATA/selection.json" --out "$DATA/plays.jsonl"
 ```
+
+Run order: `select` (before the first Shazam request) and the Shazam legs (see Shazam below), then the snapshot build, then this plays command with `--selection`, then the Olaf legs. `select` is never re-run once the Shazam leg has started. **The plays command's warning that `selection.json` was made from another `pool.db` is expected** when plays come from the snapshot's `pool.db`: `selection.json` records the `$DATA/pool.db` that ranked it. It is followed by the basis check's own warning, which names every hour whose `track_rows` or `in_pool` moved from the counts `select` recorded; read it, because those hours' ranking basis is not the snapshot's.
 
 `--selection` reads the hours and their labels from `selection.json`; it and `--hours` are mutually exclusive. Labels come only from `--selection`: `--hours` takes any file of hour keys, such as `hours.txt` or `subset.txt`, but it is unlabelled, so its records carry `group: null` and `subset: false` even for the subset hours. To write plays for just the four subset hours with their labels, add `--subset-only` to a `--selection` run (it is an error without `--selection`). Every play record, carryover plays included, carries `group` (`canonical-high`, `canonical-low`, `contrast`, or `null` for a `--hours` run), `band` (`overnight`, `daytime`, `evening`; the hour key's own band for a `--hours` run), and `subset` (true for the four subset hours of a `--selection` run, else false), so the report can slice recall by group, band, and subset. A `selection.json` with no `hours` object, a label outside those sets, a `band` that is not the hour key's own band (a label's `band` is stamped on every play of the hour, so it must equal the hour key's own), or a non-boolean `subset` (or a file that is not JSON, such as `hours.txt`) exits with one line naming the file and the problem, before anything is written. A `selection.json` made from a different export directory or `pool.db` than `--export` and `--pool-db` still runs, with a warning, because a newer export may cover the same hours. After writing, a `--selection` run recomputes each written hour's non-carryover track count and in-pool count and logs one warning naming every hour whose counts differ from the ones `select` recorded, with both values (the join rules, the pool, or the export moved the ranking basis; a warning, never a refusal, and the hours written do not change). A `selection.json` made before counts were recorded runs with one warning that its basis cannot be checked. `--out` is checked (relative or inside the checkout is refused) before the export or the pool is read.
 
@@ -195,6 +200,15 @@ uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m eval
 ```
 
 Rerun the same command on later days; it skips every address with a scoring outcome.
+
+### Running the legs
+
+`evaluation/run.py` runs the study's Shazam legs from the frozen `selection.json`, in this order: 12 s on the full corpus, then 6 s, 20 s, and 12 s @320k on the four-hour subset (the hours with `subset: true`). It chooses no hours itself: `hours.txt` and `subset.txt` are conveniences for people, and every leg reads `selection.json`. All legs run inside one `Throttle` on `shazam/throttle.json`, so they share one daily budget (`STREAM_SLEUTH_SHAZAM_RATE_PER_DAY` and `STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S`, read by `shazam_eval.budget_from_env()` for this command and `shazam_eval` alike). A leg that stops the day (`rate_limited`, `forbidden`, `daily_cap`, or `failure_streak`) leaves the later legs `not started`, and the end-of-run report names each leg's outcome. Resume, retries, and stop reasons are `shazam_eval`'s. It refuses to start with less than 5 GiB free in the clip work directory, and checks `--work-dir`, `--archive-dir`, `--store`, and `--state` (defaults under the data directory) before any request.
+
+```sh
+uv run --extra eval --env-file "$DATA/eval.env" python -m evaluation.run            # every leg
+uv run --extra eval --env-file "$DATA/eval.env" python -m evaluation.run --legs 12s  # one leg
+```
 
 ## Notes
 
