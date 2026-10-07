@@ -17,6 +17,7 @@ tag database, say); without one, the identifier is the song and the other keys a
 
 import json
 import os
+import signal
 import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -36,8 +37,13 @@ DEFAULT_QUERY_TIMEOUT_S = 60.0
 # Written into each snapshot so Olaf never falls back to a config beside its binary.
 SNAPSHOT_CONFIG = {"db_folder": "~/.olaf/db/", "cache_folder": "~/.olaf/cache/"}
 
+SNAPSHOT_CONFIG_PATH = Path(".olaf", "olaf_config.json")
+
 # The LMDB file Olaf's first successful store creates in that db_folder.
 SNAPSHOT_INDEX = Path(".olaf", "db", "data.mdb")
+
+# Pairs per ``olaf store`` call: a whole reference pool on one argv would pass ARG_MAX.
+STORE_BATCH = 200
 
 
 class OlafError(RuntimeError):
@@ -45,6 +51,16 @@ class OlafError(RuntimeError):
 
 
 class OlafRecognizer(Recognizer):
+    """Identifies a clip against one Olaf snapshot, and fills that snapshot with ``store``.
+
+    ``home`` is the snapshot directory: absolute, not the home directory, and outside
+    the checkout, else ``OlafError``. ``olaf_bin`` defaults to ``STREAM_SLEUTH_OLAF_BIN``.
+    A match below ``min_match_count`` is ignored. ``lookup`` maps an identifier to the
+    four wire keys; any key it leaves out falls back to the identifier-as-song default.
+    A query running past ``query_timeout_s`` is killed with its decoder and raises
+    ``OlafError``.
+    """
+
     def __init__(
         self,
         home: str | Path,
@@ -60,7 +76,11 @@ class OlafRecognizer(Recognizer):
         self.query_timeout_s = query_timeout_s
 
     def recognize(self, wav_path: str) -> EvalIdentification | None:
-        if not (self.home / SNAPSHOT_INDEX).is_file():
+        """The strongest match at or above the floor, or None; ``OlafError`` on failure.
+
+        The snapshot must already hold its config and an index: a query never creates one.
+        """
+        if not all((self.home / f).is_file() for f in (SNAPSHOT_CONFIG_PATH, SNAPSHOT_INDEX)):
             raise OlafError(f"no Olaf index in {self.home}; fill it with `index build` first")
         matches = [
             m
@@ -72,12 +92,8 @@ class OlafRecognizer(Recognizer):
         if not matches:
             return None
         best = max(matches, key=lambda m: m["match_count"])
-        names = (self.lookup(best["ref_key"]) if self.lookup else None) or {
-            "artist": "",
-            "song": best["ref_key"],
-            "album": "",
-            "label": "",
-        }
+        found = self.lookup(best["ref_key"]) if self.lookup else None
+        names = {"artist": "", "song": best["ref_key"], "album": "", "label": "", **(found or {})}
         return {
             "artist": names["artist"],
             "song": names["song"],
@@ -91,32 +107,48 @@ class OlafRecognizer(Recognizer):
         }
 
     def store(self, items: Iterable[tuple[str, str]]) -> None:
-        """Index ``(audio path, identifier)`` pairs; Olaf skips identifiers it already holds."""
-        args = [arg for pair in items for arg in pair]
-        if not args:
+        """Index ``(audio path, identifier)`` pairs, ``STORE_BATCH`` per Olaf call.
+
+        Creates the snapshot and its config if absent. Olaf skips identifiers it already
+        holds, so rerunning after an ``OlafError`` stores only what is missing.
+        """
+        pairs = list(items)
+        if not pairs:
             return
-        config = self.home / ".olaf" / "olaf_config.json"
+        config = self.home / SNAPSHOT_CONFIG_PATH
         if not config.exists():
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
-        self._run("store", "--with-ids", *args)
+        for i in range(0, len(pairs), STORE_BATCH):
+            batch = [arg for pair in pairs[i : i + STORE_BATCH] for arg in pair]
+            self._run("store", "--with-ids", *batch)
 
     def _run(self, *args: str, timeout: float | None = None) -> str:
+        # A timed run gets its own process group, so a timeout also kills the ffmpeg
+        # Olaf decodes with; an untimed store stays in the caller's, so Ctrl-C reaches it.
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [self.olaf_bin, *args],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env={**os.environ, "HOME": str(self.home)},
-                timeout=timeout,
+                start_new_session=timeout is not None,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise OlafError(f"olaf {args[0]} timed out after {timeout} s") from exc
+        except OSError as exc:
+            raise OlafError(f"cannot run {self.olaf_bin}: {exc.strerror}") from exc
+        with proc:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                raise OlafError(f"olaf {args[0]} timed out after {timeout} s") from exc
         if proc.returncode != 0:
             # Olaf prints argument-parsing errors to stdout, not stderr.
-            reason = proc.stderr.strip() or proc.stdout.strip()
+            reason = stderr.strip() or stdout.strip()
             raise OlafError(f"olaf {args[0]} exited {proc.returncode}: {reason[-500:]}")
-        return proc.stdout
+        return stdout
 
 
 def _snapshot_home(home: str | Path) -> Path:

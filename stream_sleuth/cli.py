@@ -14,6 +14,7 @@ from .recognizers.olaf import OlafError, OlafRecognizer
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the command line; returns 0, or exits 2 on a usage error and 1 if Olaf fails."""
     parser = argparse.ArgumentParser(prog="stream-sleuth")
     commands = parser.add_subparsers(dest="command", required=True)
     index = commands.add_parser("index", help="manage a local fingerprint index")
@@ -39,7 +40,10 @@ def main(argv: list[str] | None = None) -> int:
         recognizer = OlafRecognizer(args.home, olaf_bin=args.olaf_bin)
     except OlafError as e:
         parser.error(str(e))
-    recognizer.store(pairs)
+    try:
+        recognizer.store(pairs)
+    except OlafError as e:
+        parser.exit(1, f"{parser.prog}: {e}\n")
     return 0
 
 
