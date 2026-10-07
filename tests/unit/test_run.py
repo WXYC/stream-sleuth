@@ -19,8 +19,17 @@ from pathlib import Path
 import pytest
 
 from evaluation import run as run_mod
-from evaluation.clips import ClipAddress
-from evaluation.run import LEGS, main, preflight, read_hours, read_results, run_legs, run_olaf
+from evaluation.clips import ClipAddress, ClipError
+from evaluation.run import (
+    LEGS,
+    main,
+    preflight,
+    read_hours,
+    read_results,
+    run_legs,
+    run_olaf,
+    study_identities,
+)
 from evaluation.shazam_eval import (
     MAX_RETRIES,
     CountingClient,
@@ -363,23 +372,46 @@ def test_an_olaf_record_is_the_shazam_shape_plus_confidence_and_ref_key(tmp_path
     assert store.history()[0] == {(f"{HOUR}#0+12@128k", "olaf@x")}
 
 
+ROTATION = olaf_identity("rotation", 12)
+
+
 def test_a_matched_olaf_record_reads_back_as_one_emission(tmp_path: Path) -> None:
-    store, identity = olaf_store(tmp_path), "olaf@x"
-    run_one_olaf(store, FakeOlaf(), identity, n=1)
-    results = read_results([store], {identity})
+    store = olaf_store(tmp_path)
+    run_one_olaf(store, FakeOlaf(), ROTATION, n=1)
+    results = read_results([store], study_identities("rotation", 12))
     [emission] = results.emissions
-    assert emission.key == (f"{HOUR}#0+12@128k", identity)
+    assert emission.key == (f"{HOUR}#0+12@128k", ROTATION)
     assert emission.found == {**MATCH, "at": 0.0}
     assert results.scored == {emission.key} and results.uncovered == {}
 
 
 def test_a_no_match_olaf_record_is_scored_and_not_uncovered(tmp_path: Path) -> None:
-    store, identity = olaf_store(tmp_path), "olaf@x"
-    run_one_olaf(store, FakeOlaf(match=None), identity, n=1)
-    results = read_results([store], {identity})
+    store = olaf_store(tmp_path)
+    run_one_olaf(store, FakeOlaf(match=None), ROTATION, n=1)
+    assert store.records()[0]["status"] == 0  # the subprocess answered, whatever it found
+    results = read_results([store], study_identities("rotation", 12))
     assert results.emissions == []
-    assert results.scored == {(f"{HOUR}#0+12@128k", identity)}
+    assert results.scored == {(f"{HOUR}#0+12@128k", ROTATION)}
     assert results.uncovered == {}
+
+
+def test_an_address_whose_clip_cannot_be_cut_is_skipped_and_tried_again_next_run(
+    tmp_path: Path,
+) -> None:
+    store, olaf = olaf_store(tmp_path), FakeOlaf()
+    addresses = [ClipAddress(HOUR, 15 * i, 12, "128k") for i in range(3)]
+
+    def open_clip(address: ClipAddress):  # noqa: ANN202
+        if address.offset_s == 15:
+            raise ClipError("runs past the end of the hour")
+        return run_mod.cut(address, Path(), Path())
+
+    assert run_olaf(addresses, open_clip, store, olaf.recognize, ROTATION) == "done"
+    assert [r["address"] for r in store.records()] == [f"{HOUR}#0+12@128k", f"{HOUR}#30+12@128k"]
+    assert olaf.calls == 2  # no query for the clip that was never cut
+    again = FakeOlaf()
+    run_olaf(addresses, lambda a: run_mod.cut(a, Path(), Path()), store, again.recognize, ROTATION)
+    assert again.calls == 1  # only the skipped address, which had no record
 
 
 def test_a_result_filed_under_one_floor_is_not_reused_for_another(tmp_path: Path) -> None:

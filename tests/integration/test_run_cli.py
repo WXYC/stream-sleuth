@@ -8,15 +8,18 @@ binary is never run here: ``OlafRecognizer`` is replaced, and its own end-to-end
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from evaluation import run as run_mod
+from evaluation import shazam_eval
 from evaluation.olaf_snapshot import RESULTS, SnapshotError, build_snapshot, snapshot_lock
 from evaluation.pool import open_pool_db
 from evaluation.run import main
+from evaluation.shazam_eval import Throttle
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.audio import render
 from tests.characterization.shazam_responses import NO_MATCH
@@ -107,19 +110,57 @@ def test_an_olaf_leg_files_its_results_in_the_snapshot(data: Path) -> None:
     assert list((data / "clips").iterdir()) == []
 
 
-def test_a_run_with_no_shazam_leg_touches_nothing_of_shazams(
+def _snapshot(data: Path) -> Path:
+    home = data / "olaf" / "rotation"
+    open_pool_db(home / "pool.db").close()
+    return home
+
+
+def test_an_olaf_only_run_is_not_refused_by_shazams_pin_budget_or_lock(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(shazam_eval, "version", lambda name: "9.9.9")  # not the pinned shazamio
+    monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500/day")  # a malformed budget
+    home = _snapshot(data)
+    (data / "shazam").mkdir()
+    with Throttle(data / "shazam" / "throttle.json", 500, 0.0):  # the live Shazam leg's lock
+        with caplog.at_level(logging.INFO):
+            assert main(["--only", "olaf", "--snapshot", "rotation"]) == 0
+    for leg in ("12s", "6s", "20s", "12s-320k-subset"):
+        assert f"{leg}/olaf: done" in caplog.text
+    assert len(_records(home / RESULTS)) == 7  # 2 + 2 + 2 hours, and the one subset hour
+
+
+def test_a_run_with_no_shazam_leg_creates_nothing_of_shazams(
     data: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def refuse(*args: object) -> None:
-        raise AssertionError("an Olaf-only run must not reach Shazam's pin or budget")
-
-    monkeypatch.setattr(run_mod, "require_pinned_shazamio", refuse)
-    monkeypatch.setattr(run_mod, "budget_from_env", refuse)
-    monkeypatch.setattr(run_mod, "Throttle", refuse)
-    open_pool_db(data / "olaf" / "rotation" / "pool.db").close()
+    monkeypatch.setattr(shazam_eval, "version", lambda name: "9.9.9")
+    monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500/day")
+    _snapshot(data)
     for argv in (["--only", "olaf", "--legs", "12s"], ["--legs", "6s", "20s"]):
         assert main([*argv, "--snapshot", "rotation"]) == 0
     assert not (data / "shazam").exists()  # no state file, no lock, not even its directory
+
+
+def test_the_shazam_lock_is_free_before_any_olaf_leg_runs(
+    data: Path, fake: FakeShazam, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    opened: list[int] = []
+
+    def query_with_the_state_file_free(self: FakeOlaf, wav_path: str) -> dict:
+        with Throttle(data / "shazam" / "throttle.json", 500, 0.0):  # ThrottleBusyError if held
+            opened.append(1)
+        return MATCH
+
+    monkeypatch.setattr(FakeOlaf, "recognize", query_with_the_state_file_free)
+    home = _snapshot(data)
+    with caplog.at_level(logging.INFO):
+        code = main(["--legs", "12s", "--snapshot", "rotation", "--base-url", fake.url])
+    assert code == 0
+    assert "12s/shazam: done" in caplog.text and "12s/olaf: done" in caplog.text
+    assert len(opened) == 2  # one per Olaf query, each with the lock free
+    assert len(fake.requests) == 2
+    assert len(_records(home / RESULTS)) == 2
 
 
 def test_olaf_legs_need_a_built_snapshot_and_a_name(data: Path) -> None:
@@ -133,7 +174,7 @@ def test_olaf_legs_need_a_built_snapshot_and_a_name(data: Path) -> None:
 def test_a_snapshot_being_built_is_refused(data: Path) -> None:
     home = data / "olaf" / "rotation"
     open_pool_db(home / "pool.db").close()
-    with snapshot_lock(home), pytest.raises(SnapshotError, match="another"):
+    with snapshot_lock(home), pytest.raises(SystemExit, match="another"):
         main(["--only", "olaf", "--snapshot", "rotation"])
     assert not (home / RESULTS).exists()
 
@@ -157,10 +198,33 @@ def test_a_build_is_refused_while_a_run_queries_the_snapshot(
         pass
 
 
-def test_a_snapshot_named_by_case_alone_is_refused_by_a_run(data: Path) -> None:
-    open_pool_db(data / "olaf" / "rotation" / "pool.db").close()
-    with pytest.raises(SnapshotError, match="case"):
-        main(["--only", "olaf", "--snapshot", "Rotation"])
+def test_a_snapshot_refusal_comes_before_the_shazam_lock_is_taken(
+    data: Path, fake: FakeShazam
+) -> None:
+    home = _snapshot(data)
+    with pytest.raises(SystemExit, match="case"):  # one line, not a traceback
+        main(["--snapshot", "Rotation", "--base-url", fake.url])
+    with snapshot_lock(home), pytest.raises(SystemExit, match="another"):
+        main(["--snapshot", "rotation", "--base-url", fake.url])
+    with pytest.raises(SystemExit, match="no snapshot"):
+        main(["--snapshot", "absent", "--base-url", fake.url])
+    assert fake.requests == []
+    assert not (data / "shazam" / "throttle.json.lock").exists()  # the lock was never taken
+
+
+@pytest.mark.parametrize(
+    "argv", [["--only", "olaf", "--legs", "6s-subset"], ["--only", "shazam", "--legs", "6s", "20s"]]
+)
+def test_a_selection_that_picks_no_leg_exits_non_zero_with_one_line(
+    data: Path, argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _snapshot(data)
+    with pytest.raises(SystemExit) as refusal:
+        main([*argv, "--snapshot", "rotation"])
+    assert refusal.value.code not in (0, None)
+    error = capsys.readouterr().err.strip().splitlines()[-1]
+    assert "no leg" in error
+    assert not (data / "shazam").exists()
 
 
 def test_a_run_below_five_gib_free_refuses_before_any_request(
