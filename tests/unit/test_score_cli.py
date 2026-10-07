@@ -196,7 +196,7 @@ def test_the_score_file_has_the_shape_report_py_reads(data: Path) -> None:
         "uncovered_plays": {},
     }
     assert (leg["precision"], leg["distinct_precision"], leg["recall"]) == (1.0, 1.0, 0.2)
-    assert leg["adjudicated_precision"] is None
+    assert (leg["adjudicated_precision"], leg["adjudicated_distinct_precision"]) == (1.0, 1.0)
     assert leg["pads"] == {
         "canonical": {"recommended_s": 180.0, "samples": 1, "p95_s": None, "window_pads_s": [180.0]}
     }
@@ -610,17 +610,17 @@ def queued(data: Path) -> Path:
     return data / QUEUE
 
 
-def test_a_queue_with_a_verdict_is_never_overwritten_and_nothing_else_is_written(
+def test_a_queue_with_a_verdict_is_kept_byte_for_byte_and_read_by_the_rescore(
     data: Path,
 ) -> None:
     queue = queued(data)
     filled = fill_verdict(queue, "correct")
 
-    with pytest.raises(SystemExit, match=r"near_misses\.csv.*verdict"):
-        run_cli(data)
+    assert run_cli(data) == 0
 
     assert queue.read_bytes() == filled
-    assert not (data / "score" / "score.json").exists()
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert (leg["precision"], leg["adjudicated_precision"]) == (0.0, 1.0)
 
 
 def test_a_queue_with_no_verdict_is_rewritten(data: Path) -> None:
@@ -635,16 +635,32 @@ def test_a_queue_with_no_verdict_is_rewritten(data: Path) -> None:
 ROW = "12s/shazam,rec,a,b,1,h,0:00:00,0:00:12,shazam,x,y,z,,1,False,p,q,r,artist"
 BOM = b"\xef\xbb\xbf"
 NOT_OURS = [
-    pytest.param(
-        f"{HEADER.replace('verdict', 'Verdict')}\n{ROW},correct\n".encode(), id="re-cased"
-    ),
-    pytest.param(BOM + f"{HEADER}\n{ROW},wrong\n".encode(), id="byte-order mark"),
     pytest.param(f"{HEADER}\n{ROW},caf".encode() + b"\xe9\n", id="not UTF-8"),
     pytest.param(b'{"hour_key": "h", "play_id": 1}\n', id="a JSONL file"),
     pytest.param(b"a,b\n1,2\n", id="another CSV"),
     pytest.param(b"", id="an empty file"),
     pytest.param(f"{HEADER.replace(',verdict', '')}\n".encode(), id="a header without verdict"),
 ]
+
+
+FILLED = [
+    pytest.param(
+        f"{HEADER.replace('verdict', 'Verdict')}\n{ROW},correct\n".encode(), id="re-cased"
+    ),
+    pytest.param(BOM + f"{HEADER}\n{ROW},wrong\n".encode(), id="byte-order mark"),
+]
+
+
+@pytest.mark.parametrize("content", FILLED)
+def test_a_filled_queue_of_ours_is_kept_whatever_its_rows_say(data: Path, content: bytes) -> None:
+    """Its one row names a run nothing scored, so it is stale: ignored, never deleted."""
+    queue = data / QUEUE
+    queue.parent.mkdir()
+    queue.write_bytes(content)
+
+    assert run_cli(data) == 0
+
+    assert queue.read_bytes() == content
 
 
 @pytest.mark.parametrize("content", NOT_OURS)
@@ -1039,37 +1055,20 @@ def test_the_false_positive_queue_follows_out_and_its_own_flag(data: Path) -> No
     assert [r["leg"] for r in read_queue(data / "fp.csv")] == ["12s/shazam"]
 
 
-def test_a_false_positive_queue_with_a_verdict_is_never_overwritten_and_nothing_is_written(
-    data: Path,
-) -> None:
-    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
-    run_cli(data)
-    queue = data / FP_QUEUE
-    filled = fill_verdict(queue, "unlogged-correct")
-    near = (data / QUEUE).read_bytes()
-    (data / "score" / "score.json").unlink()
-
-    with pytest.raises(SystemExit, match=r"false_positives\.csv.*verdict"):
-        run_cli(data)
-
-    assert queue.read_bytes() == filled
-    assert (data / QUEUE).read_bytes() == near
-    assert not (data / "score" / "score.json").exists()
-
-
-def test_a_filled_false_positive_queue_stops_the_run_before_the_near_miss_queue_is_rewritten(
+def test_a_filled_false_positive_queue_is_kept_and_an_unfilled_near_miss_queue_rewritten(
     data: Path,
 ) -> None:
     add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
     add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
     run_cli(data)
-    fill_verdict(data / FP_QUEUE, "talk")
-    (data / QUEUE).unlink()
+    filled = fill_verdict(data / FP_QUEUE, "talk")
+    near = data / QUEUE
+    near.write_text(near.read_text(encoding="utf-8") + "stale\n", encoding="utf-8")
 
-    with pytest.raises(SystemExit, match=r"false_positives\.csv"):
-        run_cli(data)
+    run_cli(data)
 
-    assert not (data / QUEUE).exists()
+    assert (data / FP_QUEUE).read_bytes() == filled
+    assert len(read_queue(near)) == 1
 
 
 def test_the_two_queues_may_not_share_a_path(data: Path) -> None:
@@ -1148,3 +1147,112 @@ def test_the_span_follows_the_capture_length_of_the_runs_last_emission() -> None
         return next(r["preflag"] for r in rows if r["recognizer"] == SHAZAM)
 
     assert (flagged(20), flagged(12)) == (LIKELY, "")
+
+
+def mixed_store(data: Path) -> None:
+    """Four emissions: one correct (a run), a near miss (a run), and a false-positive run of two."""
+    add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
+    add_shazam(data, ClipAddress(HOUR, 210, 12), MOLINA)
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    add_shazam(data, ClipAddress(HOUR, 765, 12), UNLOGGED)
+
+
+def fill_queues(data: Path, near: str, fp: str) -> tuple[bytes, bytes]:
+    """Fill the first row of each queue (a blank leaves it as written); return their bytes."""
+    return fill_verdict(data / QUEUE, near), fill_verdict(data / FP_QUEUE, fp)
+
+
+# (near-miss verdict, false-positive verdict) -> (adjudicated precision, adjudicated distinct).
+# Flowsheet figures are 1/4 over emissions and 1/3 over runs (correct, near miss, false positive).
+ADJUDICATED = [
+    pytest.param("", "", 0.25, 1 / 3, id="blank verdicts stay wrong"),
+    pytest.param("wrong", "wrong", 0.25, 1 / 3, id="wrong stays wrong"),
+    pytest.param("correct", "", 0.5, 2 / 3, id="a correct near miss counts as correct"),
+    pytest.param("", "unlogged-correct", 0.75, 2 / 3, id="the whole two-emission run is correct"),
+    pytest.param("", "talk", 0.5, 0.5, id="talk leaves both the numerator and the denominator"),
+    pytest.param("correct", "talk", 1.0, 1.0, id="both at once"),
+    pytest.param(" Correct ", " Unlogged-Correct ", 1.0, 1.0, id="case and blanks"),
+]
+
+
+@pytest.mark.parametrize(("near", "fp", "emission_level", "distinct"), ADJUDICATED)
+def test_a_rescore_reads_the_verdicts_and_moves_only_the_adjudicated_figures(
+    data: Path, near: str, fp: str, emission_level: float, distinct: float
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    before = read_score(data)["legs"]["12s/shazam"]
+    assert (before["adjudicated_precision"], before["adjudicated_distinct_precision"]) == (
+        before["precision"],
+        before["distinct_precision"],
+    )
+    filled = fill_queues(data, near, fp)
+
+    assert run_cli(data) == 0
+
+    for path, entry, written in zip((QUEUE, FP_QUEUE), (near, fp), filled, strict=True):
+        assert (data / path).read_bytes() == written or not entry  # an unfilled queue is rewritten
+    after = read_score(data)["legs"]["12s/shazam"]
+    assert (after["precision"], after["distinct_precision"]) == (0.25, 1 / 3)
+    assert after["adjudicated_precision"] == pytest.approx(emission_level)
+    assert after["adjudicated_distinct_precision"] == pytest.approx(distinct)
+    assert {k: v for k, v in after.items() if not k.startswith("adjudicated")} == {
+        k: v for k, v in before.items() if not k.startswith("adjudicated")
+    }
+
+
+def test_a_rescore_leaves_both_queue_files_byte_identical(data: Path) -> None:
+    mixed_store(data)
+    run_cli(data)
+    filled = fill_queues(data, "correct", "unlogged-correct")
+
+    run_cli(data)
+    run_cli(data)
+
+    assert ((data / QUEUE).read_bytes(), (data / FP_QUEUE).read_bytes()) == filled
+
+
+def test_a_row_naming_no_current_run_is_logged_once_and_ignored(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    queue = queued(data)  # one near miss at 195
+    filled = fill_verdict(queue, "correct")
+    (data / "shazam" / "results.jsonl").unlink()
+    add_shazam(data, ClipAddress(HOUR, 210, 12), MOLINA)  # that run is gone
+    caplog.set_level("WARNING")
+
+    run_cli(data)
+
+    stale = [r for r in caplog.records if "near_misses.csv" in r.getMessage()]
+    assert len(stale) == 1 and "row(s) 2" in stale[0].getMessage()
+    assert queue.read_bytes() == filled
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert leg["adjudicated_precision"] == leg["precision"] == 1.0
+
+
+UNKNOWN = [
+    pytest.param(QUEUE, "maybe", id="a near miss, unknown"),
+    pytest.param(QUEUE, "talk", id="a near miss, a false-positive value"),
+    pytest.param(QUEUE, "unlogged-correct", id="a near miss, the other queue's value"),
+    pytest.param(FP_QUEUE, "correct", id="a false positive, a near-miss value"),
+    pytest.param(FP_QUEUE, "yes", id="a false positive, unknown"),
+]
+
+
+@pytest.mark.parametrize(("queue", "verdict"), UNKNOWN)
+def test_an_unknown_verdict_is_refused_in_one_line_naming_the_file_row_and_value(
+    data: Path, queue: str, verdict: str
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    (data / "score" / "score.json").unlink()
+    filled = fill_verdict(data / queue, verdict)
+
+    with pytest.raises(SystemExit) as refusal:
+        run_cli(data)
+
+    message = str(refusal.value)
+    assert "\n" not in message
+    assert Path(queue).name in message and "row 2" in message and repr(verdict) in message
+    assert (data / queue).read_bytes() == filled
+    assert not (data / "score" / "score.json").exists()
