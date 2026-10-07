@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, hour_addresses, main
+from evaluation.clips import hour_addresses
+from evaluation.shazam_eval import MAX_RETRIES, Throttle, ThrottleBusyError, main
 from stream_sleuth.paths import CHECKOUT, DataPathError
 from tests.characterization.shazam_responses import JESSICA_PRATT, NO_MATCH
 from tests.unit.test_shazam_eval import HTML_429, FakeShazam, _json
