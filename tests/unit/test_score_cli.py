@@ -19,10 +19,9 @@ from evaluation.clips import ClipAddress, grid
 from evaluation.olaf_snapshot import RESULTS
 from evaluation.pool import open_pool_db
 from evaluation.results import Emission, ResultStore, recognizer_identity
-from evaluation.run import OlafOutcome
 from evaluation.score import attribute, plays_from
-from evaluation.shazam_eval import ShazamOutcome
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+from tests.stores import olaf_record, shazam_record
 from tests.unit.test_score import (
     COCREDIT,
     HERMANOS,
@@ -81,26 +80,22 @@ def add_snapshot(data: Path, artist: str = COCREDIT, album_artist: str = "Juana 
 
 
 def add_olaf(data: Path, address: ClipAddress, artist: str) -> None:
-    outcome = OlafOutcome(
-        0,
+    olaf_record(
+        ResultStore(data / "olaf" / SNAPSHOT / RESULTS),
+        str(address),
         "matched",
-        artist,
-        MOLINA[1],
-        MOLINA[2],
-        "",
-        confidence=40.0,
+        (artist, MOLINA[1], MOLINA[2]),
+        identity=OLAF,
         ref_key=STAGE,
-        query_offset_s=0.0,
         ref_start_s=75.0,
     )
-    ResultStore(data / "olaf" / SNAPSHOT / RESULTS).append(str(address), OLAF, outcome)
 
 
 def add_shazam(data: Path, address: ClipAddress, track: tuple[str, str, str], **extra: Any) -> None:
-    artist, song, album = track
-    outcome = ShazamOutcome(200, "matched", artist, song, album, "", **extra)
     (data / "shazam").mkdir(exist_ok=True)
-    ResultStore(data / "shazam" / "results.jsonl").append(str(address), SHAZAM12, outcome)
+    shazam_record(
+        ResultStore(data / "shazam" / "results.jsonl"), str(address), "matched", track, **extra
+    )
 
 
 def run_cli(data: Path, *args: str) -> int:
@@ -139,8 +134,8 @@ def test_the_score_file_has_the_shape_report_py_reads(data: Path) -> None:
     add_olaf(data, ClipAddress(HOUR, 195, 12), COCREDIT)
     for a in grid(HOUR, 12):
         if a.offset_s != 195:
-            ResultStore(data / "olaf" / SNAPSHOT / RESULTS).append(
-                str(a), OLAF, OlafOutcome(0, "no_match")
+            olaf_record(
+                ResultStore(data / "olaf" / SNAPSHOT / RESULTS), str(a), "no_match", identity=OLAF
             )
 
     run_cli(data, "--snapshot", SNAPSHOT)

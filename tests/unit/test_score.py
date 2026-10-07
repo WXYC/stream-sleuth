@@ -19,6 +19,7 @@ from evaluation.results import Emission, Leg, Results, ResultStore, read_results
 from evaluation.score import attribute, load_emissions, plays_from, score_plays
 from stream_sleuth.recognizers.base import EvalIdentification
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+from tests.stores import olaf_record, shazam_record
 
 HOUR = "2026/08/12/202608121600.mp3"
 EMPTY = "2026/08/12/202608121700.mp3"  # gridded, never queried
@@ -329,14 +330,12 @@ def test_pad_per_era(lags: list[float], recommended: float, p95: float | None) -
     }
 
 
-def _store_line(address: str, kind: str, track: tuple[str, str, str] = MOLINA, **extra: Any) -> str:
-    artist, song, album = track
-    record = {
-        "address": address, "recognizer": SHAZAM, "recorded_at": "2026-10-06T20:00:00+00:00",
-        "status": 200, "kind": kind, "artist": artist, "song": song, "album": album, "label": "",
-        "offset_s": None, **extra,
-    }  # fmt: skip
-    return json.dumps(record, ensure_ascii=False) + "\n"
+def _no_matches(
+    store: ResultStore, hour: str, skip: tuple[int, ...] = (), **grid_args: Any
+) -> None:
+    for a in grid(hour, 12, **grid_args):
+        if a.offset_s not in skip:
+            shazam_record(store, a.key, "no_match")
 
 
 def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
@@ -344,30 +343,18 @@ def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
     records = RECORDS + _hour(EMPTY, "canonical", (6, 60.0, CHUQUI, {})) + short
     addresses = grid(HOUR, 12) + grid(EMPTY, 12) + grid(SHORT, 12, hour_s=1800.0)
     # SHORT's records run to 3,585 s, but past 1,785 s they are not in its decoded grid.
-    lines = [_store_line(a.key, "no_match") for a in grid(SHORT, 12)]
-    lines += [
-        _store_line(a.key, "no_match") for a in grid(HOUR, 12) if a.offset_s not in (195, 2700)
-    ]
-    lines += [
-        _store_line(f"{HOUR}#2700+12@128k", "server_error", status=503),  # in play 5's window only
-        _store_line(f"{HOUR}#195+12@128k", "matched"),
-        _store_line(f"{HOUR}#195+12@128k", "matched"),  # a repeat: counted once
-        _store_line(f"{HOUR}#195+12@320k", "matched"),  # another leg
-        _store_line(
-            f"{HOUR}#195+12@128k",
-            "matched",
-            CHUQUI,
-            recognizer=OLAF,
-            confidence=40.0,
-            query_offset_s=0.0,
-            ref_start_s=0.0,
-            ref_key="ab" * 20,
-        ),  # another recognizer
-        _store_line(f"{OTHER}#195+12@128k", "matched"),  # an hour outside the leg
-    ]
-    path = tmp_path / "results.jsonl"
-    path.write_text("".join(lines), encoding="utf-8")
-    results = read_results([ResultStore(path)], {SHAZAM, OLAF})
+    store = ResultStore(tmp_path / "results.jsonl")
+    _no_matches(store, SHORT, hour_s=1800.0)
+    _no_matches(store, HOUR, skip=(195, 2700))
+    shazam_record(store, f"{HOUR}#2700+12@128k", "server_error")  # in play 5's window only
+    shazam_record(store, f"{HOUR}#195+12@128k")
+    shazam_record(store, f"{HOUR}#195+12@128k")  # a repeat: counted once
+    shazam_record(store, f"{HOUR}#195+12@320k")  # another leg
+    olaf_record(
+        store, f"{HOUR}#195+12@128k", "matched", CHUQUI, identity=OLAF
+    )  # another recognizer
+    shazam_record(store, f"{OTHER}#195+12@128k")  # an hour outside the leg
+    results = read_results([store], {SHAZAM, OLAF})
 
     leg = score.score_leg(
         plays_from(records + _hour(OTHER, "canonical", (9, 60.0, MOLINA, {}))),
@@ -403,10 +390,9 @@ def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
 def test_an_address_on_a_window_edge_gates_that_play(
     tmp_path: Path, offset: int, uncovered: set[int]
 ) -> None:
-    lines = [_store_line(a.key, "no_match") for a in grid(HOUR, 12) if a.offset_s != offset]
-    path = tmp_path / "results.jsonl"
-    path.write_text("".join(lines), encoding="utf-8")
-    results = read_results([ResultStore(path)], {SHAZAM})
+    store = ResultStore(tmp_path / "results.jsonl")
+    _no_matches(store, HOUR, skip=(offset,))
+    results = read_results([store], {SHAZAM})
     leg = score.score_leg(plays_from(RECORDS), results, SHAZAM, LEG, [HOUR], grid(HOUR, 12))
     assert {r.play.play_id for r in leg.plays if not r.covered} == uncovered
 
@@ -423,13 +409,10 @@ def test_plays_no_emission_can_join_stay_in_recall_and_are_counted(tmp_path: Pat
         (3, 1200.0, MOLINA, {}),
         (4, 2400.0, ("", "", ""), {"in_pool": None, "pool_match_tier": None}),  # uncovered
     )
-    lines = [
-        _store_line(a.key, "no_match") for a in grid(LABELS, 12) if a.offset_s not in (1215, 3000)
-    ]
-    lines.append(_store_line(f"{LABELS}#1215+12@128k", "matched"))
-    path = tmp_path / "results.jsonl"
-    path.write_text("".join(lines), encoding="utf-8")
-    results = read_results([ResultStore(path)], {SHAZAM})
+    store = ResultStore(tmp_path / "results.jsonl")
+    _no_matches(store, LABELS, skip=(1215, 3000))
+    shazam_record(store, f"{LABELS}#1215+12@128k")
+    results = read_results([store], {SHAZAM})
     leg = score.score_leg(plays_from(records), results, SHAZAM, LEG, [LABELS], grid(LABELS, 12))
     # Play 1 (no artist, in_pool null) is never in the in-pool denominator; plays 1 and 2 have
     # no title key, so title_tier can never join them: misses all the same, and counted. Play 4
@@ -441,12 +424,10 @@ def test_plays_no_emission_can_join_stay_in_recall_and_are_counted(tmp_path: Pat
 
 def test_an_hour_whose_records_are_all_errors_is_uncovered_but_has_records(tmp_path: Path) -> None:
     errors = "2026/08/12/202608122100.mp3"
-    path = tmp_path / "results.jsonl"
-    path.write_text(
-        "".join(_store_line(f"{errors}#{o}+12@128k", "server_error", status=503) for o in (0, 15)),
-        encoding="utf-8",
-    )
-    results = read_results([ResultStore(path)], {SHAZAM})
+    store = ResultStore(tmp_path / "results.jsonl")
+    for offset in (0, 15):
+        shazam_record(store, f"{errors}#{offset}+12@128k", "server_error")
+    results = read_results([store], {SHAZAM})
     plays = plays_from(_hour(errors, "canonical", (1, 120.0, MOLINA, {})))
     leg = score.score_leg(plays, results, SHAZAM, LEG, [errors], grid(errors, 12))
     assert leg.coverage == score.Coverage(
