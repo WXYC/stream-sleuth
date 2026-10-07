@@ -813,12 +813,14 @@ def test_hour_stats_counts_and_median_gap(tmp_path: Path, pool_db: Path) -> None
 def test_hour_stats_slots_are_each_shows_first_track_in_eastern_time(
     tmp_path: Path, pool_db: Path
 ) -> None:
-    # Show 1 starts in the hour, Wednesday 16:01 EDT. Show 2 started before it, with a
-    # talkset row at 15:20 and its first track at 15:50 EDT: its slot is the earlier hour.
+    # Show 1 starts in the hour, Wednesday 16:01 EDT. Show 2 started before it: a talkset row
+    # at 14:50 EDT, an Eastern hour before its first track at 15:50 EDT. Its slot is the
+    # track's hour, so a slot taken from the first row of any type would read 14 instead.
     rows = hour_rows(1, 20, 8, 200.0)
-    rows.append(row(20, ts(19, 20), "talkset", show_id=2))
+    rows.append(row(20, ts(18, 50), "talkset", show_id=2))
     rows += [row(21, ts(19, 50), show_id=2), row(22, ts(20, 10), show_id=2)]
     rows.append(row(30, ts(20, 5, day=19), show_id=3))  # a week on, the same slot
+    rows.append(row(40, ts(19, 30), "talkset", show_id=4))  # no track row, so no slot
     export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
     sheet = corpus.Flowsheet.load(export)
     assert sheet.show_slot == {"1": (2026, 2, 16), "2": (2026, 2, 15), "3": (2026, 2, 16)}
@@ -1214,13 +1216,16 @@ def test_select_corpus_records_a_contrast_shortfall_when_slots_run_out() -> None
 
 
 def test_select_corpus_contrast_hour_spanning_two_slots_belongs_to_both() -> None:
-    first, second, third = keys_in(5, range(10, 13), year=2023)
+    # The spanning hour ranks first; a lower-ranked hour in each of its slots is blocked, so
+    # recording only one of the two slots would let the other hour through.
+    first, in_first_slot, in_second_slot, other = keys_in(5, range(10, 14), year=2023)
     stats = {
         first: stat(first, era="etl", in_pool=9, slots={(2023, 4, 20), (2023, 4, 21)}),
-        second: stat(second, era="etl", in_pool=8, slots={(2023, 4, 21)}),
-        third: stat(third, era="etl", in_pool=7, slots={(2023, 1, 9)}),
+        in_first_slot: stat(in_first_slot, era="etl", in_pool=8, slots={(2023, 4, 20)}),
+        in_second_slot: stat(in_second_slot, era="etl", in_pool=7, slots={(2023, 4, 21)}),
+        other: stat(other, era="etl", in_pool=6, slots={(2023, 1, 9)}),
     }
-    assert contrast(corpus.select_corpus(stats)) == [first, third]
+    assert contrast(corpus.select_corpus(stats)) == [first, other]
 
 
 def test_select_corpus_is_twenty_hours_with_no_shortfall() -> None:
