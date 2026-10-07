@@ -22,6 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from evaluation.s3_readonly import STREAM_ERRORS, archive_bucket, archive_client
+from stream_sleuth.paths import require_outside_checkout
 
 log = logging.getLogger(__name__)
 
@@ -74,13 +75,16 @@ def _is_missing(exc: Exception) -> bool:
 def fetch(key: str, *, archive_dir: Path, client: Any = None, bucket: str | None = None) -> Path:
     """Download the hour ``key`` to ``archive_dir/key`` unless it is already there.
 
-    ``key`` must be one :func:`hour_key` produces, or :class:`InvalidHourKeyError`
+    ``archive_dir`` must be absolute and outside the checkout, or
+    :class:`stream_sleuth.paths.DataPathError` is raised first. ``key`` must be one
+    :func:`hour_key` produces, or :class:`InvalidHourKeyError`
     is raised before any request. An existing file of the
     object's size is kept; one of any other size raises
     :class:`HourSizeMismatchError` and is never overwritten. A new download
     streams into a ``.part`` file renamed only once its size matches the
     object's ``ContentLength``; a short read raises :class:`ShortReadError`.
     """
+    require_outside_checkout(archive_dir)
     try:
         hour_start(key)  # rejects excluded hours and anything that could escape archive_dir
     except ValueError as exc:
@@ -123,6 +127,7 @@ def fetch_all(
     else, such as expired credentials, a missing bucket, a connection error, or
     a bug, would fail every hour or hide a defect, so it propagates.
     """
+    require_outside_checkout(archive_dir)  # run-wide, so never a skipped hour
     client = client or archive_client()
     bucket = bucket or archive_bucket()
     failed = []
