@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 from moto import mock_aws
@@ -36,14 +37,8 @@ SYNTHETIC_TAGS = {
 
 
 @pytest.fixture(autouse=True)
-def synthetic_pool(monkeypatch):
-    for name in list(os.environ):
-        if name.startswith(("AWS_", "STREAM_SLEUTH_", "DIGITAL_ARCHIVE_STORE_")):
-            monkeypatch.delenv(name)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    # Without this, moto passes an unrecognized host through to a real request.
-    monkeypatch.setenv("MOTO_S3_CUSTOM_ENDPOINTS", ENDPOINT)
+def synthetic_pool(monkeypatch, aws_isolated_env):
+    aws_isolated_env.allow_custom_endpoints(ENDPOINT)
     monkeypatch.setenv("STREAM_SLEUTH_POOL_ENDPOINT", ENDPOINT)
     monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", BUCKET)
     monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
@@ -249,3 +244,9 @@ def test_an_indexed_row_is_never_overwritten_by_a_later_failure(tmp_path, db):
 
     assert counts == {"indexed": 1, "failed": 1}
     assert _rows(db) == {obj.key: ("indexed", None)}
+
+
+def test_synthetic_pool_builds_on_the_shared_aws_isolation(request, tmp_path_factory):
+    assert "aws_isolated_env" in request.fixturenames
+    config = Path(os.environ["AWS_CONFIG_FILE"])
+    assert config.is_relative_to(tmp_path_factory.getbasetemp())
