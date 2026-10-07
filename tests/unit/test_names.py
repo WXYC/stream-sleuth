@@ -180,6 +180,52 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
 
 
 @pytest.mark.parametrize(
+    ("s", "fuzzy"),
+    [
+        # A dotted initialism (two or more single letters each followed by a period, the
+        # last period optional) keys as the same letters undotted.
+        ("R.E.M.", "rem"),
+        ("R.E.M", "rem"),
+        ("REM", "rem"),
+        ("A.R. Kane", "ar kane"),
+        ("AR Kane", "ar kane"),
+        ("U.S. Girls", "us girls"),
+        ("L.A. Witch", "la witch"),
+        ("The L.A. Witch Tapes", "the la witch tapes"),
+        ("S.G. Goodman (Live)", "sg goodman live"),
+        ("A.B.C.D.", "abcd"),
+        ("Ñ.Ö.", "no"),
+        # A single initial is no initialism.
+        ("J. Mascis", "j mascis"),
+        ("J.Mascis", "j mascis"),
+        # An abbreviation with a longer word, a number, or a decimal is untouched.
+        ("St. Vincent", "st vincent"),
+        ("Mr. Twin Sister", "mr twin sister"),
+        ("Vol. 2", "vol 2"),
+        ("No. 1", "no 1"),
+        ("Disc 1.5", "disc 1 5"),
+        ("v1.2", "v1 2"),
+        ("1.A.B", "1 ab"),
+        ("x.com", "x com"),
+        ("a.k.a.mix", "aka mix"),
+        ("a.k.a", "aka"),
+        # Initials with a space between them are separate initials, as before.
+        ("J. M. Barrie", "j m barrie"),
+    ],
+)
+def test_fuzzy_joins_a_dotted_initialism_to_the_same_letters(s: str, fuzzy: str) -> None:
+    assert norm.fuzzy(s) == fuzzy
+
+
+@pytest.mark.parametrize("s", ["R.E.M.", "A.R. Kane", "U.S. Girls"])
+def test_the_exact_keys_keep_an_initialism_dotted(s: str) -> None:
+    undotted = s.replace(".", "")
+    assert norm.fold(s) != norm.fold(undotted)
+    assert norm.album_key(s) != norm.album_key(undotted)
+    assert norm.fuzzy(s) == norm.fuzzy(undotted)
+
+
+@pytest.mark.parametrize(
     ("names", "play", "pool"),
     [
         # The play side reads bracketed clauses only; the pool side reads outside them too.
@@ -309,6 +355,10 @@ def test_title_keys(artist: str | None, title: str | None, keys: list[tuple[str,
             ("Jessica Pratt", "y", "Back, Baby (Remix)"),
             "fuzzy",
         ),
+        # A dotted initialism joins the same letters undotted, on the fuzzy key only.
+        (("US Girls", "x", "Overtime"), ("U.S. Girls", "y", "Overtime"), "fuzzy"),
+        (("A.R. Kane", "x", "Baby Milk Snatcher"), ("AR Kane", "y", "Baby Milk Snatcher"), "fuzzy"),
+        (("J. Mascis", "x", "Overtime"), ("JM Mascis", "y", "Overtime"), None),
         # An empty part never joins, on either side.
         (("Jessica Pratt", "x", ""), ("Jessica Pratt", "y", ""), None),
         (("", "x", "Back, Baby"), ("", "y", "Back, Baby"), None),

@@ -19,6 +19,9 @@ _CRUFT = re.compile(
     r"|[^\)\]]*?\b(?:deluxe|expanded|anniversary|bonus track|special) version\b)[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
+# A dotted initialism: two or more single letters, each followed by a period but the last,
+# whose period is optional. A letter inside a longer word, or beside a digit, is no initial.
+_INITIALISM = re.compile(r"(?<!\w)[^\W\d_](?:\.[^\W\d_])+(?!\w)")
 _FEATURING = frozenset({"feat", "ft", "featuring", "with"})
 _BRACKETED = re.compile(r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}")
 # A bracketed clause with one of these whole words, or its plural or past form, names a
@@ -86,6 +89,11 @@ def album_key(s: str | None) -> str:
 def fuzzy(s: str | None) -> str:
     """The fuzzy-tier key: ``album_key(fold(s))`` less bracketed clauses, non-word runs as a space.
 
+    A dotted initialism, two or more single letters each followed by a period (the last
+    period optional), is one word first: "R.E.M." and "R.E.M" key as "REM" does, and
+    "A.R. Kane" as "AR Kane". A single initial ("J. Mascis") and an abbreviation with a
+    longer word ("St. Vincent") are untouched, and the exact keys never join such a pair.
+
     ``(...)``, ``[...]`` and ``{...}`` clauses are dropped after NFKD, which folds
     full-width brackets to ASCII, so "The Worm" joins a tag "The Worm（ザ・ワーム）".
     A version clause is kept, its words less :data:`SAME_RECORDING` phrases and a generic
@@ -102,9 +110,8 @@ def fuzzy(s: str | None) -> str:
         )
         return f" {' '.join(words)} "
 
-    return " ".join(
-        re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, album_key(fold(s)))).split()
-    )
+    undotted = _INITIALISM.sub(lambda m: m.group().replace(".", ""), album_key(fold(s)))
+    return " ".join(re.sub(r"[\W_]+", " ", _BRACKETED.sub(drop_unless_version, undotted)).split())
 
 
 def qualifiers(*names: str | None) -> frozenset[str]:
