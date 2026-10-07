@@ -4,11 +4,14 @@ Station-neutral. ``shazamio``'s own client retries and hides status codes, so
 ``CountingClient`` implements its ``HTTPClientInterface`` instead: exactly one
 ``aiohttp`` attempt per request, every request counted against a ``Throttle``
 before it is sent, and the status and parsed body kept for ``outcome_from``.
-A 429 stops the run for the rest of the UTC day, and the stop is persisted, so a
-restart that day sends nothing. One process holds a throttle state file at a
-time, enforced with a lock. Only ``matched`` and ``no_match`` are scoring
-outcomes; ``server_error`` and ``decode_error`` are stored too and retried by a
-later run. The store is a JSONL file the harness only ever appends to.
+A 429 (``rate_limited``) or a 403 (``forbidden``) stops the run for the rest of the UTC
+day, and the stop is persisted, so a restart that day sends nothing. A state file whose
+last request is more than the interval in the future is refused, never slept on. One
+process holds a throttle state file at a time, enforced with a lock. Only ``matched``
+and ``no_match`` are scoring outcomes; ``server_error`` and ``decode_error`` are stored
+too and retried by a later run, at most ``MAX_RETRIES`` times per address, after which
+the address is reported and not queried. The store is a JSONL file the harness only
+ever appends to.
 
 The result store, the throttle state, and the clip work directory are research
 data: each is checked with ``stream_sleuth.paths.require_outside_checkout`` before
@@ -27,6 +30,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
@@ -45,10 +49,20 @@ from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
 
+Key = tuple[str, str]  # a clip address and the recognizer identity it was queried with
 SCORING_KINDS = frozenset({"matched", "no_match"})
 # Consecutive non-scoring outcomes that stop the day: a systemic failure other than a
-# 429 (a 403, a changed response shape) would otherwise spend the whole daily budget.
+# 429 or 403 (a changed response shape, a flapping 5xx) would otherwise spend the whole budget.
 MAX_FAILURE_STREAK = 20
+# Retries after an address's first non-scoring outcome; past them it is reported, not queried.
+MAX_RETRIES = 3
+# Statuses that stop the day, with the reason: 429 is load, 403 is access policy. Neither is
+# the address's fault, so neither counts toward its retries.
+STOP_REASONS = {429: "rate_limited", 403: "forbidden"}
+
+
+def _utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
 def recognizer_identity(segment_s: int) -> str:
@@ -170,7 +184,7 @@ class Throttle:
     def _state(self) -> dict[str, Any]:
         if self._lock is None:
             raise ValueError(f"throttle on {self.state_path} is closed")
-        today = datetime.fromtimestamp(self.clock(), timezone.utc).date().isoformat()
+        today = _utc(self.clock())[:10]
         state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
         if today > state.get("day", ""):  # a clock stepped back keeps the later day's state
             state = {"day": today, "count": 0, "last": state.get("last"), "stopped": False}
@@ -195,10 +209,16 @@ class Throttle:
                 raise DayStoppedError(stopped if isinstance(stopped, str) else "rate_limited")
             if state["count"] >= self.rate_per_day:
                 raise DayStoppedError("daily_cap")
-            last = state["last"]
-            wait = 0.0 if last is None else last + self.min_interval_s - self.clock()
+            last, now = state["last"], self.clock()
+            wait = 0.0 if last is None else last + self.min_interval_s - now
+            if wait > 2 * self.min_interval_s:  # last is more than an interval ahead of now
+                raise ValueError(
+                    f"{self.state_path}: last {_utc(last)} is in the future of now {_utc(now)}"
+                )
             if wait <= 0:
                 break
+            if wait > self.min_interval_s:
+                log.warning("%s: waiting %.0fs, longer than the interval", self.state_path, wait)
             await self.sleep(wait)
         self._save({**state, "count": state["count"] + 1, "last": self.clock()})
 
@@ -267,11 +287,21 @@ class ResultStore:
         except OSError:  # missing or empty
             return False
 
-    def scored(self) -> set[tuple[str, str]]:
-        """Addresses with a scoring outcome; anything else is retried."""
-        return {
-            (r["address"], r["recognizer"]) for r in self.records() if r["kind"] in SCORING_KINDS
-        }
+    def history(self) -> tuple[set[Key], set[Key], set[Key]]:
+        """The scored, tried, and exhausted keys: the one tally that ``run`` and the report share.
+
+        A key is exhausted after a first failure and ``MAX_RETRIES`` failed retries, where a
+        failure is a non-scoring outcome that is not a day-stopping status.
+        """
+        scored, tried, failures = set[Key](), set[Key](), Counter[Key]()
+        for r in self.records():
+            key = (r["address"], r["recognizer"])
+            tried.add(key)
+            if r["kind"] in SCORING_KINDS:
+                scored.add(key)
+            elif r["status"] not in STOP_REASONS:
+                failures[key] += 1
+        return scored, tried, {key for key, n in failures.items() if n > MAX_RETRIES}
 
     def append(self, address: str, recognizer: str, outcome: ShazamOutcome) -> None:
         record = {
@@ -291,25 +321,25 @@ async def run(
     store: ResultStore,
     client: CountingClient,
 ) -> str:
-    """Query every unscored address in order.
+    """Query every unscored address in order, except those out of retries (logged, not queried).
 
-    Returns ``done``, ``rate_limited``, ``daily_cap``, or ``failure_streak`` (after
-    ``MAX_FAILURE_STREAK`` non-scoring outcomes in a row, which stops the day like a 429).
+    Returns ``done``, ``rate_limited``, ``forbidden`` (a 403), ``daily_cap``, or
+    ``failure_streak`` (after ``MAX_FAILURE_STREAK`` non-scoring outcomes in a row);
+    all but ``done`` and ``daily_cap`` stop the day like a 429.
     """
-    records = store.records()
-    scored = {(r["address"], r["recognizer"]) for r in records if r["kind"] in SCORING_KINDS}
-    tried = {(r["address"], r["recognizer"]) for r in records}
+    scored, tried, exhausted = store.history()
 
-    def key(address: ClipAddress) -> tuple[str, str]:
+    def key(address: ClipAddress) -> Key:
         return (str(address), recognizer_identity(address.length_s))
 
-    pending = [a for a in addresses if key(a) not in scored]
+    for k in exhausted:
+        log.warning("not querying %s (%s): out of retries", *k)
+    pending = [a for a in addresses if key(a) not in scored | exhausted]
     # Never-tried addresses first, so a stretch that always fails is retried only after
     # them and cannot trip the failure streak at the same place every day.
     pending.sort(key=lambda a: key(a) in tried)  # stable: grid order within each group
     streak = 0
     for address in pending:
-        identity = recognizer_identity(address.length_s)
         shazam = Shazam(http_client=client, segment_duration_seconds=address.length_s)
         try:
             with open_clip(address) as clip:
@@ -323,11 +353,11 @@ async def run(
         except (aiohttp.ClientError, asyncio.TimeoutError):
             status = client.last[0]  # a 429 whose body failed to arrive still stops the day
             outcome = ShazamOutcome(status, "rate_limited" if status == 429 else "server_error")
-        if outcome.kind == "rate_limited":
-            client.throttle.stop_for_day()  # before the record, so a crash between keeps the stop
-            store.append(str(address), identity, outcome)
-            return "rate_limited"
-        store.append(str(address), identity, outcome)
+        if reason := STOP_REASONS.get(outcome.status):
+            client.throttle.stop_for_day(reason)  # before the record, so a crash between keeps it
+            store.append(*key(address), outcome)
+            return reason
+        store.append(*key(address), outcome)
         streak = 0 if outcome.kind in SCORING_KINDS else streak + 1
         if streak >= MAX_FAILURE_STREAK:
             log.warning("%d non-scoring outcomes in a row; stopping for the day", streak)
@@ -396,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     log.info("stopped: %s after %d requests", stop, client.requests)
+    if exhausted := sorted(store.history()[2]):
+        log.warning("out of retries and not queried: %s", exhausted)
     return 0
 
 
