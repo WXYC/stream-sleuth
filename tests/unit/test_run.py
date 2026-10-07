@@ -20,7 +20,7 @@ import pytest
 
 from evaluation import run as run_mod
 from evaluation.clips import ClipAddress
-from evaluation.run import LEGS, main, preflight, read_hours, run_legs, run_olaf
+from evaluation.run import LEGS, main, preflight, read_hours, read_results, run_legs, run_olaf
 from evaluation.shazam_eval import (
     MAX_RETRIES,
     CountingClient,
@@ -361,6 +361,25 @@ def test_an_olaf_record_is_the_shazam_shape_plus_confidence_and_ref_key(tmp_path
     assert (record["status"], record["offset_s"]) == (0, None)  # 0: the subprocess answered
     assert (record["kind"], record["confidence"], record["ref_key"]) == ("matched", 42.0, "ab" * 20)
     assert store.history()[0] == {(f"{HOUR}#0+12@128k", "olaf@x")}
+
+
+def test_a_matched_olaf_record_reads_back_as_one_emission(tmp_path: Path) -> None:
+    store, identity = olaf_store(tmp_path), "olaf@x"
+    run_one_olaf(store, FakeOlaf(), identity, n=1)
+    results = read_results([store], {identity})
+    [emission] = results.emissions
+    assert emission.key == (f"{HOUR}#0+12@128k", identity)
+    assert emission.found == {**MATCH, "at": 0.0}
+    assert results.scored == {emission.key} and results.uncovered == {}
+
+
+def test_a_no_match_olaf_record_is_scored_and_not_uncovered(tmp_path: Path) -> None:
+    store, identity = olaf_store(tmp_path), "olaf@x"
+    run_one_olaf(store, FakeOlaf(match=None), identity, n=1)
+    results = read_results([store], {identity})
+    assert results.emissions == []
+    assert results.scored == {(f"{HOUR}#0+12@128k", identity)}
+    assert results.uncovered == {}
 
 
 def test_a_result_filed_under_one_floor_is_not_reused_for_another(tmp_path: Path) -> None:
