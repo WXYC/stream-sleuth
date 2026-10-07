@@ -7,6 +7,7 @@ two references: one tagged the way the station's files are, one with no tags at 
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -15,7 +16,9 @@ from mutagen.id3 import TALB, TIT2, TPE1
 from mutagen.wave import WAVE
 
 from evaluation import pool
+from evaluation import run as run_mod
 from evaluation.olaf_snapshot import build_snapshot
+from evaluation.run import main
 from stream_sleuth.loop import Cadence, State, step
 from stream_sleuth.recognizers.olaf import OlafRecognizer, snapshot_dir
 from tests.audio import render
@@ -92,3 +95,33 @@ def test_a_match_carries_the_references_tags_and_an_untagged_one_is_a_miss(
         "",
     ]
     assert step(State(CADENCE.fast), untagged, CADENCE)[1].emit is None
+
+
+def test_an_olaf_leg_files_each_clip_under_its_reference_and_resumes(
+    synthetic_pool, tmp_path, monkeypatch
+):
+    build_snapshot("rotation", pool.inventory(["rotation/"]), olaf_bin=OLAF_BIN)
+    monkeypatch.setattr(run_mod.shutil, "disk_usage", lambda p: type("U", (), {"free": 1 << 40}))
+    hour = "2026/08/12/202608121600.mp3"
+    data = tmp_path / "data"
+    (data / "archive" / hour).parent.mkdir(parents=True)
+    render(
+        data / "archive" / hour,
+        noise(11),
+        noise(22),
+        args=["-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "128k"],
+    )  # fmt: skip
+    (data / "selection.json").write_text(json.dumps({"hours": {hour: {"subset": True}}}))
+    results = snapshot_dir("rotation") / "results.jsonl"
+
+    assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
+
+    by_address = {r["address"]: r for r in map(json.loads, results.read_text().splitlines())}
+    assert len(by_address) == 8  # every 15 s grid offset that fits a 12 s clip in 120 s
+    assert by_address[f"{hour}#0+12@128k"]["ref_key"] == pool.stage_id(TAGGED)
+    assert by_address[f"{hour}#0+12@128k"]["artist"] == "Juana Molina"
+    assert by_address[f"{hour}#90+12@128k"]["ref_key"] == pool.stage_id(UNTAGGED)
+    before = results.read_bytes()
+
+    assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
+    assert results.read_bytes() == before  # nothing was queried or stored again
