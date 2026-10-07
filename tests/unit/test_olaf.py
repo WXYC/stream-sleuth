@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import stat
+import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -319,7 +322,7 @@ def test_a_failure_reported_only_on_stdout_still_names_its_reason(olaf, fake_ola
 
 @pytest.mark.parametrize(
     "state",
-    ["absent", "empty", "failed store"],
+    ["absent", "empty", "failed store", "no config"],
 )
 def test_querying_a_snapshot_without_an_index_is_an_error_and_creates_nothing(
     olaf, fake_olaf, tmp_path, state
@@ -333,6 +336,9 @@ def test_querying_a_snapshot_without_an_index_is_an_error_and_creates_nothing(
     elif state == "failed store":  # Olaf leaves its db folder but no data.mdb
         (home / ".olaf" / "db").mkdir(parents=True)
         (home / ".olaf" / "olaf_config.json").write_text("{}")
+    elif state == "no config":  # Olaf would fall back to a config beside its binary
+        (home / ".olaf" / "db").mkdir(parents=True)
+        (home / ".olaf" / "db" / "data.mdb").write_bytes(b"")
     before = sorted(tmp_path.rglob("*"))
     with pytest.raises(olaf.OlafError, match="no Olaf index"):
         olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("clip.wav")
@@ -376,3 +382,92 @@ def test_index_build_refuses_the_snapshot_and_creates_nothing(
     assert calls() == []
     assert sorted(tmp_path.rglob("*")) == before
     assert not (CHECKOUT / "snap").exists()
+
+
+def test_a_large_store_is_split_so_no_argv_grows_past_the_limit(olaf, fake_olaf, tmp_path):
+    script, _, calls = fake_olaf
+    pairs = [(f"/pool/{i}.mp3", f"id-{i}") for i in range(2 * olaf.STORE_BATCH + 1)]
+    olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).store(pairs)
+    batches = [c["argv"] for c in calls()]
+    assert [len(b) for b in batches] == [
+        2 + 2 * olaf.STORE_BATCH,
+        2 + 2 * olaf.STORE_BATCH,
+        2 + 2,
+    ]
+    assert all(b[:2] == ["store", "--with-ids"] for b in batches)
+    assert [a for b in batches for a in b[2:]] == [a for pair in pairs for a in pair]
+
+
+@pytest.mark.parametrize("action", ["query", "store"])
+def test_a_missing_binary_is_an_olaf_error(olaf, snap, tmp_path, action):
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(tmp_path / "no-such-olaf"))
+    with pytest.raises(olaf.OlafError, match="cannot run"):
+        if action == "query":
+            recognizer.recognize("clip.wav")
+        else:
+            recognizer.store([("/a.mp3", "id")])
+
+
+def test_a_timed_out_query_kills_the_decoder_olaf_started(olaf, fake_olaf, snap, tmp_path):
+    # Olaf decodes with an ffmpeg child; a timeout must not leave it running.
+    script, set_output, _ = fake_olaf
+    child_pid = tmp_path / "child.pid"
+    script.write_text(
+        script.read_text().replace(
+            "sys.exit(reply",
+            "import subprocess, time\n"
+            "child = subprocess.Popen(['sleep', '30'])\n"
+            f"open({str(child_pid)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(30); sys.exit(reply",
+        )
+    )
+    set_output(json.dumps(query_object(0.0)))
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script), query_timeout_s=1.0)
+    with pytest.raises(olaf.OlafError, match="timed out"):
+        recognizer.recognize("clip.wav")
+    pid = int(child_pid.read_text())
+    for _ in range(50):
+        if not _alive(pid):
+            break
+        time.sleep(0.05)
+    assert not _alive(pid)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A killed child of the fake (reparented to init) is reaped promptly; a zombie
+    # would still answer kill(0), so check its state too.
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return bool(state.stdout.strip()) and not state.stdout.strip().startswith("Z")
+
+
+def test_a_lookup_missing_a_key_falls_back_for_that_key(olaf, fake_olaf, snap):
+    script, set_output, _ = fake_olaf
+    set_output(json.dumps(README_RECORD))
+    tags = {"chuquimamani-condori-call-your-name": {"artist": "Chuquimamani-Condori"}}
+    result = olaf.OlafRecognizer(snap, olaf_bin=str(script), lookup=tags.get).recognize("c.wav")
+    assert (result["artist"], result["song"], result["album"], result["label"]) == (
+        "Chuquimamani-Condori",
+        "chuquimamani-condori-call-your-name",
+        "",
+        "",
+    )
+
+
+def test_index_build_reports_an_olaf_failure_in_one_line(
+    fresh_recognizer, fake_olaf, tmp_path, capsys
+):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    script, set_output, _ = fake_olaf
+    set_output(code=1, stderr="File is not an audio file")
+    argv = ["index", "build", "--home", str(tmp_path / "snap"), "--olaf-bin", str(script)]
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main([*argv, "/track.aiff", "id"])
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "File is not an audio file" in err
+    assert "Traceback" not in err
