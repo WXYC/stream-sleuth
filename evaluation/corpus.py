@@ -412,8 +412,6 @@ def select_corpus(stats: dict[str, HourStats]) -> Selection:
     old = sorted((h for h in stats.values() if h.era == "etl" and _dj(h)
                   and hour_start(h.key).astimezone(EASTERN).year in CONTRAST_YEARS), key=_by_share)  # fmt: skip
     _contrast(sel, old)
-    for name, missing in sel.shortfalls.items():
-        log.warning("selection shortfall %s: %d", name, missing)
     log.info("selected %d hours", len(sel.hours))
     return sel
 
@@ -480,8 +478,18 @@ def write_selection(
         raise
 
 
-def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
+def write_plays(
+    out: Path,
+    hours: Iterable[str],
+    sheet: Flowsheet,
+    pool: PoolIndex,
+    labels: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Write one ``plays.jsonl`` record per track row in each hour; never overwrites ``out``.
+
+    Each record carries its hour's ``group``, ``band`` and ``subset``: from ``labels``
+    (``selection.json``'s ``hours``) when it names the hour, else ``group`` is ``null``,
+    ``band`` is the hour key's own, and ``subset`` is false.
 
     Every key is validated before ``out`` is created, so a bad key leaves no partial
     file, and a failed write removes the file it created. An hour with no flowsheet
@@ -499,6 +507,7 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
     lines = []
     for key in dict.fromkeys(hours):
         start = hour_start(key)
+        label = (labels or {}).get(key, {})
         rows = sheet.by_hour.get(key, [])
         if not rows:
             log.warning("%s: no flowsheet rows; is the hour inside the export?", key)
@@ -528,6 +537,8 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
                 "in_pool": tier is not None if fold(r.artist) else None, "pool_match_tier": tier,
                 "pool_format": fmt, "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
                 "carryover": carryover, "track_rows": len(tracks), "talk_rows": talk_rows,
+                "group": label.get("group"), "band": label.get("band") or band(key),
+                "subset": bool(label.get("subset")),
             }  # fmt: skip
             lines.append(json.dumps(record, ensure_ascii=False) + "\n")
         log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
@@ -557,12 +568,14 @@ def _select(argv: list[str]) -> int:
     stats = hour_stats(Flowsheet.load(args.export), PoolIndex.load(args.pool_db))
     sel = select_corpus(stats)
     subset = choose_subset(sel, stats)
+    for name, missing in sel.shortfalls.items():  # after the subset, so subset/<group> is logged
+        log.warning("selection shortfall %s: %d", name, missing)
     write_selection(out_dir, sel, subset, args.export.name, args.pool_db)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The CLI: ``select ...`` freezes a selection; otherwise ``--hours`` writes plays."""
+    """The CLI: ``select ...`` freezes a selection; otherwise ``--hours`` or ``--selection`` writes plays."""
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["select"]:
         return _select(argv[1:])
@@ -571,12 +584,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--export", type=Path, required=True, help="dated export directory")
     parser.add_argument("--pool-db", type=Path, required=True)
-    parser.add_argument("--hours", type=Path, required=True, help="file of hour keys, one per line")
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--hours", type=Path, help="file of hour keys, one per line")
+    which.add_argument("--selection", type=Path, help="selection.json written by `select`")
     parser.add_argument("--out", type=Path, required=True, help="plays.jsonl to create")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    hours = args.hours.read_text().split()
-    write_plays(args.out, hours, Flowsheet.load(args.export), PoolIndex.load(args.pool_db))
+    labels = json.loads(args.selection.read_text())["hours"] if args.selection else None
+    hours = list(labels) if labels is not None else args.hours.read_text().split()
+    write_plays(args.out, hours, Flowsheet.load(args.export), PoolIndex.load(args.pool_db), labels)
     return 0
 
 

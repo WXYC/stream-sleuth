@@ -170,8 +170,10 @@ uv run --extra eval python -m evaluation.corpus select \
     --export "$DATA/exports/<date>" --pool-db "$DATA/pool.db" --out-dir "$DATA"
 uv run --extra eval python -m evaluation.corpus \
     --export "$DATA/exports/<date>" --pool-db "$DATA/pool.db" \
-    --hours "$DATA/hours.txt" --out "$DATA/plays.jsonl"
+    --selection "$DATA/selection.json" --out "$DATA/plays.jsonl"
 ```
+
+`--selection` reads the hours (and their labels) from `selection.json`; it and `--hours` are mutually exclusive, and `--hours` still takes any file of hour keys, such as `hours.txt` or `subset.txt`. Every play record, carryover plays included, carries `group` (`canonical-high`, `canonical-low`, `contrast`, or `null` for a bare `--hours` file), `band` (`overnight`, `daytime`, `evening`; the hour key's own band when nothing labels it), and `subset` (true for the four subset hours, else false), so the report can slice recall by group, band, and subset.
 
 ## Notes
 
