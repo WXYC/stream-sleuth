@@ -33,6 +33,7 @@ from evaluation.shazam_eval import (
     ResultStore,
     Throttle,
     budget_from_env,
+    require_pinned_shazamio,
 )
 from evaluation.shazam_eval import run as run_shazam
 from stream_sleuth.paths import data_dir, require_outside_checkout
@@ -151,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)  # tests only
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    require_pinned_shazamio()
     data = data_dir()
     work_dir = require_outside_checkout(args.work_dir or data / "clips")
     archive_dir = require_outside_checkout(args.archive_dir or data / "archive")

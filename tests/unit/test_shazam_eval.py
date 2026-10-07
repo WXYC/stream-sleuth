@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,11 +21,13 @@ from pathlib import Path
 import aiohttp
 import pytest
 
+from evaluation import run as run_mod
 from evaluation import shazam_eval
 from evaluation.clips import ClipAddress, ClipError
 from evaluation.shazam_eval import (
     MAX_FAILURE_STREAK,
     MAX_RETRIES,
+    SHAZAMIO_VERSION,
     CountingClient,
     FutureStateError,
     ResultStore,
@@ -33,6 +36,7 @@ from evaluation.shazam_eval import (
     ThrottleBusyError,
     outcome_from,
     recognizer_identity,
+    require_pinned_shazamio,
     run,
 )
 from stream_sleuth.paths import CHECKOUT, DataPathError
@@ -804,6 +808,65 @@ def test_a_refused_state_logs_the_summary_and_exits_non_zero_with_one_message(
     assert "wait" in refusals[0] and "clock" in refusals[0]
     assert "deleting" in refusals[0] and "resets" in refusals[0]
     assert json.loads(state.read_text())["count"] == 1
+
+
+def test_the_stored_identity_is_frozen_byte_for_byte() -> None:
+    # A live leg filed hundreds of answers under this string; changing it re-queries every address.
+    assert recognizer_identity(12) == "shazam@0.8.1, segment=12"
+    assert recognizer_identity(6) == "shazam@0.8.1, segment=6"
+
+
+def test_the_pinned_version_is_the_locked_and_the_installed_one() -> None:
+    lock = (CHECKOUT / "uv.lock").read_text()  # no tomllib: the floor is 3.10
+    locked = re.search(r'\[\[package\]\]\nname = "shazamio"\nversion = "([^"]+)"', lock)
+    assert locked is not None
+    assert SHAZAMIO_VERSION == locked.group(1)
+    assert SHAZAMIO_VERSION == shazam_eval.version("shazamio")
+    require_pinned_shazamio()  # the installed version agrees, so it returns
+
+
+def test_the_identity_is_built_from_the_constant_not_the_installed_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shazam_eval, "version", lambda name: "9.9.9")
+    assert recognizer_identity(12) == "shazam@0.8.1, segment=12"
+
+
+def test_another_installed_version_is_refused_with_what_it_would_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shazam_eval, "version", lambda name: "9.9.9")
+    with pytest.raises(SystemExit) as refusal:
+        require_pinned_shazamio()
+    message = str(refusal.value)
+    assert "\n" not in message
+    for part in ("9.9.9", SHAZAMIO_VERSION, "new identity", "re-queries every address", "go-ahead"):
+        assert part in message, part
+
+
+@pytest.mark.parametrize("entry", [shazam_eval.main, run_mod.main], ids=["shazam_eval", "run"])
+def test_a_cli_on_another_shazamio_version_refuses_before_the_lock_or_any_request(
+    entry: Callable[[list[str]], int],
+    tmp_path: Path,
+    server: list[FakeShazam],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeShazam([])
+    server.append(fake)
+    monkeypatch.setattr(shazam_eval, "version", lambda name: "9.9.9")
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path / "data"))
+    state = tmp_path / "throttle.json"
+    hours = tmp_path / "hours.txt"
+    hours.write_text(HOUR + "\n")
+    argv = ["--state", str(state), "--base-url", fake.url]
+    if entry is shazam_eval.main:
+        argv += ["--hours", str(hours), "--archive-dir", str(tmp_path)]
+    with pytest.raises(SystemExit) as refusal:
+        entry(argv)
+    assert refusal.value.code not in (0, None)
+    assert fake.requests == []
+    assert list(tmp_path.glob("throttle.json*")) == []  # no state file and no <state>.lock
+    assert not (tmp_path / "data").exists()
 
 
 def test_external_api_is_declared_excluded_and_opted_out_of_ci_sync() -> None:
