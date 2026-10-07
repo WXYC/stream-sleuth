@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from evaluation import run as run_mod
-from evaluation.clips import ClipAddress, ClipError
+from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError
 from evaluation.run import (
     LEGS,
     main,
@@ -40,7 +40,7 @@ from evaluation.shazam_eval import (
     recognizer_identity,
 )
 from stream_sleuth.recognizers.base import EvalIdentification
-from stream_sleuth.recognizers.olaf import OlafError
+from stream_sleuth.recognizers.olaf import DEFAULT_MIN_MATCH_COUNT, OlafError
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
 from tests.characterization.shazam_responses import NO_MATCH
 from tests.shazam_fake import HTML_429, FakeShazam, clock_at, json_response, write_tone
@@ -531,3 +531,10 @@ def test_the_budget_variables_are_read_in_one_place(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "7")
     monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "1.5")
     assert budget_from_env() == (7, 1.5)
+
+
+def test_study_identities_without_a_snapshot_name_only_the_shazam_segments() -> None:
+    assert study_identities(None) == {recognizer_identity(n) for n in CAPTURE_LENGTHS_S}
+    assert study_identities("rotation") == study_identities(None) | {
+        olaf_identity("rotation", DEFAULT_MIN_MATCH_COUNT)
+    }
