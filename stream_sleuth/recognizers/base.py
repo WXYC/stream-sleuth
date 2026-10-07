@@ -36,11 +36,13 @@ class EvalIdentification(Identification, total=False):
     """Recognizer-specific and not comparable across sources: Olaf's ``match_count``; absent for Shazam."""
 
     query_offset_s: float
-    """Seconds into the query clip at which the match begins. Set together with ``ref_start_s`` or
-    not at all; Shazam reports no query offset, so both are absent for Shazam."""
+    """Seconds into the query clip at which the match begins. Set together with ``ref_start_s``, so
+    ``at + query_offset_s - ref_start_s`` is the song's start in the hour file. Shazam reports no
+    query offset, so the driver sets it to 0 for Shazam."""
 
     ref_start_s: float
-    """Seconds into the reference recording at which the match begins."""
+    """Seconds into the reference recording at which the match begins; for Shazam, the driver sets it
+    from the response's ``matches[0].offset``."""
 
     ref_key: str
     """The reference's pool stage id (``evaluation.pool.stage_id`` of its object key, a sha1), not the
