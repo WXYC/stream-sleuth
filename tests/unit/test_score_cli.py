@@ -1024,3 +1024,40 @@ def test_a_distinct_run_is_dropped_only_when_every_emission_in_it_is_talk() -> N
         score.distinct_precision(verdicts, calls) == 0.5
     )  # the first run is correct, the third not
     assert score.precision(verdicts, calls) == 1 / 3
+
+
+def test_a_run_that_grew_after_it_was_labeled_is_logged_and_not_applied(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    filled = fill_verdict(data / FP_QUEUE, "unlogged-correct")  # the run of two at 750 and 765
+    add_shazam(data, ClipAddress(HOUR, 780, 12), UNLOGGED)  # the run now ends later and holds three
+    caplog.set_level("WARNING")
+
+    run_cli(data)
+
+    [grown] = [r.getMessage() for r in caplog.records if "grown" in r.getMessage()]
+    assert "false_positives.csv" in grown and "row 2" in grown
+    assert "765" in grown and "780" in grown and "2" in grown and "3" in grown
+    assert (data / FP_QUEUE).read_bytes() == filled
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert leg["adjudicated_runs"] == 0
+    assert leg["adjudicated_precision"] == leg["precision"]
+
+
+@pytest.mark.parametrize("emissions", ["2", "2.0", " 2 ", "02"])
+def test_an_unchanged_run_still_applies_whatever_a_spreadsheet_made_of_its_extent(
+    data: Path, emissions: str
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    fill_verdict(data / FP_QUEUE, "unlogged-correct")
+    [row] = read_queue(data / FP_QUEUE)
+    set_cells(
+        data / FP_QUEUE, "12s/shazam", emissions=emissions, last_address=f" {row['last_address']} "
+    )
+
+    run_cli(data)
+
+    assert read_score(data)["legs"]["12s/shazam"]["adjudicated_runs"] == 1

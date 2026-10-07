@@ -294,10 +294,24 @@ def _key(row: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(row.get(c, "").strip() for c in KEY_COLUMNS)
 
 
-def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str, ...], str]]:
-    """A queue's rows as ``(row number, key, verdict)``, ``[]`` when ``path`` is absent.
+def _extent(row: Mapping[str, str]) -> tuple[str, str]:
+    """A row's ``(last_address, emissions)`` as a spreadsheet may have left them: blanks stripped, and an
+    ``emissions`` of ``3.0`` or ``03`` read as ``3`` (anything that is not a number stays as written)."""
+    count = row.get("emissions", "").strip()
+    try:
+        count = str(int(float(count)))
+    except (ValueError, OverflowError):
+        pass
+    return row.get("last_address", "").strip(), count
 
-    The row number is the spreadsheet's (the header is row 1). The verdict is what the person's
+
+def read_queue(
+    path: Path, columns: Sequence[str]
+) -> list[tuple[int, tuple[str, ...], str, tuple[str, str]]]:
+    """A queue's rows as ``(row number, key, verdict, extent)``, ``[]`` when ``path`` is absent.
+
+    The row number is the spreadsheet's (the header is row 1). The extent is the run's
+    ``(last_address, emissions)`` as labeled (:func:`_extent`). The verdict is what the person's
     entry stands for (``correct``, ``wrong``, or ``talk``; blank stays ``""``, matched without
     regard to case and surrounding blanks). ``SystemExit``, one line naming ``path``, when the
     file is not a queue of this command's (its header, matched without regard to case and past a
@@ -306,7 +320,7 @@ def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str,
     one run (:data:`KEY_COLUMNS`), which would leave a conflict to file order.
     """
     allowed = VERDICTS[tuple(columns)]
-    rows: list[tuple[int, tuple[str, ...], str]] = []
+    rows: list[tuple[int, tuple[str, ...], str, tuple[str, str]]] = []
     first: dict[tuple[str, ...], int] = {}
     try:
         with path.open(encoding="utf-8-sig", newline="") as f:
@@ -324,7 +338,7 @@ def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str,
                 if (key := _key(row)) in first:
                     raise SystemExit(f"{path}: rows {first[key]} and {number} are the same run")
                 first[key] = number
-                rows.append((number, key, allowed.get(entry.lower(), "")))
+                rows.append((number, key, allowed.get(entry.lower(), ""), _extent(row)))
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError, csv.Error):
@@ -339,7 +353,7 @@ def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, 
     A person's work is never overwritten: a file with a verdict in it is refused here, and
     :func:`settle_queue` is what keeps it.
     """
-    if any(verdict for *_, verdict in read_queue(path, columns)):
+    if any(row[2] for row in read_queue(path, columns)):
         raise SystemExit(f"{path}: has verdicts filled in; not overwriting it")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -356,23 +370,36 @@ def settle_queue(
 
     A verdict applies to every emission of its run. A filled-in row is matched to a current run by
     :data:`KEY_COLUMNS`; a row that matches none is logged once, in one line, and ignored, and a
-    current run the file has no row for stays wrong. A blank verdict gives no entry.
+    current run the file has no row for stays wrong. A row applies only to a run that still ends where
+    it did when labeled (same ``last_address`` and ``emissions``); a run that has grown or shrunk is
+    logged with its row and both extents, not applied, and its row is never rewritten. A blank
+    verdict gives no entry.
     """
     rows = read_queue(path, columns)
-    if not any(verdict for *_, verdict in rows):
+    if not any(row[2] for row in rows):
         write_queue(path, columns, (row for row, _ in queued))
         return {}
     current = {_key(row): (row["leg"], run) for row, run in queued}
-    if stale := [str(n) for n, key, _ in rows if key not in current]:
+    if stale := [str(n) for n, key, *_ in rows if key not in current]:
         log.warning("%s: no current run matches row(s) %s; ignored", path, ", ".join(stale))
-    if unqueued := current.keys() - {key for _, key, _ in rows}:
+    if unqueued := current.keys() - {key for _, key, *_ in rows}:
         runs = "; ".join(f"{leg} {address}" for leg, _, address in sorted(unqueued))
         log.warning(
             "%s: %d current run(s) have no row and stay wrong: %s", path, len(unqueued), runs
         )
     calls: defaultdict[str, dict[str, str]] = defaultdict(dict)
-    for _, key, verdict in rows:
+    for number, key, verdict, extent in rows:
         if verdict and key in current:
             tag, run = current[key]
+            now = (run[-1].emission.address.key, str(len(run)))
+            if extent != now:
+                log.warning(
+                    "%s: row %d: run has grown or shrunk since it was labeled (last_address %s, %s emissions; now %s, %s); ignored",
+                    path,
+                    number,
+                    *extent,
+                    *now,
+                )
+                continue
             calls[tag].update({v.emission.address.key: verdict for v in run})
     return calls
