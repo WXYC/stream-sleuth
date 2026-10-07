@@ -116,14 +116,12 @@ class OlafRecognizer(Recognizer):
         if not pairs:
             return
         config = self.home / SNAPSHOT_CONFIG_PATH
-        if not config.exists():
-            try:
+        try:
+            if not config.exists():
                 config.parent.mkdir(parents=True, exist_ok=True)
                 config.write_text(json.dumps(SNAPSHOT_CONFIG, indent=2) + "\n")
-            except OSError as exc:
-                raise OlafError(
-                    f"cannot create the snapshot in {self.home}: {exc.strerror}"
-                ) from exc
+        except OSError as exc:
+            raise OlafError(f"cannot create the snapshot in {self.home}: {exc.strerror}") from exc
         for i in range(0, len(pairs), STORE_BATCH):
             batch = [arg for pair in pairs[i : i + STORE_BATCH] for arg in pair]
             self._run("store", "--with-ids", *batch)

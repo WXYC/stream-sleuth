@@ -556,6 +556,20 @@ def test_store_reports_an_uncreatable_snapshot_as_olaf_error(olaf, fake_olaf, tm
     assert calls() == []
 
 
+def test_store_reports_an_unsearchable_parent_as_olaf_error(olaf, fake_olaf, tmp_path):
+    script, _, calls = fake_olaf
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    recognizer = olaf.OlafRecognizer(locked / "snap", olaf_bin=str(script))
+    locked.chmod(0)
+    try:
+        with pytest.raises(olaf.OlafError, match="cannot create"):
+            recognizer.store([("/a.mp3", "id")])
+    finally:
+        locked.chmod(stat.S_IRWXU)
+    assert calls() == []
+
+
 def test_index_build_reports_an_uncreatable_snapshot_in_one_line(
     fresh_recognizer, fake_olaf, tmp_path, capsys
 ):
