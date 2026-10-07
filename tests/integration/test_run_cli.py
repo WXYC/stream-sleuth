@@ -28,6 +28,11 @@ OTHER = "2026/08/12/202608121700.mp3"
 def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "0")
+
+    class Plenty:  # never the host's disk; the free-space test sets its own
+        free = 1 << 40
+
+    monkeypatch.setattr(run_mod.shutil, "disk_usage", lambda p: Plenty)
     for key in (HOUR, OTHER):
         path = tmp_path / "data" / "archive" / key
         path.parent.mkdir(parents=True, exist_ok=True)
