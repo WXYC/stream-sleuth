@@ -38,6 +38,7 @@ from stream_sleuth.recognizers.base import EvalIdentification
 
 HOUR_S = 3600.0
 MIN_LAG_SAMPLES = 20
+DEFAULT_PAD_S = 180.0  # the plan's default pad, which a lag sample may raise and never lowers
 MAX_PAD_S = 600.0
 UNTRIED = "untried"  # a grid address with no record at all
 
@@ -73,9 +74,9 @@ class Verdict(NamedTuple):
 
 
 class PlayScore(NamedTuple):
-    """One scored play. ``first_s`` is its first correct emission's ``at``; ``ttfi_s`` (covered
-    plays only) is ``first_s`` less the song's start, never below 0, and ``lag_s`` the logged
-    offset less the song's start. The start is ``at + query_offset_s - ref_start_s`` of the
+    """One scored play. ``first_s`` is its first correct emission's ``at``. For a covered play
+    only (else both are None), ``ttfi_s`` is ``first_s`` less the song's start, never below 0,
+    and ``lag_s`` the logged offset less the song's start. The start is ``at + query_offset_s - ref_start_s`` of the
     play's earliest correct emission that carries both offsets, as Phase 1 measured the lag
     that set the pads; a Shazam answer with a null offset is skipped, and with none left both
     are None (``first_s`` and ``t_offset_s`` still give an approximate time)."""
@@ -89,13 +90,16 @@ class PlayScore(NamedTuple):
 
 
 class Pad(NamedTuple):
-    """An era's pad: the default (its plays' ``pad_s``) unless the nearest-rank 95th-percentile
-    absolute lag exceeds it, then that, capped at 600 s. ``p95_s`` is None (insufficient data,
-    the default stands) below 20 lag samples."""
+    """An era's recommended pad: the plan's 180 s default unless the nearest-rank
+    95th-percentile absolute lag exceeds it, then that, capped at 600 s. ``p95_s`` is None
+    (insufficient data, 180 s stands) below 20 lag samples. ``window_pads_s`` are the distinct
+    ``pad_s`` its plays' windows were written with, for comparison: the lags were measured inside
+    those windows, so a lag past one is censored, not counted."""
 
-    pad_s: float
+    recommended_s: float
     samples: int
     p95_s: float | None
+    window_pads_s: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,16 @@ class LegScore:
 
     @property
     def in_pool_recall(self) -> float | None:
-        return recall([r for r in self.plays if r.play.in_pool])
+        """Recall over covered plays with ``in_pool: true``; a ``null`` one is never in it."""
+        return recall([r for r in self.plays if r.play.in_pool is True])
+
+    @property
+    def unjoinable_plays(self) -> int:
+        """Covered plays with no title key (no artist or title left after normalization), which
+        no emission can join: recall counts them as misses, as the plan defines it."""
+        return sum(
+            r.covered and not names.title_keys(r.play.artist, r.play.title) for r in self.plays
+        )
 
 
 _RECORD_FIELDS = [f for f in Play._fields if f != "logged_end_s"]
@@ -253,10 +266,9 @@ def score_plays(
         start = (
             timed[0]["at"] + timed[0]["query_offset_s"] - timed[0]["ref_start_s"] if timed else None
         )
-        ttfi = None
+        ttfi = lag = None
         if first is not None and start is not None and p in covered:
-            ttfi = max(0.0, first - start)
-        lag = None if start is None else p.t_offset_s - start
+            ttfi, lag = max(0.0, first - start), p.t_offset_s - start
         rows.append(PlayScore(p, p in covered, bool(hits), first, ttfi, lag))
     return rows
 
@@ -270,17 +282,15 @@ def recall(rows: Sequence[PlayScore]) -> float | None:
 def pads(rows: Iterable[PlayScore]) -> dict[str, Pad]:
     """Each era's :class:`Pad` from its plays' lags."""
     lags: defaultdict[str, list[float]] = defaultdict(list)
-    default: dict[str, float] = {}
+    windows: defaultdict[str, set[float]] = defaultdict(set)
     for r in rows:
-        default.setdefault(r.play.era, r.play.pad_s)
+        windows[r.play.era].add(r.play.pad_s)
         lags[r.play.era] += [] if r.lag_s is None else [abs(r.lag_s)]
     result = {}
     for era, v in lags.items():
-        if len(v) < MIN_LAG_SAMPLES:
-            result[era] = Pad(default[era], len(v), None)
-            continue
-        p95 = sorted(v)[math.ceil(0.95 * len(v)) - 1]
-        result[era] = Pad(max(default[era], min(MAX_PAD_S, p95)), len(v), p95)
+        p95 = sorted(v)[math.ceil(0.95 * len(v)) - 1] if len(v) >= MIN_LAG_SAMPLES else None
+        pad = DEFAULT_PAD_S if p95 is None else max(DEFAULT_PAD_S, min(MAX_PAD_S, p95))
+        result[era] = Pad(pad, len(v), p95, tuple(sorted(windows[era])))
     return result
 
 
