@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import os
 from datetime import datetime, timezone
 
 import pytest
 from moto import mock_aws
+from urllib3 import HTTPConnectionPool
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 from evaluation import archive
 from evaluation.s3_readonly import MissingSettingError, archive_bucket, archive_client
@@ -74,10 +77,16 @@ def test_archive_bucket_requires_the_setting(monkeypatch):
 
 
 @pytest.fixture
-def synthetic_archive(monkeypatch):
+def synthetic_archive(monkeypatch, tmp_path_factory):
+    """A moto archive bucket, with no real AWS configuration, credentials, or settings visible."""
     for name in list(os.environ):
         if name.startswith(("AWS_", "STREAM_SLEUTH_")):
             monkeypatch.delenv(name)
+    aws_dir = tmp_path_factory.mktemp("aws")
+    for name, path in (("AWS_CONFIG_FILE", "config"), ("AWS_SHARED_CREDENTIALS_FILE", "creds")):
+        (aws_dir / path).write_text("")
+        monkeypatch.setenv(name, str(aws_dir / path))
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("STREAM_SLEUTH_ARCHIVE_BUCKET", BUCKET)
@@ -107,23 +116,96 @@ def test_existing_file_of_the_wrong_size_is_left_untouched(tmp_path):
     assert dest.read_bytes() == b"older recording"
 
 
-class _ShortBody:
-    """The guarded client, but GetObject claims more bytes than its body holds."""
+class _Dropping(io.RawIOBase):
+    """A socket stream that yields ``data``, then fails as a dropped or stalled connection does."""
 
-    def __init__(self, client):
-        self._client = client
+    def __init__(self, data: bytes, error: Exception):
+        self._data, self._error = data, error
+
+    def read(self, size=-1):
+        if not self._data:
+            raise self._error
+        data, self._data = self._data, b""
+        return data
+
+
+class _TruncatedHour:
+    """The guarded client, but SUMMER_KEY's GetObject body ends 8 bytes early.
+
+    The body is a real botocore ``StreamingBody`` declaring the object's full
+    length, so botocore's own stream checks run exactly as they do for a dropped
+    connection. This module may not import botocore, so the class comes from the
+    response body's MRO; the body may be its ``StreamingChecksumBody`` subclass,
+    which checks the length first and raises the same errors.
+    """
+
+    def __init__(self, client, raw):
+        self._client, self._raw = client, raw
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
 
     def get_object(self, **kwargs):
         response = self._client.get_object(**kwargs)
-        return {**response, "ContentLength": response["ContentLength"] + 8}
+        if kwargs["Key"] != SUMMER_KEY:
+            return response
+        mro = type(response["Body"]).__mro__
+        streaming_body = next(c for c in mro if c.__name__ == "StreamingBody")
+        response["Body"].close()
+        short = HOURS[SUMMER_KEY][:-8]
+        return {**response, "Body": streaming_body(self._raw(short), response["ContentLength"])}
+
+
+_POOL = HTTPConnectionPool("archive.example.test")  # names the host in the error; never connects
+_TRUNCATIONS = {
+    "eof before content length": io.BytesIO,
+    "connection reset": lambda d: _Dropping(d, ProtocolError("Connection broken")),
+    "read timeout": lambda d: _Dropping(d, ReadTimeoutError(_POOL, "/", "Read timed out.")),
+}
 
 
 @pytest.mark.usefixtures("synthetic_archive")
-def test_short_read_leaves_only_a_part_file(tmp_path):
+@pytest.mark.parametrize("raw", _TRUNCATIONS.values(), ids=_TRUNCATIONS.keys())
+def test_short_read_leaves_only_a_part_file(tmp_path, raw):
     with pytest.raises(archive.ShortReadError):
-        archive.fetch(SUMMER_KEY, archive_dir=tmp_path, client=_ShortBody(archive_client()))
+        archive.fetch(
+            SUMMER_KEY, archive_dir=tmp_path, client=_TruncatedHour(archive_client(), raw)
+        )
     assert not (tmp_path / SUMMER_KEY).exists()
-    assert (tmp_path / (SUMMER_KEY + ".part")).exists()
+    assert (tmp_path / (SUMMER_KEY + ".part")).read_bytes() == HOURS[SUMMER_KEY][:-8]
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+def test_fetch_all_skips_a_short_read_and_keeps_going(tmp_path):
+    client = _TruncatedHour(archive_client(), io.BytesIO)
+
+    failed = archive.fetch_all([SUMMER_KEY, WINTER_KEY], archive_dir=tmp_path, client=client)
+
+    assert failed == [SUMMER_KEY]
+    assert not (tmp_path / SUMMER_KEY).exists()
+    assert (tmp_path / WINTER_KEY).read_bytes() == HOURS[WINTER_KEY]
+
+
+class _Recording:
+    """The guarded client, recording the name of every client method called."""
+
+    def __init__(self, client):
+        self._client, self.calls = client, set()
+
+    def __getattr__(self, name):
+        self.calls.add(name)
+        return getattr(self._client, name)
+
+
+@pytest.mark.usefixtures("synthetic_archive")
+def test_fetch_all_calls_only_head_object_and_get_object(tmp_path):
+    client = _Recording(archive_client())
+    missing = "2026/02/01/202602010000.mp3"
+
+    archive.fetch_all([SUMMER_KEY, missing], archive_dir=tmp_path, client=client)
+    archive.fetch_all([SUMMER_KEY], archive_dir=tmp_path, client=client)  # the rerun heads it
+
+    assert client.calls == {"head_object", "get_object"}
 
 
 @pytest.mark.usefixtures("synthetic_archive")
