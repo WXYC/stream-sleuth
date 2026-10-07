@@ -61,7 +61,7 @@ def parse_add_time(text: str) -> datetime:
 
 def etl_stop(export_dir: Path) -> datetime:
     """``flowsheet-etl``'s last run plus one half-hourly run, never before the floor."""
-    with open(export_dir / "cronjob_runs.csv", newline="") as f:
+    with open(export_dir / "cronjob_runs.csv", newline="", encoding="utf-8") as f:
         runs = [
             parse_add_time(r["last_run"])
             for r in csv.DictReader(f)
@@ -86,46 +86,76 @@ def album_key(s: str | None) -> str:
 
 
 def fuzzy(s: str | None) -> str:
-    """The fuzzy-tier key: ``fold(album_key(s))`` with non-alphanumeric runs as one space."""
-    return " ".join(re.sub(r"[^0-9a-z]+", " ", fold(album_key(s))).split())
+    """The fuzzy-tier key: ``fold(album_key(s))`` with each run of non-word characters as one space.
+
+    Letters and digits of every script survive (a Japanese or Cyrillic name keeps a
+    real key); underscores and punctuation separate.
+    """
+    return " ".join(re.sub(r"[\W_]+", " ", fold(album_key(s))).split())
+
+
+Key = tuple[str, str]
+FileRef = tuple[str, str]  # (files.key, files.format)
 
 
 @dataclass
 class PoolIndex:
-    """Join keys over ``pool.db``'s indexed files, by tier (plan §5.1)."""
+    """Join keys over ``pool.db``'s indexed files, by tier (plan §5.1).
 
-    keys: dict[str, set[tuple[str, str]]] = field(default_factory=lambda: defaultdict(set))
+    Each key maps to the first indexed file by ``files.key`` that has it. A key with
+    an empty part (a missing tag, or a name that normalizes to nothing) never joins.
+    """
+
+    album: dict[Key, FileRef] = field(default_factory=dict)
+    album_fuzzy: dict[Key, FileRef] = field(default_factory=dict)
+    title: dict[Key, FileRef] = field(default_factory=dict)
+    title_fuzzy: dict[Key, FileRef] = field(default_factory=dict)
 
     @classmethod
     def load(cls, pool_db: Path) -> PoolIndex:
+        """Read ``pool_db`` read-only; a missing file raises instead of being created."""
         index = cls()
-        db = sqlite3.connect(pool_db)
-        rows = db.execute(
-            "SELECT artist, album_artist, album, title FROM files WHERE status = 'indexed'"
-        )
-        for artist, album_artist, album, title in rows:
+        db = sqlite3.connect(f"{Path(pool_db).resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            rows = db.execute(
+                "SELECT key, format, artist, album_artist, album, title FROM files"
+                " WHERE status = 'indexed' ORDER BY key"
+            ).fetchall()
+        finally:
+            db.close()
+        for key, fmt, artist, album_artist, album, title in rows:
             for a in {artist, album_artist} - {None, ""}:
-                index.keys["album"].add((fold(a), album_key(album)))
-                index.keys["album_fuzzy"].add((fuzzy(a), fuzzy(album)))
-                index.keys["title"].add((fold(a), album_key(title)))
-                index.keys["title_fuzzy"].add((fuzzy(a), fuzzy(title)))
-        db.close()
+                for _, keys, k in index._keys(a, album, title):
+                    keys.setdefault(k, (key, fmt))
         return index
 
-    def tier(self, artist: str, album: str, title: str) -> str | None:
-        """``exact`` or ``fuzzy`` on (artist, album), else ``title`` on (artist, title), else None."""
-        if not artist:
+    def _keys(
+        self, artist: str, album: str | None, title: str | None
+    ) -> list[tuple[str, dict[Key, FileRef], Key]]:
+        """``(tier, map, key)`` in tier order, leaving out every key with an empty part."""
+        candidates = [
+            ("exact", self.album, (fold(artist), album_key(album))),
+            ("fuzzy", self.album_fuzzy, (fuzzy(artist), fuzzy(album))),
+            ("title", self.title, (fold(artist), album_key(title))),
+            ("title", self.title_fuzzy, (fuzzy(artist), fuzzy(title))),
+        ]
+        return [(tier, keys, k) for tier, keys, k in candidates if all(k)]
+
+    def match(self, artist: str, album: str, title: str) -> tuple[str, str] | None:
+        """``(tier, format)`` of the first file by key at the best matching tier, else None.
+
+        Tiers: ``exact`` or ``fuzzy`` on (artist, album), else ``title`` on (artist, title).
+        """
+        hits = [(tier, keys[k]) for tier, keys, k in self._keys(artist, album, title) if k in keys]
+        if not hits:
             return None
-        if (fold(artist), album_key(album)) in self.keys["album"]:
-            return "exact"
-        if (fuzzy(artist), fuzzy(album)) in self.keys["album_fuzzy"]:
-            return "fuzzy"
-        if (fold(artist), album_key(title)) in self.keys["title"] or (
-            fuzzy(artist),
-            fuzzy(title),
-        ) in self.keys["title_fuzzy"]:
-            return "title"
-        return None
+        best = hits[0][0]
+        return best, min(ref for tier, ref in hits if tier == best)[1]
+
+    def tier(self, artist: str, album: str, title: str) -> str | None:
+        """The best matching tier, or None."""
+        found = self.match(artist, album, title)
+        return found[0] if found else None
 
 
 @dataclass(frozen=True)
@@ -153,7 +183,7 @@ class Flowsheet:
 
     @classmethod
     def load(cls, export_dir: Path) -> Flowsheet:
-        with open(export_dir / "flowsheet.csv", newline="") as f:
+        with open(export_dir / "flowsheet.csv", newline="", encoding="utf-8") as f:
             rows = [
                 Row(int(r["id"]), r["show_id"], int(r["play_order"]) if r["play_order"] else None,
                     bool(r["legacy_entry_id"]), r["entry_type"], parse_add_time(r["add_time"]),
@@ -204,19 +234,20 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
                 (plays[i + 1][0].add_time - start).total_seconds() if i + 1 < len(plays) else 3600.0
             )
             era = sheet.era(r.add_time)
-            tier = pool.tier(r.artist, r.album, r.title)
+            tier, fmt = pool.match(r.artist, r.album, r.title) or (None, None)
             status, flag = sheet.order_status[r.show_id] if era == "canonical" else ("etl", None)
             record = {
                 "hour_key": key, "play_id": r.id, "t_offset_s": t,
                 "window_start_s": max(0.0, t - PADS[era]), "window_end_s": min(3600.0, t_next + PADS[era]),
                 "artist": r.artist, "title": r.title, "album": r.album, "era": era, "pad_s": PADS[era],
                 "in_pool": tier is not None if r.artist else None, "pool_match_tier": tier,
-                "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
+                "pool_format": fmt, "rotation": r.rotation, "reorder_flag": flag, "play_order_status": status,
                 "carryover": carryover, "track_rows": len(tracks), "talk_rows": talk_rows,
             }  # fmt: skip
             lines.append(json.dumps(record, ensure_ascii=False) + "\n")
         log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
-    with open(out, "x") as f:  # built in full first, so a bad key leaves no partial file
+    # Built in full first, so a bad key leaves no partial file.
+    with open(out, "x", encoding="utf-8") as f:
         f.writelines(lines)
 
 

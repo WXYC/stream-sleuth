@@ -160,12 +160,13 @@ Every S3 client the harness uses comes from `evaluation/s3_readonly.py`, which r
 
 ### Plays
 
-`evaluation/corpus.py` is WXYC-specific. It reads the two CSVs that `evaluation/sql/flowsheet-export.sql` writes (run in a read-only `psql` session into a dated export directory, never over an earlier one) and the reference pool's `pool.db`. `Flowsheet.load()` orders rows by `(add_time, id)`, computes `ETL_STOP`, and labels each show's `play_order` as single-writer (with a reorder flag) or unreliable. `write_plays()` writes `plays.jsonl` for a list of hour keys and refuses to overwrite an existing file:
+`evaluation/corpus.py` is WXYC-specific. It reads the two CSVs that `evaluation/sql/flowsheet-export.sql` writes (run in a read-only `psql` session into a dated export directory, never over an earlier one) and the reference pool's `pool.db`. `Flowsheet.load()` orders rows by `(add_time, id)`, computes `ETL_STOP`, and labels each show's `play_order` as single-writer (with a reorder flag) or unreliable. `write_plays()` writes `plays.jsonl` for a list of hour keys, with each matched play's pool file format as `pool_format`, and refuses to overwrite an existing file. It opens `pool.db` read-only, so a mistyped path fails instead of creating an empty database. It reads no environment setting, so it needs no `eval.env`:
 
 ```sh
-uv run --extra eval --env-file "$STREAM_SLEUTH_DATA_DIR/eval.env" python -m evaluation.corpus \
-    --export "$STREAM_SLEUTH_DATA_DIR/exports/<date>" --pool-db "$STREAM_SLEUTH_DATA_DIR/pool/pool.db" \
-    --hours "$STREAM_SLEUTH_DATA_DIR/hours.txt" --out "$STREAM_SLEUTH_DATA_DIR/plays.jsonl"
+DATA="${STREAM_SLEUTH_DATA_DIR:-$HOME/.local/share/stream-sleuth}"
+uv run --extra eval python -m evaluation.corpus \
+    --export "$DATA/exports/<date>" --pool-db "$DATA/pool.db" \
+    --hours "$DATA/hours.txt" --out "$DATA/plays.jsonl"
 ```
 
 ## Notes
