@@ -22,6 +22,7 @@ import re
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -207,8 +208,10 @@ def stream(
     """Fetch, tag, and hand each audio object to ``consumer(staged_path, stage_id)``.
 
     One file is staged at a time and deleted when the consumer returns or raises.
-    Stage files left in ``staging_dir`` by a crashed run are removed first; nothing else there is touched. Returns
-    counts of ``indexed``, ``failed``, ``already_indexed``, and ``skipped_format``.
+    Stage files left in ``staging_dir`` by a crashed run are removed first; nothing
+    else there is touched. Returns counts of ``indexed``, ``failed``,
+    ``already_indexed``, and ``skipped_format``, plus ``untagged``: files indexed
+    this run that lack an artist or a title tag (also counted in ``indexed``).
     """
     client = client or pool_client()
     bucket = bucket or pool_bucket()
@@ -230,8 +233,8 @@ def stream(
         try:
             # get_object, not download_file: no s3transfer threads between the
             # call and the read-only guard.
-            body = client.get_object(Bucket=bucket, Key=obj.key)["Body"]
-            with open(path, "wb") as f:
+            response = client.get_object(Bucket=bucket, Key=obj.key)
+            with closing(response["Body"]) as body, open(path, "wb") as f:
                 for chunk in body.iter_chunks(1 << 20):
                     f.write(chunk)
             tags = read_tags(path, obj.format)
@@ -243,6 +246,8 @@ def stream(
         else:
             _record(db, obj, tags, "indexed", None)
             counts["indexed"] += 1
+            if not (tags["artist"] and tags["title"]):
+                counts["untagged"] += 1
         finally:
             path.unlink(missing_ok=True)
         if (counts["indexed"] + counts["failed"]) % 50 == 0:

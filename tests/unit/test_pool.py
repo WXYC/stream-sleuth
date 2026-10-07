@@ -202,3 +202,50 @@ def test_overlapping_prefixes_list_each_object_once():
     objects = pool.inventory(["rotation/", "rotation/Heavy/"])
 
     assert sorted(o.key for o in objects) == sorted(OBJECTS)
+
+
+@pytest.mark.parametrize(
+    ("artist", "title", "untagged"),
+    [
+        ("Juana Molina", "la paradoja", 0),
+        (None, None, 1),
+        ("Juana Molina", None, 1),
+        (None, "la paradoja", 1),
+    ],
+)
+def test_files_missing_artist_or_title_are_indexed_and_counted_untagged(
+    monkeypatch, tmp_path, db, artist, title, untagged
+):
+    def read_tags(path, fmt):
+        if fmt == "mp3":
+            return {**SYNTHETIC_TAGS, "artist": artist, "title": title}
+        return dict(SYNTHETIC_TAGS)
+
+    monkeypatch.setattr(pool, "read_tags", read_tags)
+
+    counts = pool.stream(
+        pool.inventory(["rotation/"]),
+        lambda path, stage: None,
+        db=db,
+        staging_dir=tmp_path / "pool-staging",
+    )
+
+    assert counts["indexed"] == 3
+    assert counts["untagged"] == untagged
+
+
+def test_an_indexed_row_is_never_overwritten_by_a_later_failure(tmp_path, db):
+    # The same key twice in one run: the second pass reaches the upsert after the
+    # first indexed it, so only the upsert's guard keeps the indexed row intact.
+    obj = next(o for o in pool.inventory(["rotation/"]) if o.format == "mp3")
+    calls = []
+
+    def fails_second_time(path, stage):
+        calls.append(stage)
+        if len(calls) > 1:
+            raise RuntimeError("indexer crashed")
+
+    counts = pool.stream([obj, obj], fails_second_time, db=db, staging_dir=tmp_path / "staging")
+
+    assert counts == {"indexed": 1, "failed": 1}
+    assert _rows(db) == {obj.key: ("indexed", None)}
