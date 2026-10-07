@@ -9,7 +9,10 @@ restart that day sends nothing. Only ``matched`` and ``no_match`` are scoring
 outcomes; ``server_error`` and ``decode_error`` are stored too and retried by a
 later run. The store is a JSONL file the harness only ever appends to.
 
-This module imports nothing from ``stream_sleuth``; ``outcome_from`` repeats
+The result store, the throttle state, and the clip work directory are research
+data: each is checked with ``stream_sleuth.paths.require_outside_checkout`` before
+anything is created, and each defaults to a path under ``data_dir()``. This module
+imports nothing else from ``stream_sleuth``; ``outcome_from`` repeats
 ``recognizer.parse()``'s field extraction and adds Shazam's match offset.
 """
 
@@ -36,6 +39,7 @@ from shazamio import Shazam
 from shazamio.interfaces.client import HTTPClientInterface
 
 from evaluation.clips import ClipAddress, ClipError, cut, grid, hour_duration
+from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +106,8 @@ class Throttle:
 
     The state file records the UTC day, the requests sent that day, the time of
     the last one, and whether a 429 stopped the day, so a restarted process
-    honors all four. One process per state file: there is no lock, and the
+    honors all four. ``state_path`` is refused if it is relative or inside the
+    checkout (``DataPathError``). One process per state file: there is no lock, and the
     budget is the account's, so every leg shares one file and runs in turn.
     """
 
@@ -115,7 +120,7 @@ class Throttle:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        self.state_path = state_path
+        self.state_path = require_outside_checkout(state_path)
         self.rate_per_day = rate_per_day
         self.min_interval_s = min_interval_s
         self.clock = clock
@@ -187,7 +192,7 @@ class ResultStore:
     """Append-only JSONL of Shazam outcomes keyed by clip address and recognizer identity."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self.path = require_outside_checkout(path)
 
     def records(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -265,21 +270,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--hours", type=Path, required=True, help="file of hour keys, one per line")
     parser.add_argument("--archive-dir", type=Path, required=True, help="directory of hour files")
+    parser.add_argument("--work-dir", type=Path, help="where clips are cut; default: <data>/clips")
     parser.add_argument(
-        "--work-dir", type=Path, required=True, help="where ephemeral clips are cut"
+        "--store", type=Path, help="append-only results JSONL; default: <data>/shazam/results.jsonl"
     )
-    parser.add_argument("--store", type=Path, required=True, help="append-only results JSONL")
-    parser.add_argument("--state", type=Path, required=True, help="throttle state JSON")
+    parser.add_argument(
+        "--state", type=Path, help="throttle state JSON; default: <data>/shazam/throttle.json"
+    )
     parser.add_argument("--length", type=int, default=12, help="capture length in seconds")
     parser.add_argument("--profile", default="128k")
     parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)  # tests only
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Every path this run writes is checked before a request, a mkdir, or a decode.
+    work_dir = require_outside_checkout(args.work_dir or data_dir() / "clips")
+    store = ResultStore(args.store or data_dir() / "shazam" / "results.jsonl")
     throttle = Throttle(
-        args.state,
+        args.state or data_dir() / "shazam" / "throttle.json",
         int(os.environ.get("STREAM_SLEUTH_SHAZAM_RATE_PER_DAY", "500")),
         float(os.environ.get("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "20")),
     )
+    for directory in (work_dir, store.path.parent, throttle.state_path.parent):
+        directory.mkdir(parents=True, exist_ok=True)
     client = CountingClient(throttle, base_url=args.base_url)
     addresses = hour_addresses(
         args.hours.read_text().split(), args.archive_dir, args.length, args.profile
@@ -287,8 +299,8 @@ def main(argv: list[str] | None = None) -> int:
     stop = asyncio.run(
         run(
             addresses,
-            lambda a: cut(a, args.archive_dir / a.hour_key, args.work_dir),
-            ResultStore(args.store),
+            lambda a: cut(a, args.archive_dir / a.hour_key, work_dir),
+            store,
             client,
         )
     )

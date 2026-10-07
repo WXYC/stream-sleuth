@@ -61,7 +61,6 @@ def _flags(tmp_path: Path, fake: FakeShazam, *hours: str) -> list[str]:
 
 
 def _explicit_paths(tmp_path: Path) -> list[str]:
-    (tmp_path / "work").mkdir()
     return [
         "--work-dir",
         str(tmp_path / "work"),
@@ -125,3 +124,19 @@ def test_missing_and_unreadable_hours_are_logged_and_skipped_without_a_request(
     assert [r["address"] for r in _records(tmp_path / "shazam.jsonl")] == [f"{NEXT_HOUR}#0+12@128k"]
     assert len(fake.requests) == 1
     assert missing in caplog.text and unreadable in caplog.text
+
+
+def test_paths_default_from_the_data_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(data))
+    _make_hour(tmp_path / "archive", HOUR, 20)
+    fake = FakeShazam([_json(200, NO_MATCH)])
+    try:
+        assert main(_flags(tmp_path, fake, HOUR)) == 0
+    finally:
+        fake.close()
+    assert len(_records(data / "shazam" / "results.jsonl")) == 1
+    assert (data / "shazam" / "throttle.json").exists()
+    assert list((data / "clips").iterdir()) == []
