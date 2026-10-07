@@ -657,11 +657,11 @@ def check_basis(labels: dict[str, dict[str, Any]], counts: dict[str, tuple[int, 
             moved.append(f"{key} (track_rows {was[0]} -> {now[0]}, in_pool {was[1]} -> {now[1]})")
     if moved:
         log.warning(
-            "the selection's ranking basis moved for %d hours: %s", len(moved), "; ".join(moved)
+            "the selection's ranking basis moved for %d hour(s): %s", len(moved), "; ".join(moved)
         )
     if unchecked:
         log.warning(
-            "selection.json records no counts for %d hours; their ranking basis cannot be checked",
+            "selection.json records no counts for %d hour(s); their ranking basis cannot be checked",
             unchecked,
         )
 
