@@ -37,6 +37,7 @@ OTHER = "2026/08/12/202608121700.mp3"
 HOURS = {"all": [HOUR, OTHER], "subset": [HOUR]}
 
 Setup = namedtuple("Setup", "store client fake")
+FREE = namedtuple("usage", "total used free")(0, 0, 1 << 40)
 
 
 @pytest.fixture(autouse=True)
@@ -198,9 +199,42 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (data / "shazam").mkdir(parents=True)
     monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(data))
     monkeypatch.setenv("STREAM_SLEUTH_SHAZAM_MIN_INTERVAL_S", "0")
+    monkeypatch.setattr(run_mod.shutil, "disk_usage", lambda p: FREE)  # never the host's disk
     labels = {HOUR: {"subset": True}, OTHER: {"subset": False}}
     (data / "selection.json").write_text(json.dumps({"hours": labels}))
     return data
+
+
+def test_a_refusal_after_a_finished_leg_keeps_its_done_and_logs_the_summary(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ResultStore(data / "shazam" / "results.jsonl")
+    tired = f"{HOUR}#0+6@128k"
+    for _ in range(MAX_RETRIES + 1):
+        store.append(tired, recognizer_identity(6), ShazamOutcome(503, "server_error"))
+    real = run_mod.hour_addresses
+
+    def future_dated_after_the_first_leg(keys, archive_dir, length_s, profile):  # noqa: ANN001, ANN202
+        if length_s == 6:  # the second leg: the clock now runs an hour behind the state file
+            path = data / "shazam" / "throttle.json"
+            path.write_text(
+                json.dumps({**json.loads(path.read_text()), "last": time.time() + 3600})
+            )
+        return real(keys, archive_dir, length_s, profile)
+
+    monkeypatch.setattr(run_mod, "hour_addresses", future_dated_after_the_first_leg)
+    fake = FakeShazam([json_response(200, NO_MATCH)] * 4)
+    try:
+        with caplog.at_level(logging.INFO):
+            code = main(["--legs", "12s", "6s-subset", "20s-subset", "--base-url", fake.url])
+    finally:
+        fake.close()
+    assert code == 1
+    assert len(fake.requests) == 4  # the first leg's 2 hours x 2 clips, then nothing
+    for line in ("12s: done", "6s-subset: refused", "20s-subset: not started", "4 requests"):
+        assert line in caplog.text
+    assert "out of retries and not queried" in caplog.text
+    assert tired in caplog.text
 
 
 def test_the_cli_reports_every_leg_and_exits_non_zero_on_a_refused_state(
