@@ -27,7 +27,7 @@ SHORT = "2026/08/12/202608121800.mp3"  # decodes to 1,800 s
 OTHER = "2026/08/12/202608121900.mp3"  # outside the leg's hours
 SHAZAM = "shazam@0.8.1, segment=12"
 OLAF = olaf_identity("rotation")
-LEG = Leg("12s", 12, "128k", "all")
+LEG = Leg("12s", 12, "128k", "all", ("shazam", "olaf"))
 PADS = {"canonical": 180.0, "etl": 220.0}
 
 MOLINA = ("Juana Molina", "la paradoja", "DOGA")
