@@ -18,6 +18,7 @@ import logging
 import re
 import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -156,9 +157,13 @@ def hour_addresses(
 
     An hour that is missing or unreadable is logged and contributes nothing, so
     one bad hour never stops the run; a short hour yields only the clips that fit.
+    A repeated key is used once, at its first position, with one warning naming it.
     """
     addresses: list[ClipAddress] = []
-    for key in keys:
+    counts = Counter(keys)
+    for key, n in counts.items():
+        if n > 1:
+            log.warning("hour %s is listed %d times; using it once", key, n)
         try:
             hour_s = hour_duration(archive_dir / key)
         except ClipError as exc:

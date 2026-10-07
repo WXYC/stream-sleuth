@@ -91,6 +91,17 @@ def test_a_short_hour_is_queried_only_at_the_addresses_that_fit(tmp_path: Path) 
     assert list((tmp_path / "work").iterdir()) == []
 
 
+def test_a_repeated_hour_key_in_the_hours_file_is_queried_once(tmp_path: Path) -> None:
+    _make_hour(tmp_path / "archive", HOUR, 40)  # two clips: 0 and 15 s
+    fake = FakeShazam([_json(200, JESSICA_PRATT), _json(200, NO_MATCH)])
+    try:
+        assert main([*_flags(tmp_path, fake, HOUR, HOUR), *_explicit_paths(tmp_path)]) == 0
+    finally:
+        fake.close()
+    assert len(fake.requests) == 2
+    assert len(_records(tmp_path / "shazam.jsonl")) == 2
+
+
 def test_a_429_stops_the_cli_for_the_day(tmp_path: Path) -> None:
     _make_hour(tmp_path / "archive", HOUR, 60)
     fake = FakeShazam([_json(200, JESSICA_PRATT), HTML_429])
