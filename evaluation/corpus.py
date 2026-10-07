@@ -442,7 +442,12 @@ def choose_subset(sel: Selection, stats: dict[str, HourStats]) -> list[str]:
 
 
 def write_selection(
-    out_dir: Path, sel: Selection, subset: list[str], export: str, pool_db: Path
+    out_dir: Path,
+    sel: Selection,
+    subset: list[str],
+    export: str,
+    pool_db: Path,
+    stats: dict[str, HourStats],
 ) -> None:
     """Write ``hours.txt``, ``subset.txt`` and ``selection.json`` into ``out_dir``; never overwrite.
 
@@ -450,14 +455,18 @@ def write_selection(
     before anything is created. A file that already exists raises ``FileExistsError``
     and removes the files this call created, so a frozen selection is never half replaced.
     ``selection.json`` is a record for people and for the report's shortfall line, not a
-    boundary artifact: ``hours`` maps each key to its ``group``, ``band`` and ``subset``.
+    boundary artifact: ``hours`` maps each key to its ``group``, ``band`` and ``subset``,
+    and to the ``in_pool`` and ``track_rows`` counts from ``stats`` that ranked it, which
+    the plays command compares with its own. ``pool_db`` is recorded absolute and resolved.
     """
     out_dir = require_outside_checkout(out_dir)
     record = {
         "export": export,
-        "pool_db": str(pool_db),
+        "pool_db": str(pool_db.resolve()),
         "hours": {
-            k: {"group": g, "band": b, "subset": k in subset} for k, (g, b) in sel.hours.items()
+            k: {"group": g, "band": b, "subset": k in subset}
+            | {"in_pool": stats[k].in_pool, "track_rows": stats[k].track_rows}
+            for k, (g, b) in sel.hours.items()
         },
         "shortfalls": dict(sorted(sel.shortfalls.items())),
     }
@@ -485,8 +494,11 @@ def write_plays(
     sheet: Flowsheet,
     pool: PoolIndex,
     labels: dict[str, dict[str, Any]] | None = None,
-) -> None:
+) -> dict[str, tuple[int, int]]:
     """Write one ``plays.jsonl`` record per track row in each hour; never overwrites ``out``.
+
+    Returns each hour's ``(track_rows, in_pool)`` over its non-carryover plays: the counts
+    :func:`hour_stats` ranks by, for :func:`check_basis`.
 
     Each record carries its hour's ``group``, ``band`` and ``subset``: from ``labels``
     (``selection.json``'s ``hours``) when it names the hour, else ``group`` is ``null``,
@@ -506,6 +518,7 @@ def write_plays(
     """
     require_outside_checkout(out)
     lines = []
+    counts = {}
     for key in dict.fromkeys(hours):
         start = hour_start(key)
         label = (labels or {}).get(key, {})
@@ -519,6 +532,7 @@ def write_plays(
         hi = bisect_left(sheet.rows, start, lo=lo, key=lambda r: r.add_time)
         before = [r for r in sheet.rows[lo:hi] if r.entry_type == "track"]
         plays = [(r, True) for r in before[-1:]] + [(r, False) for r in tracks]
+        in_pool = 0
         for i, (r, carryover) in enumerate(plays):
             t = (r.add_time - start).total_seconds()
             t_next = (
@@ -526,6 +540,7 @@ def write_plays(
             )
             era = sheet.era(r.add_time)
             tier, fmt = pool.match(r.artist, r.album, r.title) or (None, None)
+            in_pool += tier is not None and not carryover
             status, flag = (
                 sheet.order_status.get(r.show_id, ("unreliable", None))
                 if era == "canonical"
@@ -542,6 +557,7 @@ def write_plays(
                 "subset": bool(label.get("subset")),
             }  # fmt: skip
             lines.append(json.dumps(record, ensure_ascii=False) + "\n")
+        counts[key] = (len(tracks), in_pool)
         log.info("%s: %d plays (%d carryover)", key, len(plays), len(plays) - len(tracks))
     # Built in full first, so a bad key leaves no partial file. An existing ``out``
     # raises before the guard; the guard covers close, whose final flush can fail too.
@@ -552,6 +568,7 @@ def write_plays(
     except BaseException:
         out.unlink()  # the file this call created, never an earlier one
         raise
+    return counts
 
 
 def _select(argv: list[str]) -> int:
@@ -565,13 +582,13 @@ def _select(argv: list[str]) -> int:
     parser.add_argument("--out-dir", type=Path, help="default: the data directory")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    out_dir = args.out_dir if args.out_dir else data_dir()
+    out_dir = require_outside_checkout(args.out_dir if args.out_dir else data_dir())
     stats = hour_stats(Flowsheet.load(args.export), PoolIndex.load(args.pool_db))
     sel = select_corpus(stats)
     subset = choose_subset(sel, stats)
     for name, missing in sel.shortfalls.items():  # after the subset, so subset/<group> is logged
         log.warning("selection shortfall %s: %d", name, missing)
-    write_selection(out_dir, sel, subset, args.export.name, args.pool_db)
+    write_selection(out_dir, sel, subset, args.export.name, args.pool_db, stats)
     return 0
 
 
@@ -580,7 +597,8 @@ def read_selection(path: Path, export: Path, pool_db: Path) -> dict[str, dict[st
 
     Anything wrong exits with one line naming ``path`` and the problem, before any output
     exists. A record made from another export or ``pool.db`` than the ones given only warns:
-    a newer export may legitimately cover the same hours.
+    a newer export may legitimately cover the same hours. Each label's ``band`` must be
+    its key's own :func:`band`, since plays stamp it on every record of the hour.
     """
 
     def fail(problem: str) -> NoReturn:
@@ -608,6 +626,12 @@ def read_selection(path: Path, export: Path, pool_db: Path) -> dict[str, dict[st
                 fail(f"`hours` entry {key}: {field_} {label.get(field_)!r} is not one of {values}")
         if not isinstance(label.get("subset"), bool):
             fail(f"`hours` entry {key}: subset {label.get('subset')!r} is not a boolean")
+        try:
+            own = band(key)
+        except ValueError as e:
+            fail(f"`hours` entry {key}: {e}")
+        if label["band"] != own:
+            fail(f"`hours` entry {key}: band {label['band']!r} is not the hour's own, {own!r}")
     made_from = record.get("export"), record.get("pool_db")
     if made_from[0] != export.name or Path(str(made_from[1])).resolve() != pool_db.resolve():
         log.warning(
@@ -615,6 +639,31 @@ def read_selection(path: Path, export: Path, pool_db: Path) -> dict[str, dict[st
             *made_from, export.name, pool_db,
         )  # fmt: skip
     return hours
+
+
+def check_basis(labels: dict[str, dict[str, Any]], counts: dict[str, tuple[int, int]]) -> None:
+    """Warn once per kind when a written hour's counts differ from the ones that ranked it.
+
+    ``counts`` is :func:`write_plays`' return. A difference only warns, since a newer
+    export or snapshot can legitimately move it. A label with no recorded counts (an
+    older ``selection.json``) cannot be checked, which is one warning, not a refusal.
+    """
+    moved, unchecked = [], 0
+    for key, now in counts.items():
+        was = (labels[key].get("track_rows"), labels[key].get("in_pool"))
+        if None in was:
+            unchecked += 1
+        elif was != now:
+            moved.append(f"{key} (track_rows {was[0]} -> {now[0]}, in_pool {was[1]} -> {now[1]})")
+    if moved:
+        log.warning(
+            "the selection's ranking basis moved for %d hours: %s", len(moved), "; ".join(moved)
+        )
+    if unchecked:
+        log.warning(
+            "selection.json records no counts for %d hours; their ranking basis cannot be checked",
+            unchecked,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -638,12 +687,17 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.subset_only and not args.selection:
         parser.error("--subset-only needs --selection")
+    require_outside_checkout(args.out)  # before the export and pool are read
     labels = read_selection(args.selection, args.export, args.pool_db) if args.selection else None
     if labels is None:
         hours = args.hours.read_text().split()
     else:
         hours = [k for k, label in labels.items() if label["subset"] or not args.subset_only]
-    write_plays(args.out, hours, Flowsheet.load(args.export), PoolIndex.load(args.pool_db), labels)
+    counts = write_plays(
+        args.out, hours, Flowsheet.load(args.export), PoolIndex.load(args.pool_db), labels
+    )
+    if labels is not None:
+        check_basis(labels, counts)
     return 0
 
 
