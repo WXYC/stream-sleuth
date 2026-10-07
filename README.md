@@ -83,7 +83,7 @@ Every setting is `STREAM_SLEUTH_<NAME>`. WXDU's original `WXDU_<NAME>` spelling 
 | `STREAM_SLEUTH_CAPTURE_SLOW` | `WXDU_CAPTURE_SLOW` | `12` | Capture length after a miss, seconds |
 | `STREAM_SLEUTH_VERBOSE` | `WXDU_VERBOSE` | off | `1`, `true`, or `yes` logs every cycle |
 
-The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret (the message names the `WXDU_SHAZAM_SECRET` alias, as it always has), or `jsonl` without an absolute path in an existing directory. A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
+The recognizer refuses to start (message on stderr, exit 1) when the chosen output is incomplete: `http` without a secret (the message names the `WXDU_SHAZAM_SECRET` alias, as it always has), or `jsonl` without an absolute path outside the checkout that it can append to (it creates the file, not its directory). A JSONL record is the identification (`artist`, `song`, `album`, `label`) plus `emitted_at`.
 
 ## Development
 

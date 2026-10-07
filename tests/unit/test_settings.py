@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -163,13 +164,43 @@ def test_refuses_an_incomplete_or_unknown_output(start, capsys, env, message):
     assert capsys.readouterr().err == message
 
 
-def test_refuses_a_jsonl_path_whose_directory_is_missing(start, tmp_path, capsys):
-    missing = tmp_path / "missing"
+def _read_only(directory: Path) -> Path:
+    directory.chmod(0o500)
+    return directory
 
-    with pytest.raises(SystemExit) as exit_info:
-        start(STREAM_SLEUTH_OUTPUT="jsonl", STREAM_SLEUTH_OUTPUT_PATH=str(missing / "e.jsonl"))
+
+@pytest.mark.parametrize(
+    ("make_path", "strerror"),
+    [
+        (lambda tmp: tmp / "missing" / "e.jsonl", "No such file or directory"),
+        (lambda tmp: tmp, "Is a directory"),
+        (lambda tmp: _read_only(tmp) / "e.jsonl", "Permission denied"),
+    ],
+    ids=["missing-directory", "path-is-a-directory", "read-only-directory"],
+)
+def test_refuses_a_jsonl_path_it_cannot_append_to(start, tmp_path, capsys, make_path, strerror):
+    path = make_path(tmp_path)
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            start(STREAM_SLEUTH_OUTPUT="jsonl", STREAM_SLEUTH_OUTPUT_PATH=str(path))
+    finally:
+        tmp_path.chmod(0o700)
 
     assert exit_info.value.code == 1
     assert capsys.readouterr().err == (
-        f"STREAM_SLEUTH_OUTPUT_PATH's directory {missing} does not exist; refusing to run.\n"
+        f"cannot append to STREAM_SLEUTH_OUTPUT_PATH {path} ({strerror}); refusing to run.\n"
     )
+
+
+def test_refuses_a_jsonl_path_inside_the_checkout(start, capsys):
+    checkout = Path(__file__).resolve().parents[2]
+    path = checkout / "wxyc-emissions.jsonl"
+
+    with pytest.raises(SystemExit) as exit_info:
+        start(STREAM_SLEUTH_OUTPUT="jsonl", STREAM_SLEUTH_OUTPUT_PATH=str(path))
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == (
+        f"STREAM_SLEUTH_OUTPUT_PATH {path} is inside the checkout {checkout}; refusing to run.\n"
+    )
+    assert not path.exists()

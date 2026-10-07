@@ -54,11 +54,12 @@ def select_output() -> tuple[Output, str]:
     """The output ``STREAM_SLEUTH_OUTPUT`` names, and where it delivers to, for the banner.
 
     Refuses to run (stderr, exit 1) when the chosen output is incomplete: the HTTP
-    output needs the shared secret, with WXDU's original message; JSONL needs an
-    absolute path in an existing directory, so a run started from the checkout
+    output needs the shared secret, with WXDU's original message. JSONL needs an
+    absolute path outside the checkout, so a run started from the checkout
     (``run.sh`` ``cd``s there) or under launchd (working directory ``/``) never
-    writes somewhere unintended, and a missing directory fails at startup rather
-    than on every emission.
+    writes a result store into the repo; the file is then opened for append once,
+    creating it if absent, so an unwritable path fails at startup rather than on
+    every emission.
     """
     if OUTPUT == "http":
         if not API_SECRET:
@@ -70,10 +71,18 @@ def select_output() -> tuple[Output, str]:
         path = Path(OUTPUT_PATH)
         if not path.is_absolute():
             _refuse(f"STREAM_SLEUTH_OUTPUT_PATH must be an absolute path, not {OUTPUT_PATH!r}")
-        if not path.parent.is_dir():
-            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH's directory {path.parent} does not exist")
+        if _CHECKOUT in path.resolve().parents:
+            _refuse(f"STREAM_SLEUTH_OUTPUT_PATH {path} is inside the checkout {_CHECKOUT}")
+        try:
+            path.open("a", encoding="utf-8").close()
+        except OSError as e:
+            _refuse(f"cannot append to STREAM_SLEUTH_OUTPUT_PATH {path} ({e.strerror})")
         return JsonlOutput(OUTPUT_PATH), OUTPUT_PATH
     _refuse(f"STREAM_SLEUTH_OUTPUT must be http or jsonl, not {OUTPUT!r}")
+
+
+# The directory holding this package: the repo checkout, which a result store never enters.
+_CHECKOUT = Path(__file__).resolve().parents[1]
 
 
 def _refuse(reason: str) -> NoReturn:
