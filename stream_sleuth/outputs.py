@@ -2,6 +2,7 @@
 
 import json
 import urllib.request
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from .config import API_SECRET, API_URL
@@ -9,14 +10,18 @@ from .config import API_SECRET, API_URL
 
 @runtime_checkable
 class Output(Protocol):
-    def emit(self, track: dict) -> object:
-        """Deliver one identification; the return value is logged."""
+    def emit(self, track: Mapping[str, object]) -> object:
+        """Deliver one identification; the return value is logged.
+
+        ``track`` is a ``Mapping`` so an ``Identification`` (a TypedDict, which is
+        not a ``dict`` to mypy) and a plain ``dict`` from ``parse()`` both fit.
+        """
 
 
 class HttpPostOutput(Output):
     """POSTs each identification to the ingest API (``WXDU_SHAZAM_API``)."""
 
-    def emit(self, track: dict) -> object:
+    def emit(self, track: Mapping[str, object]) -> object:
         return post(track)
 
 

@@ -15,7 +15,7 @@ The code lives in the `stream_sleuth` package; `recognizer.py` is a thin shim th
 | `stream_sleuth/outputs.py` | `Output` protocol; `HttpPostOutput`; `post()` |
 | `stream_sleuth/loop.py` | `identify_once()` and `main()`, the adaptive loop |
 
-Each conforming class subclasses its protocol explicitly, so mypy checks its signatures. Sibling modules bind settings with `from .config import ...`, so a test that changes the environment must re-import the package; use `fresh_recognizer` (see Tests). The loop calls `time.sleep` through the `time` module so a patch of `time.sleep` is seen at call time.
+Each conforming class subclasses its protocol explicitly, so mypy checks its signatures. Sibling modules bind settings with `from .config import ...`, so a test that changes the environment must re-import the package; use `fresh_recognizer` (see Tests). The loop calls `time.sleep` through the `time` module so a patch of `time.sleep` is seen at call time. The shim's names are copies of the package's bindings, not seams: patching `recognizer.post` (or assigning `recognizer.API_SECRET`) does not reach `main()`, so patch the `stream_sleuth` module that owns the call site. `Output.emit` takes a `Mapping[str, object]`, so a recognizer's `Identification` reaches an output without a cast.
 
 ## Interpreter
 
