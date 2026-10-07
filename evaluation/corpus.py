@@ -315,7 +315,9 @@ class Selection:
     """Chosen hour keys -> ``(group, band)`` in selection order, and every shortfall.
 
     A ``<group>/<band>`` shortfall was relaxed: filled from the group's other bands.
-    ``<group>/unfilled`` and ``contrast/<year>`` count hours that could not be found.
+    A ``contrast/<year>`` shortfall was relaxed too: that year had no eligible hour,
+    so its slot went to the next best hour from the other contrast years, if one was
+    left. Only ``<group>/unfilled`` counts hours that could not be found at all.
     """
 
     hours: dict[str, tuple[str, str]] = field(default_factory=dict)
