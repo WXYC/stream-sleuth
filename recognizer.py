@@ -14,7 +14,7 @@ of POSTing (see the README's Config section):
 
   WXDU_STREAM_URL    stream to sample      (default: 192 kbps stream)
   WXDU_SHAZAM_API    ingest endpoint URL   (default: https://api.wxdu.art/api/shazam)
-  WXDU_SHAZAM_SECRET shared secret         (REQUIRED; matches the API's SHAZAM_INGEST_SECRET)
+  WXDU_SHAZAM_SECRET shared secret         (required for http output; matches the API's SHAZAM_INGEST_SECRET)
   WXDU_INTERVAL      pause between tries    (default: 23; while getting hits)
   WXDU_INTERVAL_GAP  pause between tries    (default: 4;  during a miss/gap, to
                                              catch the next track sooner)
