@@ -21,6 +21,7 @@ from evaluation.pool import open_pool_db
 from evaluation.run import main
 from evaluation.shazam_eval import Throttle
 from stream_sleuth.paths import CHECKOUT, DataPathError
+from stream_sleuth.recognizers.olaf import OlafError
 from tests.audio import render
 from tests.characterization.shazam_responses import NO_MATCH
 from tests.shazam_fake import FakeShazam, json_response
@@ -196,6 +197,51 @@ def test_a_build_is_refused_while_a_run_queries_the_snapshot(
     assert len(refusals) == 2  # one per query
     with snapshot_lock(data / "olaf" / "rotation"):  # the run released its lock
         pass
+
+
+@pytest.mark.parametrize("outcome", ["done", "daily_cap", "rate_limited", "refused"])
+def test_every_shazam_outcome_frees_the_lock_and_leaves_the_olaf_legs_to_run(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, outcome: str
+) -> None:
+    async def shazam_leg(addresses, open_clip, store, client):  # noqa: ANN001, ANN202
+        if outcome == "refused":
+            raise shazam_eval.FutureStateError("throttle state is in the future")
+        return outcome
+
+    opened: list[int] = []
+
+    def query_with_the_state_file_free(self: FakeOlaf, wav_path: str) -> dict:
+        with Throttle(data / "shazam" / "throttle.json", 500, 0.0):  # ThrottleBusyError if held
+            opened.append(1)
+        return MATCH
+
+    monkeypatch.setattr(run_mod, "run_shazam", shazam_leg)
+    monkeypatch.setattr(FakeOlaf, "recognize", query_with_the_state_file_free)
+    home = _snapshot(data)
+    with caplog.at_level(logging.INFO):
+        code = main(["--legs", "12s", "--snapshot", "rotation"])
+    assert code == int(outcome == "refused")
+    assert f"12s/shazam: {'refused' if outcome == 'refused' else outcome}" in caplog.text
+    assert "12s/olaf: done" in caplog.text
+    assert len(opened) == len(_records(home / RESULTS)) == 2  # every Olaf query, lock free
+
+
+def test_the_shazam_report_is_logged_before_an_olaf_leg_that_raises(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def shazam_leg(addresses, open_clip, store, client):  # noqa: ANN001, ANN202
+        return "rate_limited"
+
+    def broken(self: FakeOlaf, wav_path: str) -> dict:
+        raise OlafError("no Olaf index")
+
+    monkeypatch.setattr(run_mod, "run_shazam", shazam_leg)
+    monkeypatch.setattr(FakeOlaf, "recognize", broken)
+    _snapshot(data)
+    with caplog.at_level(logging.INFO), pytest.raises(OlafError):
+        main(["--legs", "12s", "--snapshot", "rotation"])
+    assert "12s/shazam: rate_limited" in caplog.text
+    assert "0 requests" in caplog.text
 
 
 def test_a_snapshot_refusal_comes_before_the_shazam_lock_is_taken(
