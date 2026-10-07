@@ -14,97 +14,29 @@ from typing import Any
 import pytest
 
 from evaluation import score
-from evaluation.clips import ClipAddress, grid
+from evaluation.clips import grid
 from evaluation.results import Emission, Leg, Results, ResultStore, read_results
 from evaluation.score import attribute, load_emissions, plays_from, score_plays
-from stream_sleuth.recognizers.base import EvalIdentification
-from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
+from tests.emissions import OLAF, SHAZAM, emission
+from tests.plays import (
+    CHUQUI,
+    COCREDIT,
+    ELLINGTON,
+    EMPTY,
+    HERMANOS,
+    HOUR,
+    MOLINA,
+    OTHER,
+    PRATT,
+    RECORDS,
+    SHORT,
+    STAGE,
+    UNLOGGED,
+    hour_records,
+)
 from tests.stores import olaf_record, shazam_record
 
-HOUR = "2026/08/12/202608121600.mp3"
-EMPTY = "2026/08/12/202608121700.mp3"  # gridded, never queried
-SHORT = "2026/08/12/202608121800.mp3"  # decodes to 1,800 s
-OTHER = "2026/08/12/202608121900.mp3"  # outside the leg's hours
-SHAZAM = "shazam@0.8.1, segment=12"
-OLAF = olaf_identity("rotation")
 LEG = Leg("12s", 12, "128k", "all", ("shazam", "olaf"))
-PADS = {"canonical": 180.0, "etl": 220.0}
-
-MOLINA = ("Juana Molina", "la paradoja", "DOGA")
-PRATT = ("Jessica Pratt", "Back, Baby", "On Your Own Love Again")
-CHUQUI = ("Chuquimamani-Condori", "Call Your Name", "Edits")
-HERMANOS = ("Hermanos Gutiérrez", "El Bueno y el Malo", "El Bueno y el Malo")
-ELLINGTON = ("Duke Ellington & John Coltrane", "In a Sentimental Mood", "Duke Ellington & John Coltrane")  # fmt: skip
-UNLOGGED = ("Stereolab", "French Disko", "Jenny Ondioline")
-
-
-def _hour(
-    hour_key: str, era: str, *rows: tuple[int, float, tuple[str, str, str], dict]
-) -> list[dict]:
-    """``plays.jsonl`` records for one hour, windowed as ``corpus.write_plays`` windows them.
-
-    The first row is the carryover when its offset is negative.
-    """
-    records = []
-    for i, (play_id, t, (artist, title, album), extra) in enumerate(rows):
-        t_next = rows[i + 1][1] if i + 1 < len(rows) else 3600.0
-        records.append(
-            {
-                "hour_key": hour_key,
-                "play_id": play_id,
-                "t_offset_s": t,
-                "window_start_s": max(0.0, t - PADS[era]),
-                "window_end_s": min(3600.0, t_next + PADS[era]),
-                "artist": artist,
-                "title": title,
-                "album": album,
-                "era": era,
-                "pad_s": PADS[era],
-                "reorder_flag": False,
-                "play_order_status": "single_writer",
-                "carryover": t < 0,
-                "in_pool": True,
-                "pool_match_tier": "exact",
-                "pool_format": "mp3",
-                "rotation": True,
-                "talk_rows": 0,
-                "group": "canonical-high",
-                "band": "daytime",
-                "subset": False,
-                **extra,
-            }  # fmt: skip
-        )
-    return records
-
-
-# Windows: carryover [0, 300], 1 [0, 780], 2 [420, 1080], 3 [720, 1680], 4 [1320, 2580],
-# 5 [2220, 3600]. Play 4's show is reorder-flagged and play 5's play order is unreliable: neither
-# changes attribution, which reads windows and logged intervals only. Play 4's interval runs
-# through a talk break (2,100 s to 2,400 s) in which nothing is logged. Play 3 is out of the pool.
-RECORDS = _hour(
-    HOUR,
-    "canonical",
-    (100, -200.0, HERMANOS, {}),
-    (1, 120.0, MOLINA, {}),
-    (2, 600.0, PRATT, {}),
-    (3, 900.0, PRATT, {"in_pool": False, "pool_match_tier": None}),  # the same song twice
-    (4, 1500.0, CHUQUI, {"reorder_flag": True}),
-    (5, 2400.0, ELLINGTON, {"play_order_status": "unreliable", "reorder_flag": None}),
-)
-
-
-def _found(track: tuple[str, str, str], at: float, **extra: Any) -> EvalIdentification:
-    artist, song, album = track
-    found: EvalIdentification = {
-        "artist": artist, "song": song, "album": album, "label": "", "at": at, "source": "shazam",
-    }  # fmt: skip
-    return {**found, **extra}  # type: ignore[typeddict-item]
-
-
-def _hit(track: tuple[str, str, str], at: float, hour: str = HOUR, **extra: Any) -> Emission:
-    """A 12 s Shazam emission at grid offset ``at``, as ``read_results`` would return it."""
-    address = ClipAddress(hour, int(at), 12)
-    return Emission((address.key, SHAZAM), address, _found(track, at, **extra))
 
 
 @pytest.mark.parametrize(
@@ -147,21 +79,21 @@ def _hit(track: tuple[str, str, str], at: float, hour: str = HOUR, **extra: Any)
 def test_attribution(
     track: tuple[str, str, str], at: float, play_id: int | None, neighbor: bool
 ) -> None:
-    [verdict] = attribute(plays_from(RECORDS), [_hit(track, at)])
+    [verdict] = attribute(plays_from(RECORDS), [emission(track, at)])
     assert (verdict.play.play_id if verdict.play else None, verdict.neighbor) == (play_id, neighbor)
 
 
 def test_a_dotted_initialism_joins_the_same_letters_undotted() -> None:
     """The join's rule since WXYC/stream-sleuth#96, so "A.R. Kane" logged is "AR Kane" heard."""
-    plays = plays_from(_hour(HOUR, "canonical", (1, 120.0, ("A.R. Kane", "Baby Milk Snatcher", "69"), {})))  # fmt: skip
-    [verdict] = attribute(plays, [_hit(("AR Kane", "Baby Milk Snatcher", "69"), 195.0)])
+    plays = plays_from(hour_records(HOUR, "canonical", (1, 120.0, ("A.R. Kane", "Baby Milk Snatcher", "69"), {})))  # fmt: skip
+    [verdict] = attribute(plays, [emission(("AR Kane", "Baby Milk Snatcher", "69"), 195.0)])
     assert verdict.play is not None and verdict.play.play_id == 1
 
 
 def test_a_same_song_play_in_neither_logged_interval_goes_to_the_earlier() -> None:
-    records = _hour(HOUR, "canonical", (1, 600.0, PRATT, {}), (2, 900.0, MOLINA, {}), (3, 1200.0, PRATT, {}))  # fmt: skip
+    records = hour_records(HOUR, "canonical", (1, 600.0, PRATT, {}), (2, 900.0, MOLINA, {}), (3, 1200.0, PRATT, {}))  # fmt: skip
     # 1,050 s is in both Pratt plays' windows ([420, 1080] and [1020, 3600]), and in neither's interval.
-    [verdict] = attribute(plays_from(records), [_hit(PRATT, 1050.0)])
+    [verdict] = attribute(plays_from(records), [emission(PRATT, 1050.0)])
     assert verdict.play is not None and (verdict.play.play_id, verdict.neighbor) == (1, True)
 
 
@@ -181,13 +113,13 @@ def test_read_plays_reads_utf8_jsonl(tmp_path: Path) -> None:
 
 
 HITS = [
-    _hit(HERMANOS, 30.0),
-    _hit(MOLINA, 195.0),
-    _hit(PRATT, 450.0, query_offset_s=0.0, ref_start_s=15.0),
-    _hit(PRATT, 750.0, query_offset_s=0.0, ref_start_s=315.0),
-    _hit(PRATT, 990.0),
-    _hit(CHUQUI, 1380.0, query_offset_s=2.0, ref_start_s=32.0),
-    _hit(UNLOGGED, 2205.0),
+    emission(HERMANOS, 30.0),
+    emission(MOLINA, 195.0),
+    emission(PRATT, 450.0, query_offset_s=0.0, ref_start_s=15.0),
+    emission(PRATT, 750.0, query_offset_s=0.0, ref_start_s=315.0),
+    emission(PRATT, 990.0),
+    emission(CHUQUI, 1380.0, query_offset_s=2.0, ref_start_s=32.0),
+    emission(UNLOGGED, 2205.0),
 ]
 
 
@@ -203,23 +135,23 @@ def test_precision_and_distinct_song_precision() -> None:
     ("hits", "plain", "distinct"),
     [
         pytest.param(
-            [_hit(MOLINA, 195.0), _hit(("JUANA MOLINA", "La Paradoja", "DOGA"), 210.0), _hit(UNLOGGED, 2205.0)],
+            [emission(MOLINA, 195.0), emission(("JUANA MOLINA", "La Paradoja", "DOGA"), 210.0), emission(UNLOGGED, 2205.0)],
             2 / 3, 1 / 2, id="the loop's key: artist and song, case-folded with lower()",
         ),
         pytest.param(
-            [_hit(MOLINA, 195.0), _hit(MOLINA, 990.0)], 1 / 2, 1.0,
+            [emission(MOLINA, 195.0), emission(MOLINA, 990.0)], 1 / 2, 1.0,
             id="a run is correct when any of it is, though one emission is past the window",
         ),
         pytest.param(
-            [_hit(CHUQUI, 1305.0), _hit(CHUQUI, 1320.0)], 1 / 2, 1.0,
+            [emission(CHUQUI, 1305.0), emission(CHUQUI, 1320.0)], 1 / 2, 1.0,
             id="a run whose first emission is before the window is still correct",
         ),
         pytest.param(
-            [_hit(ELLINGTON, 3585.0), _hit(ELLINGTON, 0.0, hour=EMPTY)], 1 / 2, 1 / 2,
+            [emission(ELLINGTON, 3585.0), emission(ELLINGTON, 0.0, hour=EMPTY)], 1 / 2, 1 / 2,
             id="a run ends at the hour's end",
         ),
         pytest.param(
-            [_hit(PRATT, 450.0), _hit(UNLOGGED, 2205.0), _hit(PRATT, 750.0)], 2 / 3, 1 / 2,
+            [emission(PRATT, 450.0), emission(UNLOGGED, 2205.0), emission(PRATT, 750.0)], 2 / 3, 1 / 2,
             id="runs are read in at order, not input order",
         ),
     ],
@@ -264,17 +196,17 @@ def test_recall_time_to_first_identification_and_lag() -> None:
     ("hits", "first", "ttfi", "lag"),
     [
         pytest.param(
-            [_hit(MOLINA, 150.0, query_offset_s=0.0, ref_start_s=30.0),
-             _hit(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=60.0),
-             _hit(MOLINA, 450.0, query_offset_s=0.0, ref_start_s=90.0)],
+            [emission(MOLINA, 150.0, query_offset_s=0.0, ref_start_s=30.0),
+             emission(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=60.0),
+             emission(MOLINA, 450.0, query_offset_s=0.0, ref_start_s=90.0)],
             150.0, 30.0, 80.0, id="the earliest clip with offsets sets the start, not the median",
         ),
         pytest.param(
-            [_hit(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=180.0), _hit(MOLINA, 135.0)],
+            [emission(MOLINA, 300.0, query_offset_s=0.0, ref_start_s=180.0), emission(MOLINA, 135.0)],
             135.0, 15.0, 80.0, id="an earlier offset-less answer is the first identification only",
         ),
         pytest.param(
-            [_hit(MOLINA, 150.0, query_offset_s=10.0, ref_start_s=0.0)], 150.0, 0.0, 40.0,
+            [emission(MOLINA, 150.0, query_offset_s=10.0, ref_start_s=0.0)], 150.0, 0.0, 40.0,
             id="a song that starts inside the first clip is identified at once, never before",
         ),
     ],
@@ -282,7 +214,7 @@ def test_recall_time_to_first_identification_and_lag() -> None:
 def test_the_song_start_is_the_earliest_offset_bearing_clips(
     hits: list[Emission], first: float, ttfi: float, lag: float
 ) -> None:
-    plays = plays_from(_hour(HOUR, "canonical", (1, 200.0, MOLINA, {})))
+    plays = plays_from(hour_records(HOUR, "canonical", (1, 200.0, MOLINA, {})))
     verdicts = list(reversed(attribute(plays, hits)))  # score_plays orders them itself
     [row] = score_plays(plays, verdicts, covered=set(plays))
     assert (row.first_s, row.ttfi_s, row.lag_s) == (first, ttfi, lag)
@@ -298,7 +230,7 @@ def test_recall_counts_covered_plays_only() -> None:
 
 
 def _rows(era: str, lags: list[float | None]) -> list[score.PlayScore]:
-    [play] = plays_from(_hour(HOUR, era, (1, 0.0, MOLINA, {})))
+    [play] = plays_from(hour_records(HOUR, era, (1, 0.0, MOLINA, {})))
     return [score.PlayScore(play, True, True, None, None, lag) for lag in lags]
 
 
@@ -339,8 +271,8 @@ def _no_matches(
 
 
 def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
-    short = _hour(SHORT, "etl", (7, 300.0, MOLINA, {}), (8, 1200.0, PRATT, {}))
-    records = RECORDS + _hour(EMPTY, "canonical", (6, 60.0, CHUQUI, {})) + short
+    short = hour_records(SHORT, "etl", (7, 300.0, MOLINA, {}), (8, 1200.0, PRATT, {}))
+    records = RECORDS + hour_records(EMPTY, "canonical", (6, 60.0, CHUQUI, {})) + short
     addresses = grid(HOUR, 12) + grid(EMPTY, 12) + grid(SHORT, 12, hour_s=1800.0)
     # SHORT's records run to 3,585 s, but past 1,785 s they are not in its decoded grid.
     store = ResultStore(tmp_path / "results.jsonl")
@@ -357,7 +289,7 @@ def test_coverage_and_scores_of_a_partial_leg(tmp_path: Path) -> None:
     results = read_results([store], {SHAZAM, OLAF})
 
     leg = score.score_leg(
-        plays_from(records + _hour(OTHER, "canonical", (9, 60.0, MOLINA, {}))),
+        plays_from(records + hour_records(OTHER, "canonical", (9, 60.0, MOLINA, {}))),
         results,
         SHAZAM,
         LEG,
@@ -401,7 +333,7 @@ LABELS = "2026/08/12/202608122000.mp3"
 
 
 def test_plays_no_emission_can_join_stay_in_recall_and_are_counted(tmp_path: Path) -> None:
-    records = _hour(
+    records = hour_records(
         LABELS,
         "canonical",
         (1, 120.0, ("", "Untitled", ""), {"in_pool": None, "pool_match_tier": None}),
@@ -428,7 +360,7 @@ def test_an_hour_whose_records_are_all_errors_is_uncovered_but_has_records(tmp_p
     for offset in (0, 15):
         shazam_record(store, f"{errors}#{offset}+12@128k", "server_error")
     results = read_results([store], {SHAZAM})
-    plays = plays_from(_hour(errors, "canonical", (1, 120.0, MOLINA, {})))
+    plays = plays_from(hour_records(errors, "canonical", (1, 120.0, MOLINA, {})))
     leg = score.score_leg(plays, results, SHAZAM, LEG, [errors], grid(errors, 12))
     assert leg.coverage == score.Coverage(
         grid_addresses=240,
@@ -483,7 +415,11 @@ def _emissions_file(tmp_path: Path, *records: dict | str) -> Path:
 
 def _line(offset: float, /, **changes: Any) -> dict:
     """An emissions-file record at ``offset``; a change to None removes that field."""
-    record = {**_found(MOLINA, offset), "address": f"{HOUR}#{int(offset)}+12@128k", **changes}
+    record = {
+        **emission(MOLINA, offset).found,
+        "address": f"{HOUR}#{int(offset)}+12@128k",
+        **changes,
+    }
     return {k: v for k, v in record.items() if v is not None}
 
 
@@ -524,21 +460,13 @@ def test_an_emissions_file_spans_hours_and_capture_lengths(tmp_path: Path) -> No
     assert len(attribute(plays_from(RECORDS), loaded)) == 2
 
 
-COCREDIT = "Juana Molina & Chuquimamani-Condori"
-STAGE = "a" * 40
 REFERENCES = {STAGE: (COCREDIT, "Juana Molina")}
 
 
-def _local(artist: str, at: float, ref_key: str = STAGE, **extra: Any) -> Emission:
-    """A 12 s Olaf emission as ``read_results`` would return it: it names its reference by stage id."""
-    track = (artist, MOLINA[1], MOLINA[2])
-    found = _found(track, at, source="local", confidence=40.0, ref_key=ref_key, **extra)
-    address = ClipAddress(HOUR, int(at), 12)
-    return Emission((address.key, OLAF), address, found)
-
-
 def _molina_plays(artist: str = "Juana Molina") -> list[score.Play]:
-    return plays_from(_hour(HOUR, "canonical", (1, 120.0, (artist, MOLINA[1], MOLINA[2]), {})))
+    return plays_from(
+        hour_records(HOUR, "canonical", (1, 120.0, (artist, MOLINA[1], MOLINA[2]), {}))
+    )
 
 
 @pytest.mark.parametrize(
@@ -571,20 +499,20 @@ def test_an_olaf_match_on_a_co_credited_file_is_correct_by_either_artist_tag(
     references: dict[str, tuple[str, ...]] | None,
     scored: bool,
 ) -> None:
-    emission = _local(COCREDIT, 195.0, ref_key)
-    [verdict] = attribute(_molina_plays(play_artist), [emission], references)
+    olaf = emission((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, source="local", ref_key=ref_key)
+    [verdict] = attribute(_molina_plays(play_artist), [olaf], references)
     assert (verdict.play is not None) is scored
 
 
 def test_a_shazam_co_credit_stays_wrong_whatever_the_names_mapping_holds() -> None:
     """Shazam names one artist string and no reference: its co-credit is a near miss (#93)."""
-    shazam = _hit((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
+    shazam = emission((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
     [verdict] = attribute(_molina_plays(), [shazam], REFERENCES)
     assert verdict.play is None
 
 
 def test_a_shazam_emission_still_joins_by_its_own_artist_whatever_its_ref_key_maps_to() -> None:
-    shazam = _hit((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
+    shazam = emission((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, ref_key=STAGE)
     [verdict] = attribute(_molina_plays(COCREDIT), [shazam], {STAGE: ("Jessica Pratt",)})
     assert verdict.play is not None and verdict.play.play_id == 1
 
@@ -593,8 +521,8 @@ def test_a_shazam_emission_still_joins_by_its_own_artist_whatever_its_ref_key_ma
 def test_a_leg_scores_an_olaf_co_credit_with_the_names_mapping(
     references: dict[str, tuple[str, ...]] | None, play_id: int | None
 ) -> None:
-    emission = _local(COCREDIT, 195.0)
-    results = Results([emission], {emission.key}, {})
+    olaf = emission((COCREDIT, MOLINA[1], MOLINA[2]), 195.0, source="local")
+    results = Results([olaf], {olaf.key}, {})
 
     leg = score.score_leg(
         _molina_plays(),

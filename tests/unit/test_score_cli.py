@@ -6,7 +6,6 @@ directory. ``hour_addresses`` is replaced, so no test needs ffmpeg or an archive
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 from pathlib import Path
@@ -22,9 +21,8 @@ from evaluation.results import ResultStore, recognizer_identity
 from evaluation.score import plays_from
 from stream_sleuth.recognizers.olaf import OLAF_COMMIT
 from stream_sleuth.recognizers.olaf import recognizer_identity as olaf_identity
-from tests.stores import olaf_record, shazam_record
-from tests.unit.test_queues import LIKELY, OLAF_PLAYBACK
-from tests.unit.test_score import (
+from tests.emissions import emission
+from tests.plays import (
     COCREDIT,
     HERMANOS,
     HOUR,
@@ -34,9 +32,11 @@ from tests.unit.test_score import (
     RECORDS,
     STAGE,
     UNLOGGED,
-    _hit,
-    _hour,
+    hour_records,
 )
+from tests.queues import edit_queue, read_queue
+from tests.stores import olaf_record, shazam_record
+from tests.unit.test_queues import LIKELY, OLAF_PLAYBACK
 
 SNAPSHOT = "rotation"
 SHAZAM12 = recognizer_identity(12)
@@ -324,11 +324,6 @@ def test_scoring_does_not_take_the_snapshot_lock_so_it_reads_a_running_query(dat
     assert (data / "score" / "score.json").exists()
 
 
-def read_queue(path: Path) -> list[dict[str, str]]:
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
-
-
 QUEUE = "score/near_misses.csv"
 HEADER = (
     "leg,recognizer,address,last_address,emissions,hour_key,start,end,source,artist,song,album,"
@@ -383,17 +378,6 @@ def test_the_queue_defaults_to_the_directory_of_the_score_file(data: Path) -> No
     assert not (data / "score").exists()
 
 
-def fill_verdict(path: Path, verdict: str) -> bytes:
-    """Put ``verdict`` in the queue's first row, as a person would; return the file's bytes."""
-    rows = read_queue(path)
-    rows[0]["verdict"] = verdict
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    return path.read_bytes()
-
-
 def queued(data: Path) -> Path:
     """Run once over a store holding one near miss; return the queue it wrote."""
     add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
@@ -406,7 +390,7 @@ def test_a_queue_with_a_verdict_is_kept_byte_for_byte_and_read_by_the_rescore(
     data: Path,
 ) -> None:
     queue = queued(data)
-    filled = fill_verdict(queue, "correct")
+    filled = edit_queue(queue, verdict="correct")
 
     assert run_cli(data) == 0
 
@@ -556,7 +540,7 @@ def test_only_shazam_with_only_olaf_legs_selects_nothing(
 
 
 def test_a_play_keeps_its_rotation_flag_as_the_producer_wrote_it() -> None:
-    records = _hour(
+    records = hour_records(
         HOUR, "canonical", (1, 120.0, MOLINA, {}), (2, 600.0, PRATT, {"rotation": False})
     )
 
@@ -703,7 +687,7 @@ def test_a_filled_false_positive_queue_is_kept_and_an_unfilled_near_miss_queue_r
     add_shazam(data, ClipAddress(HOUR, 195, 12), OTHER_SONG)
     add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
     run_cli(data)
-    filled = fill_verdict(data / FP_QUEUE, "talk")
+    filled = edit_queue(data / FP_QUEUE, verdict="talk")
     near = data / QUEUE
     near.write_text(near.read_text(encoding="utf-8") + "stale\n", encoding="utf-8")
 
@@ -743,7 +727,7 @@ def mixed_store(data: Path) -> None:
 
 def fill_queues(data: Path, near: str, fp: str) -> tuple[bytes, bytes]:
     """Fill the first row of each queue (a blank leaves it as written); return their bytes."""
-    return fill_verdict(data / QUEUE, near), fill_verdict(data / FP_QUEUE, fp)
+    return edit_queue(data / QUEUE, verdict=near), edit_queue(data / FP_QUEUE, verdict=fp)
 
 
 # (near-miss verdict, false-positive verdict) -> (adjudicated precision, adjudicated distinct).
@@ -800,7 +784,7 @@ def test_a_row_naming_no_current_run_is_logged_once_and_ignored(
     data: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     queue = queued(data)  # one near miss at 195
-    filled = fill_verdict(queue, "correct")
+    filled = edit_queue(queue, verdict="correct")
     (data / "shazam" / "results.jsonl").unlink()
     add_shazam(data, ClipAddress(HOUR, 210, 12), MOLINA)  # that run is gone
     caplog.set_level("WARNING")
@@ -830,7 +814,7 @@ def test_an_unknown_verdict_is_refused_in_one_line_naming_the_file_row_and_value
     mixed_store(data)
     run_cli(data)
     (data / "score" / "score.json").unlink()
-    filled = fill_verdict(data / queue, verdict)
+    filled = edit_queue(data / queue, verdict=verdict)
 
     with pytest.raises(SystemExit) as refusal:
         run_cli(data)
@@ -842,24 +826,14 @@ def test_an_unknown_verdict_is_refused_in_one_line_naming_the_file_row_and_value
     assert not (data / "score" / "score.json").exists()
 
 
-def save_like_a_spreadsheet(path: Path) -> bytes:
-    """Rewrite a queue as Excel or Sheets saves it: a byte-order mark, CRLF line endings, every
-    field quoted, and booleans upper-cased."""
-    rows = read_queue(path)
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, list(rows[0]), quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-        writer.writeheader()
-        writer.writerows(
-            {k: v.upper() if v in ("True", "False") else v for k, v in r.items()} for r in rows
-        )
-    return path.read_bytes()
-
-
 def test_verdicts_survive_a_save_in_a_spreadsheet(data: Path) -> None:
     mixed_store(data)
     run_cli(data)
     fill_queues(data, "correct", "unlogged-correct")
-    saved = (save_like_a_spreadsheet(data / QUEUE), save_like_a_spreadsheet(data / FP_QUEUE))
+    saved = (
+        edit_queue(data / QUEUE, spreadsheet=True),
+        edit_queue(data / FP_QUEUE, spreadsheet=True),
+    )
     assert b"FALSE" in saved[0] and saved[0].startswith(BOM) and b"\r\n" in saved[0]
 
     run_cli(data)
@@ -890,16 +864,6 @@ def test_the_score_file_says_how_many_wrong_runs_there_are_and_how_many_were_jud
     )
 
 
-def set_cells(path: Path, leg: str, **cells: str) -> bytes:
-    """Set cells in the rows of ``leg``, as a person would; return the file's bytes."""
-    rows = read_queue(path)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, list(rows[0]))
-        writer.writeheader()
-        writer.writerows({**r, **cells} if r["leg"] == leg else r for r in rows)
-    return path.read_bytes()
-
-
 def two_legs(data: Path) -> None:
     """One false-positive run of one emission at one address, for both recognizers of the leg."""
     add_snapshot(data, UNLOGGED[0], UNLOGGED[0])
@@ -926,8 +890,8 @@ def test_a_verdict_reaches_only_its_own_leg_at_a_shared_address(
 ) -> None:
     two_legs(data)
     run_cli(data, "--snapshot", SNAPSHOT)
-    set_cells(data / FP_QUEUE, "12s/shazam", verdict=shazam)
-    set_cells(data / FP_QUEUE, "12s/olaf", verdict=olaf)
+    edit_queue(data / FP_QUEUE, {"leg": "12s/shazam"}, verdict=shazam)
+    edit_queue(data / FP_QUEUE, {"leg": "12s/olaf"}, verdict=olaf)
 
     run_cli(data, "--snapshot", SNAPSHOT)
 
@@ -941,7 +905,9 @@ def test_a_row_judged_under_another_identity_of_the_same_leg_is_stale(
     two_legs(data)
     run_cli(data, "--snapshot", SNAPSHOT)
     other_floor = olaf_identity(SNAPSHOT, 7)
-    set_cells(data / FP_QUEUE, "12s/olaf", recognizer=other_floor, verdict="unlogged-correct")
+    edit_queue(
+        data / FP_QUEUE, {"leg": "12s/olaf"}, recognizer=other_floor, verdict="unlogged-correct"
+    )
     caplog.set_level("WARNING")
 
     run_cli(data, "--snapshot", SNAPSHOT)
@@ -956,7 +922,7 @@ def test_two_rows_for_one_run_are_refused_naming_both(data: Path) -> None:
     queue = data / FP_QUEUE
     lines = queue.read_text(encoding="utf-8-sig").splitlines()
     queue.write_text("\n".join([*lines, lines[1]]) + "\n", encoding="utf-8")
-    fill_verdict(queue, "talk")
+    edit_queue(queue, verdict="talk")
     (data / "score" / "score.json").unlink()
 
     with pytest.raises(SystemExit, match=r"false_positives\.csv.*rows 2 and 3") as refusal:
@@ -970,7 +936,7 @@ def test_a_run_with_no_row_in_a_kept_queue_is_logged_by_address(
     data: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     queued(data)
-    fill_verdict(data / QUEUE, "correct")
+    edit_queue(data / QUEUE, verdict="correct")
     add_shazam(data, ClipAddress(HOUR, 210, 12), MOLINA)  # ends the first run
     add_shazam(data, ClipAddress(HOUR, 300, 12), OTHER_SONG)  # a new near-miss run
     caplog.set_level("WARNING")
@@ -989,7 +955,7 @@ def test_a_bad_false_positive_queue_stops_the_run_before_the_near_miss_queue_is_
     near = data / QUEUE
     near.write_text(near.read_text(encoding="utf-8") + "stale\n", encoding="utf-8")
     kept = near.read_bytes()
-    fill_verdict(data / FP_QUEUE, "maybe")
+    edit_queue(data / FP_QUEUE, verdict="maybe")
 
     with pytest.raises(SystemExit, match="maybe"):
         run_cli(data)
@@ -1000,7 +966,7 @@ def test_a_bad_false_positive_queue_stops_the_run_before_the_near_miss_queue_is_
 def test_write_queue_refuses_a_file_with_a_verdict_in_it(data: Path) -> None:
     mixed_store(data)
     run_cli(data)
-    filled = fill_verdict(data / QUEUE, "correct")
+    filled = edit_queue(data / QUEUE, verdict="correct")
 
     with pytest.raises(SystemExit, match="verdicts filled in"):
         queues.write_queue(data / QUEUE, queues.NEAR_COLUMNS, [])
@@ -1012,8 +978,8 @@ def test_a_distinct_run_is_dropped_only_when_every_emission_in_it_is_talk() -> N
     """One song across a wrong run marked talk, a correct emission, and a wrong run, then a run
     that is nothing but talk, then a wrong one."""
     play = plays_from(RECORDS)[1]
-    first, correct, last = (_hit(UNLOGGED, at) for at in (750.0, 765.0, 780.0))
-    talk, wrong = _hit(MOLINA, 900.0), _hit(PRATT, 915.0)
+    first, correct, last = (emission(UNLOGGED, at) for at in (750.0, 765.0, 780.0))
+    talk, wrong = emission(MOLINA, 900.0), emission(PRATT, 915.0)
     verdicts = [
         score.Verdict(e, p, False)
         for e, p in ((first, None), (correct, play), (last, None), (talk, None), (wrong, None))
