@@ -99,6 +99,7 @@ Known gap on the `title` tier: it joins only when the play's title key equals th
 ## Shazam
 
 - **No test or manual check ever contacts Shazam.** `evaluation.shazam_eval.CountingClient` takes a required `base_url`; tests pass a localhost server's URL, and only the CLI passes `None` (the real host). Signatures are computed offline from synthetic audio, so tests run `Shazam.recognize` up to the HTTP request.
+- `evaluation/shazam_eval.py` imports `stream_sleuth.paths` and nothing else from the runtime package. Its result store, throttle state, and work directory pass `require_outside_checkout()` before anything is created. The `external_api` marker is declared and excluded in `addopts` with a `ci-sync-skip` comment: CI never runs it, and no test uses it.
 - Every request goes through `Throttle.acquire()` inside the client, so anything `shazamio` sends is counted. Never construct `shazamio`'s default `HTTPClient` in the harness: it retries 429s up to 20 times.
 
 ## WXYC fork

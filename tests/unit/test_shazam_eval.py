@@ -357,3 +357,13 @@ def test_the_client_requires_an_explicit_base_url(tmp_path: Path) -> None:
     throttle = Throttle(tmp_path / "t.json", 500, 20.0)
     with pytest.raises(TypeError):
         CountingClient(throttle)  # type: ignore[call-arg]
+
+
+def test_external_api_is_declared_excluded_and_opted_out_of_ci_sync() -> None:
+    text = (CHECKOUT / "pyproject.toml").read_text()  # no tomllib: the floor is 3.10
+    assert '"external_api: ' in text
+    assert "not external_api" in text
+    assert (
+        "# ci-sync-skip: external_api reason: unofficial Shazam client, never called from CI"
+        in text
+    )
