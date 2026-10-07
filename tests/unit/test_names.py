@@ -180,6 +180,82 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
 
 
 @pytest.mark.parametrize(
+    ("s", "album_key", "fuzzy"),
+    [
+        # An unbracketed featuring credit goes as the bracketed one does: the whole word
+        # feat, feat., ft, ft. or featuring, in any case, and the words after it.
+        ("Hibiscus Feat. Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus feat Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus (feat Bbyafricka)", "hibiscus", "hibiscus"),
+        ("Hibiscus ft. Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus FT Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus Featuring Bbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus  feat.  Bbyafricka  &  Juana Molina", "hibiscus", "hibiscus"),
+        ("Hibiscus\tfeat.\nBbyafricka", "hibiscus", "hibiscus"),
+        ("Hibiscus feat. R.E.M.", "hibiscus", "hibiscus"),
+        ("Juana Molina feat. Jessica Pratt", "juana molina", "juana molina"),
+        # Not "with" (a title: "Dancing with Myself"), not a leading word, not part of a word.
+        ("Dancing with Myself", "dancing with myself", "dancing with myself"),
+        ("Waltz with Bashir", "waltz with bashir", "waltz with bashir"),
+        ("Featuring Ourselves", "featuring ourselves", "featuring ourselves"),
+        ("Feat. Ourselves", "feat. ourselves", "feat ourselves"),
+        ("Theft", "theft", "theft"),
+        ("Feather", "feather", "feather"),
+        ("Lift", "lift", "lift"),
+        ("Ghost Feather Boa", "ghost feather boa", "ghost feather boa"),
+        ("Soft Feat", "soft", "soft"),
+        # The credit never swallows a version qualifier that follows it: a bracketed clause
+        # or a spaced-dash suffix is kept (and read as one), and the other clauses go as before.
+        ("Hibiscus feat. Bbyafricka (Live)", "hibiscus (live)", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka [Demo]", "hibiscus [demo]", "hibiscus demo"),
+        ("Hibiscus feat. Bbyafricka - Live", "hibiscus - live", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka – Live", "hibiscus – live", "hibiscus live"),
+        (
+            "Hibiscus feat. Bbyafricka (Live) (Bonus Track Version)",
+            "hibiscus (live)",
+            "hibiscus live",
+        ),
+        ("Hibiscus feat. Bbyafricka (Deluxe Version)", "hibiscus", "hibiscus"),
+        ("Hibiscus (Live) feat. Bbyafricka", "hibiscus (live)", "hibiscus live"),
+        ("Hibiscus feat. Bbyafricka (Brazil)", "hibiscus (brazil)", "hibiscus"),
+    ],
+)
+def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
+    s: str, album_key: str, fuzzy: str
+) -> None:
+    assert norm.album_key(s) == album_key
+    assert norm.fuzzy(s) == fuzzy
+
+
+@pytest.mark.parametrize(
+    ("play_title", "pool_title", "tier"),
+    [
+        # The Carré case: the flowsheet's bracketed credit meets the tag's inline one.
+        ("Hibiscus (feat Bbyafricka)", "Hibiscus Feat. Bbyafricka", "exact"),
+        ("Hibiscus Feat. Bbyafricka", "Hibiscus (feat Bbyafricka)", "exact"),
+        ("Hibiscus", "Hibiscus ft. Bbyafricka", "exact"),
+        ("Hibiscus featuring Bbyafricka", "Hibiscus", "exact"),
+        ("Hibiscus Feat. Bbyafricka!", "Hibiscus", "exact"),
+        ("Dancing with Myself", "Dancing", None),
+        # A version the credit precedes is still named, on the play side and the pool side.
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus (Live)", "exact"),
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus feat. Bbyafricka", None),
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus ft. Someone Else (Live)", "exact"),
+        ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka (Live)", "exact"),
+        ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka", None),
+        ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka - Live", "fuzzy"),
+        ("Hibiscus feat. Bbyafricka - Live", "Hibiscus (Live)", "fuzzy"),
+        ("Hibiscus feat. Bbyafricka (Demo)", "Hibiscus feat. Bbyafricka (Live)", None),
+    ],
+)
+def test_title_tier_joins_an_unbracketed_featuring_credit(
+    play_title: str, pool_title: str, tier: str | None
+) -> None:
+    assert norm.title_tier("Carré", "", play_title, ("Carré",), "", pool_title) == tier
+
+
+@pytest.mark.parametrize(
     ("s", "fuzzy"),
     [
         # A dotted initialism (two or more single letters each followed by a period, the
