@@ -381,3 +381,59 @@ def test_a_previous_score_file_is_rewritten(data: Path) -> None:
     run_cli(data)
 
     assert (data / "score" / "score.json").read_bytes() != previous
+
+
+def test_only_shazam_ignores_snapshot_as_run_py_does(data: Path) -> None:
+    score.main(
+        ["--plays", str(data / "plays.jsonl"), "--only", "shazam", "--snapshot", "absent"]
+        + ["--legs", "12s"]
+    )
+
+    assert set(read_score(data)["legs"]) == {"12s/shazam"}
+    assert not (data / "olaf").exists()
+
+
+def test_only_olaf_scores_the_olaf_side_of_a_mixed_leg(data: Path) -> None:
+    add_snapshot(data)
+    add_olaf(data, ClipAddress(HOUR, 195, 12), COCREDIT)
+
+    score.main(
+        ["--plays", str(data / "plays.jsonl"), "--only", "olaf", "--snapshot", SNAPSHOT]
+        + ["--legs", "12s"]
+    )
+
+    assert set(read_score(data)["legs"]) == {"12s/olaf"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, b"{not json\n", b'{"hour_key": "2026082315"}\n'],
+    ids=["missing", "not JSON", "a record missing fields"],
+)
+def test_an_unreadable_plays_file_is_one_line(data: Path, content: bytes | None) -> None:
+    plays = data / "plays.jsonl"
+    if content is None:
+        plays.unlink()
+    else:
+        plays.write_bytes(content)
+
+    with pytest.raises(SystemExit, match=r"plays\.jsonl"):
+        run_cli(data)
+
+    assert not (data / "score").exists()
+
+
+def test_a_failed_write_leaves_the_previous_score_file_whole(
+    data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = previous_score_file(data)
+    add_shazam(data, ClipAddress(HOUR, 195, 12), MOLINA)
+
+    def interrupted(src: object, dst: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(score.os, "replace", interrupted)
+    with pytest.raises(OSError):
+        run_cli(data)
+
+    assert (data / "score" / "score.json").read_bytes() == previous

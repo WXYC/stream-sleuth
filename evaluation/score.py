@@ -524,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
     require_snapshot(parser, use_olaf, args.snapshot)
+    snapshot = args.snapshot if use_olaf else None  # as run.py: ignored when no Olaf leg runs
     selected = [
         (leg, who)
         for leg in legs
@@ -539,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outside_checkout(args.store or data / "shazam" / "results.jsonl")
         )
         out = require_outside_checkout(args.out or data / "score" / "score.json")
-        home = checked_snapshot_dir(args.snapshot) if args.snapshot else None
+        home = checked_snapshot_dir(snapshot) if snapshot else None
     except (DataPathError, SnapshotError) as refusal:
         raise SystemExit(str(refusal)) from None
     read = [
@@ -553,9 +554,13 @@ def main(argv: list[str] | None = None) -> int:
     check_score_file(out)
     if home and not (home / "pool.db").is_file():
         raise SystemExit(f"{home}: no snapshot here; build it first")
-    plays, hours = read_plays(plays_path), read_hours(selection)
+    try:
+        plays = read_plays(plays_path)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise SystemExit(f"{plays_path}: not a readable plays.jsonl ({error!r})") from None
+    hours = read_hours(selection)
     stores = [store, ResultStore(home / RESULTS)] if home else [store]
-    results = read_results(stores, study_identities(args.snapshot, args.min_match_count))
+    results = read_results(stores, study_identities(snapshot, args.min_match_count))
     references: dict[str, tuple[str, ...]] = {}
     if home:
         with closing(open_read_only(home / "pool.db")) as db:
@@ -572,7 +577,9 @@ def main(argv: list[str] | None = None) -> int:
         entries[f"{leg.name}/{who}"] = leg_json(leg, identity, ls)
     out.parent.mkdir(parents=True, exist_ok=True)
     document = json.dumps({"version": 1, "legs": entries}, ensure_ascii=False, indent=1)
-    out.write_text(document + "\n", encoding="utf-8")
+    temp = out.with_name(out.name + ".tmp")  # a complete file, then a rename: never half-written
+    temp.write_text(document + "\n", encoding="utf-8")
+    os.replace(temp, out)
     log.info("wrote %s", out)
     return 0
 
