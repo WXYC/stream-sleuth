@@ -299,6 +299,8 @@ AGREEMENT_POOL: list[tuple[str, str | None, str, str]] = [
     ("Juana Molina", "Various Artists", "DOGA", "la paradoja"),
     ("Stereolab（ステレオラブ）", "Stereolab", "Dots and Loops", "Brakhage"),
     ("Hermanos Gutiérrez", None, "Session 9", "Hijo del Sol"),
+    ("U.S. Girls", None, "Heavy Light", "Overtime"),
+    ("A.R. Kane", "Various Artists", "69", "Baby Milk Snatcher"),
 ]
 
 
@@ -324,10 +326,14 @@ def test_the_title_tier_is_names_title_tier(tmp_path: Path) -> None:
         "Various Artists",
         "Stereolab",
         "Hermanos Gutiérrez",
+        "US Girls",
+        "AR Kane",
+        "J. Mascis",
     ]
     albums = ["Other", "Other [Live]", "Other (Demo)", "Other (Remixed)"]
     titles = ["Back, Baby", "Back, Baby (Live)", "Back, Baby - Demo", "Back, Baby - Live"]
     titles += ["BACK BABY", "la paradoja", "Brakhage", "Hijo del Sol", "Hijo del Sol (Session)"]
+    titles += ["Overtime", "Baby Milk Snatcher"]
 
     seen = set()
     for artist, album, title in itertools.product(artists, albums, titles):
@@ -339,6 +345,38 @@ def test_the_title_tier_is_names_title_tier(tmp_path: Path) -> None:
         seen.add(expected)
 
     assert seen == {True, False}
+
+
+@pytest.mark.parametrize(
+    ("pool_artist", "play_artist", "tier"),
+    [
+        # A dotted initialism and the same letters undotted join, on the fuzzy tier only.
+        ("A.R. Kane", "AR Kane", "fuzzy"),
+        ("AR Kane", "A.R. Kane", "fuzzy"),
+        ("A.R. Kane", "A.R. Kane", "exact"),
+        # A single initial is not an initialism.
+        ("J. Mascis", "JM Mascis", None),
+        ("J. Mascis", "J Mascis", "fuzzy"),
+    ],
+)
+def test_a_dotted_initialism_joins_the_same_letters_on_the_fuzzy_tier(
+    tmp_path: Path, pool_artist: str, play_artist: str, tier: str | None
+) -> None:
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    db.execute(
+        "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+        " VALUES ('k.mp3', ?, 'p/', 'mp3', 1, ?, '69', 'Baby Milk Snatcher', 'indexed')",
+        (f"{0:040x}", pool_artist),
+    )
+    db.commit()
+    db.close()
+    index = corpus.PoolIndex.load(path)
+    assert index.tier(play_artist, "69", "Baby Milk Snatcher") == tier
+    assert index.tier(play_artist, "Other", "Baby Milk Snatcher") == (
+        None if tier is None else "title"
+    )
 
 
 def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Path:
