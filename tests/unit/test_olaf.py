@@ -379,6 +379,13 @@ def test_a_snapshot_outside_the_data_area_is_refused(olaf, home, reason):
         olaf.OlafRecognizer(home)
 
 
+def test_an_existing_snapshot_is_accepted_when_home_does_not_exist(olaf, tmp_path, monkeypatch):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "no-such-home"))
+    assert olaf.OlafRecognizer(snap).home == snap
+
+
 def test_a_snapshot_reached_through_a_symlink_into_the_checkout_is_refused(olaf, tmp_path):
     link = tmp_path / "link"
     link.symlink_to(CHECKOUT)
