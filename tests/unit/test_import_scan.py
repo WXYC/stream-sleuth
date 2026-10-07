@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.import_scan import scan_for_s3_imports, scan_for_s3_write_names
+from tests.import_scan import (
+    scan_for_s3_imports,
+    scan_for_s3_write_names,
+    scan_for_station_imports,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -103,3 +107,59 @@ def test_real_tree_has_no_s3_client_outside_the_factory():
 
 def test_real_tree_has_no_s3_write_or_presign_names():
     assert scan_for_s3_write_names(REPO_ROOT) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import evaluation.corpus\n",
+        "import evaluation.archive as a\n",
+        "from evaluation.corpus import read_selection\n",
+        "from evaluation import clips, corpus\n",
+        "def f():\n    from evaluation.corpus import band\n",  # a deferred import too
+    ],
+)
+@pytest.mark.parametrize(
+    "relative", ["evaluation/run.py", "evaluation/shazam_eval.py", "stream_sleuth/loop.py"]
+)
+def test_station_scan_flags_a_wxyc_module_imported_by_station_neutral_code(
+    tmp_path, source, relative
+):
+    root = _tree(tmp_path, relative, source)
+
+    assert [hit.split(":")[0] for hit in scan_for_station_imports(root)] == [relative]
+
+
+@pytest.mark.parametrize(
+    ("relative", "flagged"),
+    [
+        ("evaluation/run.py", True),
+        ("stream_sleuth/loop.py", False),  # stream_sleuth.archive, not the WXYC module
+    ],
+)
+@pytest.mark.parametrize("source", ["from .archive import hour_key\n", "from . import corpus\n"])
+def test_station_scan_resolves_relative_imports_against_their_package(
+    tmp_path, relative, flagged, source
+):
+    root = _tree(tmp_path, relative, source)
+
+    assert scan_for_station_imports(root) == ([f"{relative}:1"] if flagged else [])
+
+
+@pytest.mark.parametrize(
+    "relative", ["evaluation/corpus.py", "tests/unit/test_corpus.py", "tests/unit/test_run.py"]
+)
+def test_station_scan_allows_the_wxyc_modules_and_tests(tmp_path, relative):
+    root = _tree(tmp_path, relative, "from evaluation.archive import hour_key\n")
+
+    assert scan_for_station_imports(root) == []
+
+
+def test_station_scan_does_not_flag_other_evaluation_modules(tmp_path):
+    root = _tree(tmp_path, "evaluation/run.py", "from evaluation.clips import cut\n")
+
+    assert scan_for_station_imports(root) == []
+
+
+def test_real_tree_keeps_the_wxyc_modules_out_of_station_neutral_code():
+    assert scan_for_station_imports(REPO_ROOT) == []
