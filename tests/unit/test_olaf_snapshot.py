@@ -6,13 +6,31 @@ the real one is exercised by ``tests/integration/test_olaf_snapshot.py``.
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 import pytest
 from moto import mock_aws
 
-from evaluation import pool
-from evaluation.olaf_snapshot import RESULTS, SnapshotError, build_snapshot, snapshot_lock
+from evaluation import olaf_snapshot, pool
+from evaluation.olaf_snapshot import (
+    MARKER,
+    RESULTS,
+    SnapshotError,
+    build_snapshot,
+    main,
+    mark_built,
+    require_built,
+    snapshot_lock,
+)
 from stream_sleuth.paths import CHECKOUT, DataPathError
-from stream_sleuth.recognizers.olaf import OlafRecognizer, snapshot_dir
+from stream_sleuth.recognizers.olaf import (
+    OLAF_COMMIT,
+    SNAPSHOT_INDEX,
+    OlafRecognizer,
+    snapshot_dir,
+)
 from tests.unit.test_s3_readonly import seed_objects
 
 ENDPOINT = "https://pool.example.test"
@@ -111,3 +129,203 @@ def test_two_builds_of_one_snapshot_cannot_overlap(stored):
             build_snapshot("rotation", objects)
         assert stored == []
     assert build_snapshot("rotation", objects) == {"indexed": 2}
+
+
+def marker(snapshot: str = "rotation") -> dict:
+    return json.loads((snapshot_dir(snapshot) / MARKER).read_text())
+
+
+def test_a_completed_build_writes_a_marker_naming_the_commit_and_the_counts(stored):
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert marker() == {"olaf_commit": OLAF_COMMIT, "indexed": 2, "failed": 0, "source": "build"}
+    assert require_built(snapshot_dir("rotation"))["indexed"] == 2
+
+
+def test_a_rerun_counts_the_snapshots_files_not_the_runs(stored):
+    objects = pool.inventory(["rotation/"])
+    build_snapshot("rotation", objects)
+    build_snapshot("rotation", objects)  # indexes nothing new
+
+    assert marker()["indexed"] == 2
+
+
+def test_a_build_with_failed_files_is_complete_and_records_how_many(monkeypatch, stored):
+    def broken(path, fmt):
+        if fmt == "flac":
+            raise ValueError("bad tags")
+        return {**TAGS, "duration_s": 1.0}
+
+    monkeypatch.setattr(pool, "read_tags", broken)
+
+    assert build_snapshot("rotation", pool.inventory(["rotation/"])) == {"indexed": 1, "failed": 1}
+
+    assert (marker()["indexed"], marker()["failed"]) == (1, 1)
+
+
+def test_no_marker_is_written_when_the_build_raises(monkeypatch, stored):
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(olaf_snapshot, "stream", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert not (snapshot_dir("rotation") / MARKER).exists()
+
+
+def test_a_marker_is_replaced_atomically_and_leaves_no_temp_file(stored):
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert sorted(p.name for p in snapshot_dir("rotation").iterdir() if "built" in p.name) == [
+        MARKER
+    ]
+
+
+def test_an_interrupted_rerun_drops_the_old_marker(monkeypatch, stored):
+    objects = pool.inventory(["rotation/"])
+    build_snapshot("rotation", objects)
+    monkeypatch.setattr(olaf_snapshot, "stream", lambda *a, **k: 1 / 0)
+
+    with pytest.raises(ZeroDivisionError):
+        build_snapshot("rotation", objects)
+
+    assert not (snapshot_dir("rotation") / MARKER).exists()
+
+
+def test_a_marker_is_replaced_not_appended_to(stored):
+    home = snapshot_dir("rotation")
+    home.mkdir(parents=True)
+    (home / MARKER).write_text("not json at all")
+
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert marker()["indexed"] == 2
+
+
+@pytest.mark.parametrize(
+    ("contents", "refusal"),
+    [
+        (None, "no completion marker"),
+        ("{", "unreadable"),
+        ("[]", "unreadable"),
+        (json.dumps({"olaf_commit": OLAF_COMMIT}), "unreadable"),
+        (json.dumps({"olaf_commit": "0" * 40, "indexed": 3, "failed": 0}), "another Olaf commit"),
+    ],
+)
+def test_a_run_refuses_a_snapshot_without_a_usable_marker(tmp_path, contents, refusal):
+    home = tmp_path / "rotation"
+    home.mkdir()
+    if contents is not None:
+        (home / MARKER).write_text(contents)
+
+    with pytest.raises(SnapshotError, match=refusal) as error:
+        require_built(home)
+
+    assert "\n" not in str(error.value)
+
+
+def test_a_run_logs_the_failed_count(tmp_path, caplog):
+    home = tmp_path / "rotation"
+    home.mkdir()
+    (home / MARKER).write_text(json.dumps({"olaf_commit": OLAF_COMMIT, "indexed": 5, "failed": 2}))
+
+    with caplog.at_level("INFO"):
+        require_built(home)
+
+    assert "5 indexed" in caplog.text and "2 failed" in caplog.text
+
+
+def pre_marker_snapshot(statuses=("indexed", "indexed", "failed"), index=True) -> Path:
+    """A snapshot as an earlier build left it: its ``pool.db`` and Olaf index, no marker."""
+    home = snapshot_dir("rotation")
+    with pool.open_pool_db(home / "pool.db") as db:
+        for i, status in enumerate(statuses):
+            key = f"rotation/Heavy/{i}.mp3"
+            db.execute(
+                "INSERT INTO files (key, stage_id, prefix, format, size, status)"
+                " VALUES (?, ?, 'rotation/', 'mp3', 1, ?)",
+                (key, hashlib.sha1(key.encode()).hexdigest(), status),
+            )
+    if index:
+        (home / SNAPSHOT_INDEX).parent.mkdir(parents=True)
+        (home / SNAPSHOT_INDEX).write_bytes(b"lmdb")
+    return home
+
+
+def fingerprint(home: Path) -> dict[str, tuple[int, bytes]]:
+    return {
+        str(p.relative_to(home)): (p.stat().st_mtime_ns, p.read_bytes())
+        for p in sorted(home.rglob("*"))
+        if p.is_file() and p.name != ".lock"
+    }
+
+
+def test_mark_built_marks_a_pre_marker_snapshot_without_touching_anything_else(tmp_path):
+    home = pre_marker_snapshot()
+    (home / RESULTS).write_text("{}\n")
+    before = fingerprint(home)
+
+    assert mark_built("rotation") == {
+        "olaf_commit": OLAF_COMMIT,
+        "indexed": 2,
+        "failed": 1,
+        "source": "mark-built",
+    }
+
+    assert marker() == {**marker(), "indexed": 2, "failed": 1, "source": "mark-built"}
+    assert {k: v for k, v in fingerprint(home).items() if k != MARKER} == before
+    assert require_built(home)["indexed"] == 2
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "refusal"),
+    [
+        ({"statuses": ("indexed", "staged")}, "staged"),
+        ({"index": False}, "Olaf index"),
+    ],
+)
+def test_mark_built_refuses_an_unfinished_snapshot(kwargs, refusal):
+    home = pre_marker_snapshot(**kwargs)
+
+    with pytest.raises(SnapshotError, match=refusal):
+        mark_built("rotation")
+
+    assert not (home / MARKER).exists()
+
+
+def test_mark_built_refuses_an_existing_marker_and_leaves_it_alone(stored):
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+    before = (snapshot_dir("rotation") / MARKER).read_bytes()
+
+    with pytest.raises(SnapshotError, match="already"):
+        mark_built("rotation")
+
+    assert (snapshot_dir("rotation") / MARKER).read_bytes() == before
+
+
+def test_mark_built_refuses_a_snapshot_that_is_not_there_and_creates_nothing(tmp_path):
+    with pytest.raises(SnapshotError, match="no snapshot"):
+        mark_built("rotation")
+
+    assert not snapshot_dir("rotation").exists()
+
+
+def test_mark_built_is_refused_while_a_build_or_run_holds_the_snapshot():
+    home = pre_marker_snapshot()
+    with snapshot_lock(home), pytest.raises(SnapshotError, match="another"):
+        mark_built("rotation")
+    assert not (home / MARKER).exists()
+
+
+def test_the_mark_built_command_marks_and_a_refusal_is_one_line(capsys):
+    pre_marker_snapshot()
+
+    assert main(["--mark-built", "rotation"]) == 0
+    assert (snapshot_dir("rotation") / MARKER).is_file()
+    with pytest.raises(SystemExit, match="already") as refusal:
+        main(["--mark-built", "rotation"])
+    assert "\n" not in str(refusal.value)
+    with pytest.raises(SystemExit, match="plain path component"):
+        main(["--mark-built", "../rotation"])
