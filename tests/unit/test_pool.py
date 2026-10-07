@@ -387,3 +387,13 @@ def test_open_read_only_reads_a_pool_db_and_never_writes_or_creates_one(db, tmp_
     with pytest.raises(sqlite3.OperationalError):
         pool.open_read_only(tmp_path / "absent.db")
     assert not (tmp_path / "absent.db").exists()
+
+
+def test_open_read_only_refuses_to_attach_a_database_so_it_can_create_no_other_file(db, tmp_path):
+    db.close()
+
+    with closing(pool.open_read_only(tmp_path / "pool.db")) as ro:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            ro.execute("ATTACH DATABASE ? AS other", (str(tmp_path / "other.db"),))
+        assert pool.reference_artists(ro) == {}  # ordinary reads still work
+    assert not (tmp_path / "other.db").exists()

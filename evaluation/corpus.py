@@ -21,7 +21,6 @@ import csv
 import json
 import logging
 import re
-import sqlite3
 import statistics
 import sys
 from bisect import bisect_left
@@ -34,6 +33,7 @@ from typing import Any
 
 from evaluation.archive import EASTERN, hour_key, hour_start
 from evaluation.names import album_key, fold, fuzzy, named_qualifiers, qualifiers, title_keys
+from evaluation.pool import open_read_only
 from evaluation.selection import fail, load_selection
 from stream_sleuth.paths import data_dir, require_outside_checkout
 
@@ -114,7 +114,7 @@ class PoolIndex:
     def load(cls, pool_db: Path) -> PoolIndex:
         """Read ``pool_db`` read-only; a missing file raises instead of being created."""
         index = cls()
-        db = sqlite3.connect(f"{Path(pool_db).resolve().as_uri()}?mode=ro", uri=True)
+        db = open_read_only(Path(pool_db))
         try:
             rows = db.execute(
                 "SELECT key, format, artist, album_artist, album, title FROM files"

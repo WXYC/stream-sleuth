@@ -210,9 +210,12 @@ def _logged(play: Play, at: float) -> bool:
 def _artists(
     f: EvalIdentification, references: Mapping[str, tuple[str, ...]] | None
 ) -> tuple[str, ...]:
-    """The artist names an emission names: its own, or for a local match every name its reference carries."""
+    """The artist names an emission names: its own, plus for a local match every name its reference carries.
+
+    The emission's own name stays, so a mapping built from another ``pool.db`` than the one that
+    tagged the emission can never score a match worse than without it."""
     if f["source"] == "local" and references and f.get("ref_key", "") in references:
-        return references[f["ref_key"]]
+        return (f["artist"], *references[f["ref_key"]])
     return (f["artist"],)
 
 
