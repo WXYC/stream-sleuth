@@ -603,6 +603,16 @@ def test_select_hours_deprioritizes_reorder_flagged_shows(tmp_path: Path, pool_d
     assert corpus.select_hours(stats, era="canonical", target=5) == ["2026/08/12/202608121700.mp3"]
 
 
+def test_hour_stats_summarizes_show_less_tracks_as_unflagged(tmp_path: Path, pool_db: Path) -> None:
+    # Show-less rows get no order label (they are unreliable, never reorder-flagged).
+    rows = hour_rows(1, 20, 8, 200.0, show_id="")
+    rows[0]["play_order"], rows[1]["play_order"] = 2, 1
+    export = write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+    stats = corpus.hour_stats(corpus.Flowsheet.load(export), corpus.PoolIndex.load(pool_db))
+    h = stats["2026/08/12/202608121600.mp3"]
+    assert (h.era, h.track_rows, h.reorder_flagged) == ("canonical", 8, False)
+
+
 def stat(
     key: str, *, era: str = "canonical", tracks: int = 10, in_pool: int = 5, **kw: Any
 ) -> corpus.HourStats:
