@@ -16,12 +16,18 @@ import pytest
 
 from evaluation import run as run_mod
 from evaluation import shazam_eval
-from evaluation.olaf_snapshot import RESULTS, SnapshotError, build_snapshot, snapshot_lock
+from evaluation.olaf_snapshot import (
+    MARKER,
+    RESULTS,
+    SnapshotError,
+    build_snapshot,
+    snapshot_lock,
+)
 from evaluation.pool import open_pool_db
 from evaluation.run import main
 from evaluation.shazam_eval import Throttle
 from stream_sleuth.paths import CHECKOUT, DataPathError
-from stream_sleuth.recognizers.olaf import OlafError
+from stream_sleuth.recognizers.olaf import OLAF_COMMIT, OlafError
 from tests.audio import render
 from tests.characterization.shazam_responses import NO_MATCH
 from tests.shazam_fake import FakeShazam, json_response
@@ -101,9 +107,13 @@ def test_shazam_legs_read_selection_json_and_share_one_throttle(
     assert list((data / "clips").iterdir()) == []
 
 
+def _mark(home: Path, olaf_commit: str = OLAF_COMMIT, failed: int = 0) -> None:
+    marker = {"olaf_commit": olaf_commit, "indexed": 3, "failed": failed, "source": "build"}
+    (home / MARKER).write_text(json.dumps(marker))
+
+
 def test_an_olaf_leg_files_its_results_in_the_snapshot(data: Path) -> None:
-    home = data / "olaf" / "rotation"
-    open_pool_db(home / "pool.db").close()
+    home = _snapshot(data)
     assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
     records = _records(home / RESULTS)
     assert [r["address"] for r in records] == [f"{HOUR}#0+12@128k", f"{OTHER}#0+12@128k"]
@@ -113,9 +123,11 @@ def test_an_olaf_leg_files_its_results_in_the_snapshot(data: Path) -> None:
     assert list((data / "clips").iterdir()) == []
 
 
-def _snapshot(data: Path) -> Path:
+def _snapshot(data: Path, *, built: bool = True) -> Path:
     home = data / "olaf" / "rotation"
     open_pool_db(home / "pool.db").close()
+    if built:
+        _mark(home)
     return home
 
 
@@ -175,8 +187,7 @@ def test_olaf_legs_need_a_built_snapshot_and_a_name(data: Path) -> None:
 
 
 def test_a_snapshot_being_built_is_refused(data: Path) -> None:
-    home = data / "olaf" / "rotation"
-    open_pool_db(home / "pool.db").close()
+    home = _snapshot(data)
     with snapshot_lock(home), pytest.raises(SystemExit, match="another"):
         main(["--only", "olaf", "--snapshot", "rotation"])
     assert not (home / RESULTS).exists()
@@ -194,7 +205,7 @@ def test_a_build_is_refused_while_a_run_queries_the_snapshot(
         return MATCH
 
     monkeypatch.setattr(FakeOlaf, "recognize", build_mid_query)
-    open_pool_db(data / "olaf" / "rotation" / "pool.db").close()
+    _snapshot(data)
     assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
     assert len(refusals) == 2  # one per query
     with snapshot_lock(data / "olaf" / "rotation"):  # the run released its lock
@@ -258,6 +269,39 @@ def test_a_snapshot_refusal_comes_before_the_shazam_lock_is_taken(
         main(["--snapshot", "absent", "--base-url", fake.url])
     assert fake.requests == []
     assert not (data / "shazam" / "throttle.json.lock").exists()  # the lock was never taken
+
+
+@pytest.mark.parametrize(
+    ("marker", "refusal"),
+    [
+        (None, "no completion marker"),
+        ("{", "unreadable"),
+        ({"olaf_commit": "0" * 40, "indexed": 3, "failed": 0}, "another Olaf commit"),
+    ],
+)
+def test_a_snapshot_that_is_not_marked_built_is_refused_before_the_shazam_lock(
+    data: Path, fake: FakeShazam, marker: object, refusal: str
+) -> None:
+    home = _snapshot(data, built=False)
+    if marker is not None:
+        (home / MARKER).write_text(marker if isinstance(marker, str) else json.dumps(marker))
+    for argv in (["--snapshot", "rotation"], ["--only", "olaf", "--snapshot", "rotation"]):
+        with pytest.raises(SystemExit, match=refusal) as error:
+            main([*argv, "--base-url", fake.url])
+        assert "\n" not in str(error.value)
+    assert fake.requests == []
+    assert not (home / RESULTS).exists()
+    assert not (data / "shazam" / "throttle.json.lock").exists()  # the lock was never taken
+
+
+def test_a_run_logs_how_many_files_the_build_failed(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    home = _snapshot(data, built=False)
+    _mark(home, failed=2)
+    with caplog.at_level(logging.INFO):
+        assert main(["--only", "olaf", "--snapshot", "rotation", "--legs", "12s"]) == 0
+    assert "3 indexed, 2 failed" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -32,7 +32,13 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from evaluation.clips import CAPTURE_LENGTHS_S, ClipAddress, ClipError, cut, hour_addresses
-from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir, snapshot_lock
+from evaluation.olaf_snapshot import (
+    RESULTS,
+    SnapshotError,
+    checked_snapshot_dir,
+    require_built,
+    snapshot_lock,
+)
 from evaluation.pool import open_pool_db, tag_lookup
 from evaluation.selection import fail, load_selection
 from evaluation.shazam_eval import (
@@ -393,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not (home / "pool.db").is_file():
                     raise SystemExit(f"{home}: no snapshot here; build it first")
                 stack.enter_context(snapshot_lock(home))
+                require_built(home)  # an unfinished build must not have its misses stored
             except SnapshotError as refusal:
                 raise SystemExit(str(refusal)) from None
             db = stack.enter_context(closing(open_pool_db(home / "pool.db")))
