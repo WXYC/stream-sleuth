@@ -8,9 +8,9 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn
 
 from .config import (
     API_SECRET,
@@ -23,7 +23,7 @@ from .config import (
     VERBOSE,
 )
 from .outputs import HttpPostOutput, Output
-from .recognizers.base import Recognizer
+from .recognizers.base import Identification, Recognizer
 from .recognizers.shazam import ShazamRecognizer
 from .sources import IcecastSource, Source
 
@@ -50,12 +50,12 @@ class State:
 class Action:
     """What one cycle does: emit a track, or log a line (some only when verbose)."""
 
-    emit: dict | None = None
+    emit: Mapping[str, object] | None = None
     message: str | None = None
     verbose_only: bool = False
 
 
-def step(state: State, track: dict | None, cadence: Cadence) -> tuple[State, Action]:
+def step(state: State, track: Identification | None, cadence: Cadence) -> tuple[State, Action]:
     """Decide the next state and the cycle's action from one recognition result.
 
     The returned state applies only once the action succeeds: the driver keeps the
@@ -90,12 +90,12 @@ def identify_once(seconds):
     return _identify(IcecastSource(), ShazamRecognizer(), seconds)
 
 
-def _identify(source: Source, recognizer: Recognizer, seconds: int) -> dict | None:
+def _identify(source: Source, recognizer: Recognizer, seconds: int) -> Identification | None:
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     try:
         source.capture(tmp.name, seconds)
-        return cast("dict | None", recognizer.recognize(tmp.name))
+        return recognizer.recognize(tmp.name)
     finally:
         try:
             os.unlink(tmp.name)
