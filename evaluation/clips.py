@@ -14,15 +14,18 @@ whose clip ends by the hour's end, and :func:`cut` refuses any other address.
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from stream_sleuth.paths import require_outside_checkout
+
+log = logging.getLogger(__name__)
 
 GRID_S = 15
 CAPTURE_LENGTHS_S = (6, 12, 20)
@@ -144,6 +147,25 @@ def _decoded_seconds(path: str, size: int, mtime_ns: int) -> float:
     if not times or not times[-1].isdigit():
         raise ClipError(f"ffmpeg decoded no audio from {path}")
     return int(times[-1]) / 1_000_000
+
+
+def hour_addresses(
+    keys: Iterable[str], archive_dir: Path, length_s: int, profile: str
+) -> list[ClipAddress]:
+    """Every clip address that fits each hour's decoded length, in ``keys`` order.
+
+    An hour that is missing or unreadable is logged and contributes nothing, so
+    one bad hour never stops the run; a short hour yields only the clips that fit.
+    """
+    addresses: list[ClipAddress] = []
+    for key in keys:
+        try:
+            hour_s = hour_duration(archive_dir / key)
+        except ClipError as exc:
+            log.warning("skipped hour %s: %s", key, exc)
+            continue
+        addresses += grid(key, length_s, profile, hour_s=hour_s)
+    return addresses
 
 
 @contextmanager

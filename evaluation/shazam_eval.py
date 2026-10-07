@@ -44,7 +44,7 @@ import aiohttp
 from shazamio import Shazam
 from shazamio.interfaces.client import HTTPClientInterface
 
-from evaluation.clips import ClipAddress, ClipError, cut, grid, hour_duration
+from evaluation.clips import ClipAddress, ClipError, cut, hour_addresses
 from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
@@ -364,25 +364,6 @@ async def run(
             client.throttle.stop_for_day("failure_streak")
             return "failure_streak"
     return "done"
-
-
-def hour_addresses(
-    keys: Iterable[str], archive_dir: Path, length_s: int, profile: str
-) -> list[ClipAddress]:
-    """Every clip address that fits each hour's decoded length, in ``keys`` order.
-
-    An hour that is missing or unreadable is logged and contributes nothing, so
-    one bad hour never stops the run; a short hour yields only the clips that fit.
-    """
-    addresses: list[ClipAddress] = []
-    for key in keys:
-        try:
-            hour_s = hour_duration(archive_dir / key)
-        except ClipError as exc:
-            log.warning("skipped hour %s: %s", key, exc)
-            continue
-        addresses += grid(key, length_s, profile, hour_s=hour_s)
-    return addresses
 
 
 def main(argv: list[str] | None = None) -> int:
