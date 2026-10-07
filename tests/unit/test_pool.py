@@ -254,9 +254,17 @@ def test_synthetic_pool_builds_on_the_shared_aws_isolation(request, tmp_path_fac
 
 
 class _RecordingClient:
-    """A client that fails the test on any method call."""
+    """A client that records every method reached, so a test can assert none was.
+
+    Recording rather than raising, because ``stream()``'s per-file ``except`` would
+    swallow an exception raised here.
+    """
+
+    def __init__(self):
+        self.reached = []
 
     def __getattr__(self, name):
+        self.reached.append(name)
         raise AssertionError(f"client.{name} was reached")
 
 
@@ -268,10 +276,10 @@ def test_stream_refuses_a_checkout_staging_dir_before_any_request(db):
         format="mp3",
     )
     staging = CHECKOUT / "pool-staging"
+    client = _RecordingClient()
     with pytest.raises(DataPathError):
-        pool.stream(
-            [obj], lambda path, stage: None, db=db, staging_dir=staging, client=_RecordingClient()
-        )
+        pool.stream([obj], lambda path, stage: None, db=db, staging_dir=staging, client=client)
+    assert client.reached == []
     assert not staging.exists()
 
 

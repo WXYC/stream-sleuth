@@ -41,6 +41,30 @@ def test_a_symlink_resolving_into_the_checkout_is_inside(outside_link):
     assert inside_checkout(outside_link / "unit")
 
 
+_MISCASED = Path(str(CHECKOUT).swapcase())
+_FIRMLINK = Path("/System/Volumes/Data" + str(CHECKOUT))
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param(
+            _MISCASED,
+            id="miscased",
+            marks=pytest.mark.skipif(not _MISCASED.exists(), reason="case-sensitive filesystem"),
+        ),
+        pytest.param(
+            _FIRMLINK,
+            id="firmlink",
+            marks=pytest.mark.skipif(not _FIRMLINK.exists(), reason="no macOS data firmlink"),
+        ),
+    ],
+)
+def test_another_spelling_of_the_checkout_is_inside(spelling):
+    assert inside_checkout(spelling)
+    assert inside_checkout(spelling / "pool-staging" / "new")
+
+
 @pytest.mark.parametrize(
     "path",
     [

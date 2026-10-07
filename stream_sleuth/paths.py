@@ -18,9 +18,15 @@ class DataPathError(ValueError):
 
 
 def inside_checkout(path: Path) -> bool:
-    """True when ``path``, symlinks and ``..`` resolved, is the checkout or under it."""
+    """True when ``path``, symlinks and ``..`` resolved, is the checkout or under it.
+
+    Compares file identity, not spelling, for every existing ancestor, so a mis-cased
+    path on a case-insensitive volume or one reached through a firmlink still counts.
+    """
     resolved = path.resolve()
-    return resolved == CHECKOUT or CHECKOUT in resolved.parents
+    if resolved == CHECKOUT or CHECKOUT in resolved.parents:
+        return True
+    return any(p.exists() and os.path.samefile(p, CHECKOUT) for p in (resolved, *resolved.parents))
 
 
 def require_outside_checkout(path: Path) -> Path:
