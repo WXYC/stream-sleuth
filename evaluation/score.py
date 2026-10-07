@@ -24,8 +24,9 @@ Audio without a scoring record is **uncovered**, never a miss: a play counts in 
 every grid address of the leg that starts in its window has a ``matched`` or ``no_match``
 record, and a carryover play is a candidate only, never scored.
 
-``python -m evaluation.score`` scores every selected leg and writes the score file and the near-miss queue
-(:func:`main`); wrong emissions a person should judge are queued, never absorbed.
+``python -m evaluation.score`` scores every selected leg and writes the score file, the near-miss
+queue, and the flowsheet-false-positive queue (:func:`main`); wrong emissions a person should
+judge are queued, never absorbed.
 """
 
 from __future__ import annotations
@@ -42,12 +43,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from itertools import groupby
+from itertools import combinations, groupby
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 from evaluation import names
-from evaluation.clips import ClipAddress, grid, hour_addresses
+from evaluation.clips import GRID_S, ClipAddress, grid, hour_addresses
 from evaluation.olaf_snapshot import RESULTS, SnapshotError, checked_snapshot_dir
 from evaluation.pool import open_read_only, reference_artists
 from evaluation.results import (
@@ -436,6 +437,9 @@ NEAR_COLUMNS = (
     "matched_on",
     "verdict",
 )
+FP_COLUMNS = (*RUN_COLUMNS, "preflag", "verdict")
+STEADY_START_S = GRID_S / 2  # a start estimate that holds to half a grid step is steady
+LIKELY_UNLOGGED = "likely-unlogged-correct"
 # What the score file says of a play: the fields report.py breaks results down by. A carryover
 # repeats the previous hour's ``play_id``, so a play is keyed by (hour_key, play_id, carryover).
 PLAY_FIELDS = (
@@ -489,6 +493,12 @@ def run_row(tag: str, run: Sequence[Verdict]) -> dict[str, Any]:
         "song": f["song"],
         "album": f["album"],
     }
+
+
+def _tags(emission: Emission, references: Mapping[str, tuple[str, ...]] | None) -> str:
+    """The artist tags of an Olaf emission's reference file, ``" | "``-joined (empty otherwise)."""
+    tags = references.get(emission.found.get("ref_key", ""), ()) if references else ()
+    return " | ".join(tags)
 
 
 def _same(a: str | None, b: str | None) -> bool:
@@ -559,11 +569,10 @@ def near_miss_rows(
         for run in wrong_runs(ls.verdicts):
             if found := near_miss(run, by_hour, references):
                 play, matched_on, emission = found
-                tags = references.get(emission.found.get("ref_key", ""), ()) if references else ()
                 rows.append(
                     {
                         **run_row(tag, run),
-                        "reference_artists": " | ".join(tags),
+                        "reference_artists": _tags(emission, references),
                         "play_id": play.play_id,
                         "play_carryover": play.carryover,
                         "play_artist": play.artist,
@@ -573,6 +582,84 @@ def near_miss_rows(
                         "verdict": "",
                     }
                 )
+    return rows
+
+
+def _song_start(f: EvalIdentification) -> float | None:
+    """``at + query_offset_s - ref_start_s``; None for an answer without offsets (Shazam's null)."""
+    if f.get("query_offset_s") is None or f.get("ref_start_s") is None:
+        return None
+    return f["at"] + f["query_offset_s"] - f["ref_start_s"]
+
+
+def _steady(run: Sequence[Verdict]) -> bool:
+    """Whether at least two emissions carry offsets and their song-start estimates stay within
+    :data:`STEADY_START_S`: a real playback's reference position advances with the wall clock, so the
+    estimate holds, while a position that stands still moves it by the whole 15 s grid step."""
+    starts = [s for v in run if (s := _song_start(v.emission.found)) is not None]
+    return len(starts) >= 2 and max(starts) - min(starts) <= STEADY_START_S
+
+
+def _agrees(
+    run: Sequence[Verdict],
+    others: Iterable[Emission],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> bool:
+    """Whether another recognizer's emission in the run's hour and span, ``[first at, last at +
+    capture length)``, names the same song: titles equal under ``names.fuzzy`` and some artist of
+    either (:func:`_artists`, so an Olaf file's tags count) equal to some artist of the other."""
+    begin = run[0].emission.found["at"]
+    end = run[-1].emission.found["at"] + run[-1].emission.address.length_s
+    return any(
+        begin <= o.found["at"] < end
+        and _same(o.found["song"], v.emission.found["song"])
+        and any(
+            _same(a, b)
+            for a in _artists(v.emission.found, references)
+            for b in _artists(o.found, references)
+        )
+        for o in others
+        for v in run
+    )
+
+
+def false_positive_rows(
+    plays: Sequence[Play],
+    legs: Mapping[str, LegScore],
+    references: Mapping[str, tuple[str, ...]] | None,
+) -> list[dict[str, Any]]:
+    """The flowsheet-false-positive queue: each run of wrong emissions the near-miss queue does not
+    hold, with a ``preflag`` and an empty ``verdict`` (``wrong``, ``unlogged-correct``, or ``talk``).
+
+    The playlist is an imperfect label, so a wrong emission may be a recognizer error, a song the DJ
+    played and did not log, or talk over a bed. ``preflag`` is ``likely-unlogged-correct`` when the
+    run's song start is steady (:func:`_steady`) or the other recognizer of the same leg (same
+    capture length and profile, the part of the ``<leg>/<recognizer>`` tag before ``/``) agrees
+    (:func:`_agrees`); a recognizer not scored in this run cannot agree.
+    """
+    by_hour: defaultdict[str, list[Play]] = defaultdict(list)
+    for p in plays:
+        by_hour[p.hour_key].append(p)
+    rows = []
+    for tag, ls in legs.items():
+        others: defaultdict[str, list[Emission]] = defaultdict(list)
+        for other, theirs in legs.items():
+            if other != tag and other.partition("/")[0] == tag.partition("/")[0]:
+                for v in theirs.verdicts:
+                    others[v.emission.address.hour_key].append(v.emission)
+        for run in wrong_runs(ls.verdicts):
+            if near_miss(run, by_hour, references):
+                continue
+            hour = run[0].emission.address.hour_key
+            likely = _steady(run) or _agrees(run, others[hour], references)
+            rows.append(
+                {
+                    **run_row(tag, run),
+                    "reference_artists": _tags(run[0].emission, references),
+                    "preflag": LIKELY_UNLOGGED if likely else "",
+                    "verdict": "",
+                }
+            )
     return rows
 
 
@@ -715,6 +802,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, help="the score file; default: <data>/score/score.json")
     parser.add_argument("--near-misses", type=Path, help="default: near_misses.csv beside --out")
+    parser.add_argument(
+        "--false-positives", type=Path, help="default: false_positives.csv beside --out"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     legs, use_shazam, use_olaf = select_legs(parser, args.only, args.legs)
@@ -736,6 +826,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         out = require_outside_checkout(args.out or data / "score" / "score.json")
         near_path = require_outside_checkout(args.near_misses or out.parent / "near_misses.csv")
+        fp_path = require_outside_checkout(
+            args.false_positives or out.parent / "false_positives.csv"
+        )
         home = checked_snapshot_dir(snapshot) if snapshot else None
     except (DataPathError, SnapshotError) as refusal:
         raise SystemExit(str(refusal)) from None
@@ -745,13 +838,16 @@ def main(argv: list[str] | None = None) -> int:
         store.path,
         *([home / "pool.db", home / RESULTS] if home else []),
     ]
-    if _same_file(out, near_path):
-        raise SystemExit(f"{out}: --out and --near-misses are the same file")
-    for output in (out, near_path):
+    outputs = {"--out": out, "--near-misses": near_path, "--false-positives": fp_path}
+    for (flag, a), (other, b) in combinations(outputs.items(), 2):
+        if _same_file(a, b):
+            raise SystemExit(f"{a}: {flag} and {other} are the same file")
+    for output in outputs.values():
         if clash := next((i for i in read if _same_file(output, i)), None):
             raise SystemExit(f"{output}: is also an input ({clash}); not overwriting it")
     check_score_file(out)
     check_queue(near_path)
+    check_queue(fp_path, FP_COLUMNS)
     if home and not (home / "pool.db").is_file():
         raise SystemExit(f"{home}: no snapshot here; build it first")
     try:
@@ -778,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
         scored[f"{leg.name}/{who}"] = ls
         entries[f"{leg.name}/{who}"] = leg_json(leg, identity, ls)
     write_queue(near_path, NEAR_COLUMNS, near_miss_rows(plays, scored, references))
+    write_queue(fp_path, FP_COLUMNS, false_positive_rows(plays, scored, references))
     out.parent.mkdir(parents=True, exist_ok=True)
     document = json.dumps({"version": 1, "legs": entries}, ensure_ascii=False, indent=1)
     temp = out.with_name(out.name + ".tmp")  # a complete file, then a rename: never half-written
