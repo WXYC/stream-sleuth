@@ -67,6 +67,22 @@ class AwsEnv:
         """
         self._monkeypatch.setenv("MOTO_S3_CUSTOM_ENDPOINTS", ",".join(endpoints))
 
+    def use_pool(self, endpoint: str, bucket: str) -> None:
+        """Point the pool client at a moto ``endpoint`` and ``bucket``.
+
+        Registers the endpoint with moto and sets ``STREAM_SLEUTH_POOL_ENDPOINT``,
+        ``STREAM_SLEUTH_POOL_BUCKET``, ``STREAM_SLEUTH_POOL_KEY_ID`` and
+        ``STREAM_SLEUTH_POOL_SECRET`` (the last two to ``testing``). A
+        module that needs other settings, such as ``STREAM_SLEUTH_DATA_DIR``, sets
+        them itself. This only sets environment variables, so it imports no
+        ``boto3``, ``botocore`` or ``s3transfer``.
+        """
+        self.allow_custom_endpoints(endpoint)
+        self._monkeypatch.setenv("STREAM_SLEUTH_POOL_ENDPOINT", endpoint)
+        self._monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", bucket)
+        self._monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
+        self._monkeypatch.setenv("STREAM_SLEUTH_POOL_SECRET", "testing")
+
 
 @pytest.fixture
 def aws_isolated_env(
@@ -85,7 +101,8 @@ def aws_isolated_env(
 
     A module fixture builds on this and adds only its own settings; a profile
     goes in the returned files, and non-AWS endpoints go through
-    :meth:`AwsEnv.allow_custom_endpoints`. This sets environment variables and
+    :meth:`AwsEnv.allow_custom_endpoints` (or :meth:`AwsEnv.use_pool` for the pool
+    client). This sets environment variables and
     writes files only, so it imports no ``boto3``, ``botocore`` or ``s3transfer``
     and the import scan's exemptions are unchanged.
     """

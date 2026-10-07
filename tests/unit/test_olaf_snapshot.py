@@ -26,11 +26,7 @@ TAGS = {"artist": "Juana Molina", "album": "DOGA", "title": "la paradoja"}
 
 @pytest.fixture(autouse=True)
 def synthetic_pool(monkeypatch, aws_isolated_env, tmp_path):
-    aws_isolated_env.allow_custom_endpoints(ENDPOINT)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_ENDPOINT", ENDPOINT)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_BUCKET", BUCKET)
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_KEY_ID", "testing")
-    monkeypatch.setenv("STREAM_SLEUTH_POOL_SECRET", "testing")
+    aws_isolated_env.use_pool(ENDPOINT, BUCKET)
     monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(pool, "read_tags", lambda path, fmt: {**TAGS, "duration_s": 1.0})
     with mock_aws():

@@ -73,3 +73,19 @@ def test_custom_endpoints_are_registered_with_moto(aws_isolated_env):
     aws_isolated_env.allow_custom_endpoints("https://a.example.test", "https://b.example.test")
 
     assert os.environ["MOTO_S3_CUSTOM_ENDPOINTS"] == "https://a.example.test,https://b.example.test"
+
+
+def test_use_pool_registers_the_endpoint_and_sets_the_four_pool_variables(aws_isolated_env):
+    aws_isolated_env.use_pool("https://pool.example.test", "synthetic-pool")
+
+    assert os.environ["MOTO_S3_CUSTOM_ENDPOINTS"] == "https://pool.example.test"
+    pool_settings = {
+        name: os.environ[f"STREAM_SLEUTH_POOL_{name}"]
+        for name in ("ENDPOINT", "BUCKET", "KEY_ID", "SECRET")
+    }
+    assert pool_settings == {
+        "ENDPOINT": "https://pool.example.test",
+        "BUCKET": "synthetic-pool",
+        "KEY_ID": "testing",
+        "SECRET": "testing",
+    }

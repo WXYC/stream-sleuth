@@ -43,15 +43,8 @@ def ffmpeg(*args):
 
 @pytest.fixture
 def synthetic_pool(monkeypatch, aws_isolated_env, tmp_path):
-    aws_isolated_env.allow_custom_endpoints(ENDPOINT)
-    for name, value in {
-        "POOL_ENDPOINT": ENDPOINT,
-        "POOL_BUCKET": BUCKET,
-        "POOL_KEY_ID": "testing",
-        "POOL_SECRET": "testing",
-        "DATA_DIR": str(tmp_path / "data"),
-    }.items():
-        monkeypatch.setenv(f"STREAM_SLEUTH_{name}", value)
+    aws_isolated_env.use_pool(ENDPOINT, BUCKET)
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(tmp_path / "data"))
     references = {}
     for key, seed in ((TAGGED, 11), (UNTAGGED, 22)):
         path = tmp_path / f"{seed}.wav"
