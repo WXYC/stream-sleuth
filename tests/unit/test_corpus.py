@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -490,7 +491,7 @@ def test_plays_windows_pads_and_carryover(tmp_path: Path, pool_db: Path) -> None
     assert set(first) == {
         "hour_key", "play_id", "t_offset_s", "window_start_s", "window_end_s", "artist", "title", "album",
         "era", "pad_s", "in_pool", "pool_match_tier", "pool_format", "rotation", "reorder_flag",
-        "play_order_status", "carryover", "track_rows", "talk_rows"
+        "play_order_status", "carryover", "track_rows", "talk_rows", "group", "band", "subset",
     }  # fmt: skip
 
 
@@ -1351,3 +1352,57 @@ def test_select_writes_into_the_data_dir_by_default(
     export = select_export(tmp_path)
     corpus.main(["select", "--export", str(export), "--pool-db", str(pool_db)])
     assert sorted(p.name for p in data.iterdir()) == ["hours.txt", "selection.json", "subset.txt"]
+
+
+def plays_main(tmp_path: Path, pool_db: Path, *selector: str) -> list[dict[str, object]]:
+    out = tmp_path / "plays.jsonl"
+    corpus.main(
+        [
+            "--export",
+            str(tmp_path / "export"),
+            "--pool-db",
+            str(pool_db),
+            *selector,
+            "--out",
+            str(out),
+        ]
+    )
+    return read_plays(out)
+
+
+def test_plays_from_a_selection_carry_each_hours_group_band_and_subset(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    out = tmp_path / "frozen"
+    run_select(tmp_path, pool_db, out)
+    plays = plays_main(tmp_path, pool_db, "--selection", str(out / "selection.json"))
+    assert any(p["carryover"] for p in plays)
+    stamped = {(p["hour_key"], p["group"], p["band"], p["subset"]) for p in plays}
+    assert stamped == {
+        (HOURS[0], "canonical-high", "daytime", True),
+        (HOURS[1], "canonical-high", "daytime", False),
+        (HOURS[2], "canonical-high", "evening", True),
+    }
+
+
+def test_plays_from_a_bare_hours_file_have_no_group_and_the_hours_own_band(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    select_export(tmp_path)
+    hours = tmp_path / "hours.txt"
+    hours.write_text(f"{HOURS[2]}\n")
+    plays = plays_main(tmp_path, pool_db, "--hours", str(hours))
+    assert {(p["group"], p["band"], p["subset"]) for p in plays} == {(None, "evening", False)}
+
+
+def test_plays_need_exactly_one_of_hours_and_selection(tmp_path: Path, pool_db: Path) -> None:
+    with pytest.raises(SystemExit):
+        corpus.main(["--export", "e", "--pool-db", str(pool_db), "--out", str(tmp_path / "p")])
+
+
+def test_select_logs_the_subset_shortfalls(
+    tmp_path: Path, pool_db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=corpus.log.name)
+    run_select(tmp_path, pool_db, tmp_path / "frozen")
+    assert "selection shortfall subset/canonical-low: 1" in caplog.text
