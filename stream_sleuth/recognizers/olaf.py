@@ -5,8 +5,9 @@ Each index is a *snapshot* with its own directory, which the adapter passes to O
 real ``~/.olaf`` is never touched. References are stored with ``olaf store --with-ids``,
 so every match names the caller's identifier rather than a file path that may be gone.
 
-A snapshot lives under ``$STREAM_SLEUTH_DATA_DIR/olaf/<snapshot>/``; the caller passes
-that path, since this module reads no data-directory setting. It must be absolute, and
+A harness snapshot lives under ``$STREAM_SLEUTH_DATA_DIR/olaf/<snapshot>/`` (built by
+``evaluation.olaf_snapshot.build_snapshot``; ``cli index build`` refuses it); the caller
+passes the path, since this module reads no data-directory setting. It must be absolute, and
 neither the real home (whose ``~/.olaf`` is never touched) nor inside the checkout.
 Only ``store`` creates a snapshot: querying one with no index raises ``OlafError``, so a
 mistyped path fails instead of scoring as an empty index.

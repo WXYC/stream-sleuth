@@ -1,4 +1,4 @@
-"""The runtime ``index build`` CLI keeps off a snapshot that has results or a running query.
+"""The runtime ``index build`` CLI keeps off a harness snapshot, one with results, or one a run holds.
 
 The runtime package never imports ``evaluation``, so ``stream_sleuth/cli.py`` mirrors the
 harness's file names as literals; the drift test here is the one place both packages meet.
@@ -37,8 +37,7 @@ def test_a_fresh_home_still_builds(cli, stored, tmp_path):
 
 
 def test_an_existing_home_without_results_or_a_lock_still_builds(cli, stored, tmp_path):
-    (tmp_path / "snap").mkdir()
-    (tmp_path / "snap" / "pool.db").write_bytes(b"")
+    (tmp_path / "snap" / ".olaf").mkdir(parents=True)
     assert build(cli, tmp_path / "snap") == 0
     assert stored == [[("/a.mp3", "id-a")]]
 
@@ -57,6 +56,26 @@ def test_a_home_with_results_is_refused_in_one_line_and_left_untouched(
     assert str(home) in refusal
     assert stored == []
     assert sorted(p.name for p in home.iterdir()) == [cli.SNAPSHOT_RESULTS]
+
+
+@pytest.mark.parametrize("name", ["pool.db", "built.json", "building"])
+def test_a_home_holding_any_harness_snapshot_file_is_refused_and_left_untouched(
+    cli, stored, tmp_path, capsys, name
+):
+    home = tmp_path / "snap"
+    home.mkdir()
+    (home / name).write_bytes(b"Juana Molina")
+    with pytest.raises(SystemExit) as exit_info:
+        build(cli, home)
+    assert exit_info.value.code == 2
+    refusal = capsys.readouterr().err.strip().splitlines()[-1]  # after argparse's usage
+    assert "harness snapshot" in refusal
+    assert name in refusal
+    assert "build_snapshot" in refusal
+    assert str(home) in refusal
+    assert stored == []
+    assert [p.name for p in home.iterdir()] == [name]
+    assert (home / name).read_bytes() == b"Juana Molina"
 
 
 def test_a_home_whose_lock_is_held_is_refused_and_the_lock_stays_held(
@@ -102,10 +121,25 @@ def test_the_probe_does_not_create_the_lock_file(cli, stored, tmp_path):
     assert not (home / cli.SNAPSHOT_LOCK).exists()
 
 
-def test_the_literals_match_the_harness_guard(cli, tmp_path):
+@pytest.mark.parametrize(
+    ("literal", "constant"),
+    [
+        ("SNAPSHOT_RESULTS", "RESULTS"),
+        ("SNAPSHOT_POOL_DB", "POOL_DB"),
+        ("SNAPSHOT_MARKER", "MARKER"),
+        ("SNAPSHOT_BUILDING", "BUILDING"),
+    ],
+)
+def test_the_file_name_literals_match_the_harness_constants(cli, literal, constant):
     from evaluation import olaf_snapshot
 
-    assert cli.SNAPSHOT_RESULTS == olaf_snapshot.RESULTS
+    assert getattr(cli, literal) == getattr(olaf_snapshot, constant)
+
+
+def test_the_lock_literal_matches_the_file_the_harness_locks(cli, tmp_path):
+    from evaluation import olaf_snapshot
+
+    home = tmp_path / "snap"
     home = tmp_path / "snap"
     with olaf_snapshot.snapshot_lock(home):
         assert [p.name for p in home.iterdir()] == [cli.SNAPSHOT_LOCK]
