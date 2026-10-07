@@ -167,6 +167,7 @@ def test_the_score_file_has_the_shape_report_py_reads(data: Path) -> None:
     assert sorted(leg) == [
         "adjudicated_distinct_precision",
         "adjudicated_precision",
+        "adjudicated_runs",
         "carryover_plays",
         "coverage",
         "distinct_precision",
@@ -181,7 +182,9 @@ def test_the_score_file_has_the_shape_report_py_reads(data: Path) -> None:
         "recall",
         "recognizer",
         "unjoinable_plays",
+        "wrong_runs",
     ]
+    assert (leg["wrong_runs"], leg["adjudicated_runs"]) == (0, 0)
     assert (leg["leg"], leg["recognizer"], leg["length_s"], leg["profile"]) == (
         "12s",
         OLAF,
@@ -345,7 +348,8 @@ def near_misses(
     references: dict[str, tuple[str, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     plays = plays_from(records)
-    return score.near_miss_rows(plays, legs_of_plays(plays, emissions, references), references)
+    legs = legs_of_plays(plays, emissions, references)
+    return [row for row, _ in score.near_miss_runs(plays, legs, references)]
 
 
 def one_play(artist: str, title: str, *more: tuple[int, float, str, str]) -> list[dict[str, Any]]:
@@ -887,7 +891,7 @@ def false_positives(
     if olaf is not None:
         verdicts = attribute(plays, olaf, references)
         legs["12s/olaf"] = score.LegScore(cast(Any, None), verdicts, [])
-    return score.false_positive_rows(plays, legs, references)
+    return [row for row, _ in score.false_positive_runs(plays, legs, references)]
 
 
 def unlogged(at: float, ref_start_s: float | None = None, hour: str = HOUR) -> Emission:
@@ -1020,7 +1024,7 @@ def test_a_run_is_not_flagged_by_a_different_capture_length() -> None:
         "6s/olaf": score.LegScore(cast(Any, None), attribute(plays, [answer]), []),
     }
 
-    rows = score.false_positive_rows(plays, legs, None)
+    rows = [row for row, _ in score.false_positive_runs(plays, legs, None)]
 
     assert {r["leg"]: r["preflag"] for r in rows} == {"12s/shazam": "", "6s/olaf": ""}
 
@@ -1256,3 +1260,187 @@ def test_an_unknown_verdict_is_refused_in_one_line_naming_the_file_row_and_value
     assert Path(queue).name in message and "row 2" in message and repr(verdict) in message
     assert (data / queue).read_bytes() == filled
     assert not (data / "score" / "score.json").exists()
+
+
+def save_like_a_spreadsheet(path: Path) -> bytes:
+    """Rewrite a queue as Excel or Sheets saves it: a byte-order mark, CRLF line endings, every
+    field quoted, and booleans upper-cased."""
+    rows = read_queue(path)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, list(rows[0]), quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(
+            {k: v.upper() if v in ("True", "False") else v for k, v in r.items()} for r in rows
+        )
+    return path.read_bytes()
+
+
+def test_verdicts_survive_a_save_in_a_spreadsheet(data: Path) -> None:
+    mixed_store(data)
+    run_cli(data)
+    fill_queues(data, "correct", "unlogged-correct")
+    saved = (save_like_a_spreadsheet(data / QUEUE), save_like_a_spreadsheet(data / FP_QUEUE))
+    assert b"FALSE" in saved[0] and saved[0].startswith(BOM) and b"\r\n" in saved[0]
+
+    run_cli(data)
+
+    assert ((data / QUEUE).read_bytes(), (data / FP_QUEUE).read_bytes()) == saved
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert (leg["adjudicated_precision"], leg["adjudicated_runs"]) == (1.0, 2)
+
+
+def test_the_score_file_says_how_many_wrong_runs_there_are_and_how_many_were_judged(
+    data: Path,
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert (leg["wrong_runs"], leg["adjudicated_runs"]) == (2, 0)
+
+    fill_queues(
+        data, "", "wrong"
+    )  # a recognized verdict counts, even a wrong one; a blank does not
+    run_cli(data)
+
+    leg = read_score(data)["legs"]["12s/shazam"]
+    assert (leg["wrong_runs"], leg["adjudicated_runs"], leg["adjudicated_precision"]) == (
+        2,
+        1,
+        0.25,
+    )
+
+
+def set_cells(path: Path, leg: str, **cells: str) -> bytes:
+    """Set cells in the rows of ``leg``, as a person would; return the file's bytes."""
+    rows = read_queue(path)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, list(rows[0]))
+        writer.writeheader()
+        writer.writerows({**r, **cells} if r["leg"] == leg else r for r in rows)
+    return path.read_bytes()
+
+
+def two_legs(data: Path) -> None:
+    """One false-positive run of one emission at one address, for both recognizers of the leg."""
+    add_snapshot(data, UNLOGGED[0], UNLOGGED[0])
+    add_shazam(data, ClipAddress(HOUR, 750, 12), UNLOGGED)
+    add_olaf(data, ClipAddress(HOUR, 750, 12), UNLOGGED[0], song=UNLOGGED[1], album=UNLOGGED[2])
+
+
+def adjudicated(data: Path) -> dict[str, Any]:
+    legs = read_score(data)["legs"]
+    return {k: (v["adjudicated_precision"], v["adjudicated_runs"]) for k, v in legs.items()}
+
+
+@pytest.mark.parametrize(
+    ("shazam", "olaf", "expected"),
+    [
+        pytest.param("unlogged-correct", "wrong", {"shazam": (1.0, 1), "olaf": (0.0, 1)}, id="a"),
+        pytest.param("wrong", "unlogged-correct", {"shazam": (0.0, 1), "olaf": (1.0, 1)}, id="b"),
+        pytest.param("talk", "unlogged-correct", {"shazam": (None, 1), "olaf": (1.0, 1)}, id="c"),
+        pytest.param("unlogged-correct", "", {"shazam": (1.0, 1), "olaf": (0.0, 0)}, id="d"),
+    ],
+)
+def test_a_verdict_reaches_only_its_own_leg_at_a_shared_address(
+    data: Path, shazam: str, olaf: str, expected: dict[str, tuple[float | None, int]]
+) -> None:
+    two_legs(data)
+    run_cli(data, "--snapshot", SNAPSHOT)
+    set_cells(data / FP_QUEUE, "12s/shazam", verdict=shazam)
+    set_cells(data / FP_QUEUE, "12s/olaf", verdict=olaf)
+
+    run_cli(data, "--snapshot", SNAPSHOT)
+
+    assert adjudicated(data) == {f"12s/{k}": v for k, v in expected.items()}
+
+
+def test_a_row_judged_under_another_identity_of_the_same_leg_is_stale(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same leg and address, but another match floor: a different run, not this one."""
+    two_legs(data)
+    run_cli(data, "--snapshot", SNAPSHOT)
+    other_floor = olaf_identity(SNAPSHOT, 7)
+    set_cells(data / FP_QUEUE, "12s/olaf", recognizer=other_floor, verdict="unlogged-correct")
+    caplog.set_level("WARNING")
+
+    run_cli(data, "--snapshot", SNAPSHOT)
+
+    assert adjudicated(data)["12s/olaf"] == (0.0, 0)
+    assert any("no current run matches" in r.getMessage() for r in caplog.records)
+
+
+def test_two_rows_for_one_run_are_refused_naming_both(data: Path) -> None:
+    mixed_store(data)
+    run_cli(data)
+    queue = data / FP_QUEUE
+    lines = queue.read_text(encoding="utf-8-sig").splitlines()
+    queue.write_text("\n".join([*lines, lines[1]]) + "\n", encoding="utf-8")
+    fill_verdict(queue, "talk")
+    (data / "score" / "score.json").unlink()
+
+    with pytest.raises(SystemExit, match=r"false_positives\.csv.*rows 2 and 3") as refusal:
+        run_cli(data)
+
+    assert "\n" not in str(refusal.value)
+    assert not (data / "score" / "score.json").exists()
+
+
+def test_a_run_with_no_row_in_a_kept_queue_is_logged_by_address(
+    data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    queued(data)
+    fill_verdict(data / QUEUE, "correct")
+    add_shazam(data, ClipAddress(HOUR, 210, 12), MOLINA)  # ends the first run
+    add_shazam(data, ClipAddress(HOUR, 300, 12), OTHER_SONG)  # a new near-miss run
+    caplog.set_level("WARNING")
+
+    run_cli(data)
+
+    [message] = [m for r in caplog.records if "have no row" in (m := r.getMessage())]
+    assert f"{HOUR}#300+12@128k" in message and f"{HOUR}#195+12@128k" not in message
+
+
+def test_a_bad_false_positive_queue_stops_the_run_before_the_near_miss_queue_is_rewritten(
+    data: Path,
+) -> None:
+    mixed_store(data)
+    run_cli(data)
+    near = data / QUEUE
+    near.write_text(near.read_text(encoding="utf-8") + "stale\n", encoding="utf-8")
+    kept = near.read_bytes()
+    fill_verdict(data / FP_QUEUE, "maybe")
+
+    with pytest.raises(SystemExit, match="maybe"):
+        run_cli(data)
+
+    assert near.read_bytes() == kept
+
+
+def test_write_queue_refuses_a_file_with_a_verdict_in_it(data: Path) -> None:
+    mixed_store(data)
+    run_cli(data)
+    filled = fill_verdict(data / QUEUE, "correct")
+
+    with pytest.raises(SystemExit, match="verdicts filled in"):
+        score.write_queue(data / QUEUE, score.NEAR_COLUMNS, [])
+
+    assert (data / QUEUE).read_bytes() == filled
+
+
+def test_a_distinct_run_is_dropped_only_when_every_emission_in_it_is_talk() -> None:
+    """One song across a wrong run marked talk, a correct emission, and a wrong run, then a run
+    that is nothing but talk, then a wrong one."""
+    play = plays_from(RECORDS)[1]
+    first, correct, last = (_hit(UNLOGGED, at) for at in (750.0, 765.0, 780.0))
+    talk, wrong = _hit(MOLINA, 900.0), _hit(PRATT, 915.0)
+    verdicts = [
+        score.Verdict(e, p, False)
+        for e, p in ((first, None), (correct, play), (last, None), (talk, None), (wrong, None))
+    ]
+    calls = {first.address.key: "talk", talk.address.key: "talk"}
+
+    assert (
+        score.distinct_precision(verdicts, calls) == 0.5
+    )  # the first run is correct, the third not
+    assert score.precision(verdicts, calls) == 1 / 3

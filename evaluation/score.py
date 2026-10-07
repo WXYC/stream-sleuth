@@ -612,15 +612,6 @@ def near_miss_runs(
     return queued
 
 
-def near_miss_rows(
-    plays: Sequence[Play],
-    legs: Mapping[str, LegScore],
-    references: Mapping[str, tuple[str, ...]] | None,
-) -> list[dict[str, Any]]:
-    """The rows of :func:`near_miss_runs`."""
-    return [row for row, _ in near_miss_runs(plays, legs, references)]
-
-
 def _steady(run: Sequence[Verdict]) -> bool:
     """Whether at least two emissions carry offsets and their song-start estimates stay within
     :data:`STEADY_START_S`: a real playback's reference position advances with the wall clock, so the
@@ -692,24 +683,15 @@ def false_positive_runs(
     return queued
 
 
-def false_positive_rows(
-    plays: Sequence[Play],
-    legs: Mapping[str, LegScore],
-    references: Mapping[str, tuple[str, ...]] | None,
-) -> list[dict[str, Any]]:
-    """The rows of :func:`false_positive_runs`."""
-    return [row for row, _ in false_positive_runs(plays, legs, references)]
-
-
 # What a person may write in a queue's ``verdict`` column, each as the verdict it stands for.
 NEAR_VERDICTS = {"correct": "correct", "wrong": "wrong"}
 FP_VERDICTS = {"wrong": "wrong", "unlogged-correct": "correct", "talk": "talk"}
 VERDICTS = {NEAR_COLUMNS: NEAR_VERDICTS, FP_COLUMNS: FP_VERDICTS}
-KEY_COLUMNS = ("leg", "recognizer", "address", "play_carryover")  # a run, and a near miss's play
+KEY_COLUMNS = ("leg", "recognizer", "address")  # a run: the leg's tag, its identity, its first clip
 
 
-def _key(row: Mapping[str, Any]) -> tuple[str, ...]:
-    return tuple(str(row.get(c, "")) for c in KEY_COLUMNS)
+def _key(row: Mapping[str, str]) -> tuple[str, ...]:
+    return tuple(row.get(c, "").strip() for c in KEY_COLUMNS)
 
 
 def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str, ...], str]]:
@@ -720,10 +702,12 @@ def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str,
     regard to case and surrounding blanks). ``SystemExit``, one line naming ``path``, when the
     file is not a queue of this command's (its header, matched without regard to case and past a
     byte-order mark a spreadsheet adds, is not ``columns``; a JSONL store, another CSV, an empty
-    file), cannot be read, or holds a verdict outside the queue's vocabulary.
+    file), cannot be read, holds a verdict outside the queue's vocabulary, or holds two rows for
+    one run (:data:`KEY_COLUMNS`), which would leave a conflict to file order.
     """
     allowed = VERDICTS[tuple(columns)]
-    rows = []
+    rows: list[tuple[int, tuple[str, ...], str]] = []
+    first: dict[tuple[str, ...], int] = {}
     try:
         with path.open(encoding="utf-8-sig", newline="") as f:
             reader = csv.reader(f)
@@ -731,21 +715,21 @@ def read_queue(path: Path, columns: Sequence[str]) -> list[tuple[int, tuple[str,
             if header is None or [h.strip().lower() for h in header] != list(columns):
                 raise SystemExit(f"{path}: is not a queue of this command's; not overwriting it")
             for number, cells in enumerate(reader, 2):
+                if not any(cells):
+                    continue
                 row = dict(zip(columns, cells, strict=False))
                 entry = row.get("verdict", "").strip()
                 if entry and entry.lower() not in allowed:
                     raise SystemExit(f"{path}: row {number}: unknown verdict {entry!r}")
-                rows.append((number, _key(row), allowed.get(entry.lower(), "")))
+                if (key := _key(row)) in first:
+                    raise SystemExit(f"{path}: rows {first[key]} and {number} are the same run")
+                first[key] = number
+                rows.append((number, key, allowed.get(entry.lower(), "")))
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError, csv.Error):
         raise SystemExit(f"{path}: cannot be read; not overwriting it") from None
     return rows
-
-
-def check_queue(path: Path, columns: Sequence[str] = NEAR_COLUMNS) -> None:
-    """``SystemExit`` when :func:`read_queue` refuses the file: the early check, before any work."""
-    read_queue(path, columns)
 
 
 def write_queue(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
@@ -782,7 +766,10 @@ def settle_queue(
     if stale := [str(n) for n, key, _ in rows if key not in current]:
         log.warning("%s: no current run matches row(s) %s; ignored", path, ", ".join(stale))
     if unqueued := current.keys() - {key for _, key, _ in rows}:
-        log.warning("%s: %d current run(s) have no row; they stay wrong", path, len(unqueued))
+        runs = "; ".join(f"{leg} {address}" for leg, _, address in sorted(unqueued))
+        log.warning(
+            "%s: %d current run(s) have no row and stay wrong: %s", path, len(unqueued), runs
+        )
     calls: defaultdict[str, dict[str, str]] = defaultdict(dict)
     for _, key, verdict in rows:
         if verdict and key in current:
@@ -806,6 +793,7 @@ def leg_json(
     ``carryover`` are null for a wrong emission).
     """
     attributed = {v.play for v in ls.verdicts if v.play and v.play.carryover}
+    wrong = wrong_runs(ls.verdicts)
     return {
         "leg": leg.name,
         "recognizer": identity,
@@ -819,6 +807,8 @@ def leg_json(
         "distinct_precision": distinct_precision(ls.verdicts),
         "adjudicated_precision": precision(ls.verdicts, calls),
         "adjudicated_distinct_precision": distinct_precision(ls.verdicts, calls),
+        "wrong_runs": len(wrong),  # each is in exactly one queue
+        "adjudicated_runs": sum(r[0].emission.address.key in (calls or {}) for r in wrong),
         "pads": {era: p._asdict() for era, p in pads(ls.plays).items()},
         "plays": [
             {
@@ -932,8 +922,8 @@ def main(argv: list[str] | None = None) -> int:
         if clash := next((i for i in read if _same_file(output, i)), None):
             raise SystemExit(f"{output}: is also an input ({clash}); not overwriting it")
     check_score_file(out)
-    check_queue(near_path)
-    check_queue(fp_path, FP_COLUMNS)
+    read_queue(near_path, NEAR_COLUMNS)  # a refusal comes before anything is scored or written
+    read_queue(fp_path, FP_COLUMNS)
     with ExitStack() as stack:  # the snapshot is read, not locked: a running query may append
         try:
             snap = (
