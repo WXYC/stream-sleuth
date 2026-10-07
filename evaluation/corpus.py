@@ -588,7 +588,11 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
     attribution-only play (``carryover: true``, negative ``t_offset_s``): a song
     started before the top of the hour is still playing in it. Plays with no show
     are ``unreliable``: there is no show order to check them against.
+
+    Raises :class:`~stream_sleuth.paths.DataPathError` before building anything when
+    ``out`` is relative or inside the checkout: ``plays.jsonl`` holds real flowsheet rows.
     """
+    require_outside_checkout(out)
     lines = []
     for key in dict.fromkeys(hours):
         start = hour_start(key)

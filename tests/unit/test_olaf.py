@@ -364,6 +364,16 @@ def test_a_snapshot_outside_the_data_area_is_refused(olaf, home, reason):
         olaf.OlafRecognizer(home)
 
 
+def test_a_snapshot_reached_through_a_symlink_into_the_checkout_is_refused(olaf, tmp_path):
+    link = tmp_path / "link"
+    link.symlink_to(CHECKOUT)
+    with pytest.raises(olaf.OlafError, match="inside the checkout") as exc_info:
+        olaf.OlafRecognizer(link / "snap")
+    # By name: the fixture imports the package afresh, so the class is not the test module's.
+    assert type(exc_info.value.__cause__).__name__ == "DataPathError"
+    assert not (CHECKOUT / "snap").exists()
+
+
 @pytest.mark.parametrize(("home", "reason"), REFUSED_HOMES)
 def test_index_build_refuses_the_snapshot_and_creates_nothing(
     fresh_recognizer, fake_olaf, tmp_path, monkeypatch, capsys, home, reason
