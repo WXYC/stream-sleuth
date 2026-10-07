@@ -177,7 +177,11 @@ uv run --extra eval python -m evaluation.corpus \
 
 ### Clips
 
-`evaluation/clips.py` is station-neutral: it reads hour files only. A clip is addressed by `(hour key, grid offset, capture length, codec profile)`, written `<hour key>#<offset>+<length>@<profile>`, and recognizer results are stored under that key. The grid is every 15 s from 0, keeping only clips that end inside the hour (240 for 6 s and 12 s captures, 239 for 20 s). `cut()` is a context manager: it cuts the clip under a caller-given work directory (under `$STREAM_SLEUTH_DATA_DIR`, never the checkout), re-encodes it to constant-bitrate MP3 at the profile's rate (`128k`, the live mount, or `320k`), optionally decodes that to the mono 16 kHz WAV the live capture produces, and deletes it on exit, including when the caller raises. Clips are never kept: an address is a recipe over a retained hour file.
+`evaluation/clips.py` is station-neutral: it reads hour files only. A clip is addressed by `(hour key, grid offset, capture length, codec profile)`, and recognizer results are stored under its key, `<hour key>#<offset>+<length>@<profile>` (for example `2026/08/12/202608121600.mp3#45+12@128k`). The offset and length are plain decimal integers, so every address has exactly one key and `ClipAddress.parse()` accepts that key and no other spelling (no leading zeros, decimals, signs, or non-ASCII digits). An hour key must be non-empty, printable, and free of the separators `#`, `+`, and `@`.
+
+The grid is every 15 s from 0, keeping exactly the offsets whose clip ends at or before the hour's end: a full 3,600 s hour holds 240 clips of 6 s or 12 s and 239 of 20 s, since a 20 s clip at 3,585 s would end at 3,605 s. `hour_duration()` measures an hour file by decoding it (about 2 s per hour, cached per file version); pass it as `grid(..., hour_s=hour_duration(path))` for an hour that may be short.
+
+`cut()` is a context manager. It refuses a work directory that is relative or inside the checkout (`DataPathError`, before creating anything), and refuses with `ClipError` any address whose clip would run past the hour file's decoded end, rather than yield a short or empty clip. Otherwise it cuts the clip in its own temporary directory under the work directory, re-encodes it to constant-bitrate MP3 at the profile's rate (`128k`, the live mount, or `320k`), optionally decodes that to the mono 16 kHz WAV the live capture produces, and deletes it on exit, including when the caller raises or ffmpeg fails. Clips are never kept: an address is a recipe over a retained hour file.
 
 ## Notes
 
