@@ -144,12 +144,32 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
         (None, "", "", ""),
         # The fuzzy key drops bracketed clauses after NFKD, full-width ones included.
         ("The Worm（ザ・ワーム）", "the worm(サ・ワーム)", "the worm（ザ・ワーム）", "the worm"),
+        # A clause naming a different recording is kept, as words; the others still go.
         (
             "Edits {Live} [Tape] (Demo)",
             "edits {live} [tape] (demo)",
             "edits {live} [tape] (demo)",
-            "edits",
+            "edits live demo",
         ),
+        ("Back, Baby (Live)", "back, baby (live)", "back, baby (live)", "back baby live"),
+        ("Back, Baby [Demo]", "back, baby [demo]", "back, baby [demo]", "back baby demo"),
+        (
+            "Back, Baby（Instrumental）",
+            "back, baby(instrumental)",
+            "back, baby（instrumental）",
+            "back baby instrumental",
+        ),
+        ("Halo (Live at KEXP)", "halo (live at kexp)", "halo (live at kexp)", "halo live at kexp"),
+        # Cruft runs first, so the "(ft. ...)" clause is gone before qualifiers are looked at.
+        (
+            "Halo (Live) (ft. Someone)",
+            "halo (live) (ft. someone)",
+            "halo (live)",
+            "halo live",
+        ),
+        # The qualifier is a whole word, and clauses that merely contain its letters go.
+        ("Halo (Delivered)", "halo (delivered)", "halo (delivered)", "halo"),
+        ("Halo (Editor's Note)", "halo (editor's note)", "halo (editor's note)", "halo"),
         # An entirely bracketed name has no fuzzy key, so it never joins on that tier.
         ("（ザ・ワーム）", "(サ・ワーム)", "（ザ・ワーム）", ""),
         # Letters and digits of any script survive the fuzzy key; diacritics still fold.
@@ -196,6 +216,52 @@ def test_pool_index_tiers(
     index = corpus.PoolIndex.load(pool_db)
     assert index.tier(artist, album, title) == tier
     assert index.match(artist, album, title) == ((tier, pool_format) if tier else None)
+
+
+@pytest.mark.parametrize(
+    ("title", "tier"),
+    [
+        # A play logged as another recording never joins the studio file...
+        ("Back, Baby (Live)", None),
+        ("Back, Baby (Remix)", None),
+        ("Back, Baby [Demo]", None),
+        ("Back, Baby（Instrumental）", None),
+        ("Back, Baby (Live) (ft. Someone)", None),
+        # ...but a bracket that names no recording is still dropped.
+        ("Back, Baby (Feathers)", "title"),
+        ("Back, Baby（ザ・ワーム）", "title"),
+    ],
+)
+def test_version_qualified_plays_do_not_join_the_studio_title(
+    pool_db: Path, title: str, tier: str | None
+) -> None:
+    assert corpus.PoolIndex.load(pool_db).tier("Jessica Pratt", "Other", title) == tier
+
+
+@pytest.mark.parametrize(
+    ("pool_title", "play_title", "tier"),
+    [
+        ("Back, Baby (Live)", "Back, Baby (Live)", "title"),
+        ("Back, Baby (Live)", "back baby [live]", "title"),
+        ("Back, Baby [Demo]", "Back, Baby（Demo）", "title"),
+        ("Back, Baby (Live)", "Back, Baby (Demo)", None),
+        ("Back, Baby (Live)", "Back, Baby", None),
+    ],
+)
+def test_the_same_qualifier_on_both_sides_joins(
+    tmp_path: Path, pool_title: str, play_title: str, tier: str | None
+) -> None:
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    db.execute(
+        "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+        " VALUES ('k.mp3', ?, 'p/', 'mp3', 1, 'Jessica Pratt', 'Bootleg', ?, 'indexed')",
+        (f"{0:040x}", pool_title),
+    )
+    db.commit()
+    db.close()
+    assert corpus.PoolIndex.load(path).tier("Jessica Pratt", "Other", play_title) == tier
 
 
 def test_pool_format_is_the_first_matching_file_by_key(tmp_path: Path) -> None:
