@@ -167,6 +167,34 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "halo (live)",
             "halo live",
         ),
+        # Words split as the key splits them, underscores included.
+        (
+            "Back, Baby (Live_Session)",
+            "back, baby (live_session)",
+            "back, baby (live_session)",
+            "back baby live session",
+        ),
+        # A version clause that opens with a cruft word is kept by both keys; the fuzzy
+        # key leaves out its same-recording phrases.
+        (
+            "Back, Baby (Bonus Live Track)",
+            "back, baby (bonus live track)",
+            "back, baby (bonus live track)",
+            "back baby bonus live track",
+        ),
+        (
+            "Back, Baby (Remastered Live Version)",
+            "back, baby (remastered live version)",
+            "back, baby (remastered live version)",
+            "back baby live version",
+        ),
+        # A clause naming the same recording is no version clause.
+        (
+            "Back, Baby (Radio Edit)",
+            "back, baby (radio edit)",
+            "back, baby (radio edit)",
+            "back baby",
+        ),
         # The qualifier is a whole word, and clauses that merely contain its letters go.
         ("Halo (Delivered)", "halo (delivered)", "halo (delivered)", "halo"),
         ("Halo (Editor's Note)", "halo (editor's note)", "halo (editor's note)", "halo"),
@@ -208,6 +236,17 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         ("Stereolab", "Other", "Brakhage", "title", "m4a"),
         # ...but an unrelated name in the same script still does not.
         ("Stereolab", "Dots and Dashes", "x", None, None),
+        # Every tier refuses a play naming another recording, in its title or its album,
+        # that the matched file does not name: each of these joins at the tier noted
+        # without the qualifier.
+        ("Jessica Pratt", "On Your Own Love Again", "Back, Baby (Live)", None, None),  # exact
+        ("Jessica Pratt", "On Your Own Love Again!", "Back, Baby (Demo)", None, None),  # fuzzy
+        ("Stereolab", "Dots and Loops (Live)", "Brakhage", None, None),  # title, exact key
+        ("Stereolab", "Dots & Loops [Live]", "brakhage!", None, None),  # title, fuzzy key
+        ("Juana Molina", "DOGA (Remixes)", "la paradoja", None, None),  # title, exact key
+        # A same-recording clause names no other recording, so it does not refuse.
+        ("Jessica Pratt", "On Your Own Love Again", "Back, Baby (Radio Edit)", "exact", "flac"),
+        ("Stereolab", "Dots and Loops (2011 Remastered Version)", "Brakhage", "fuzzy", "m4a"),
     ],
 )
 def test_pool_index_tiers(
@@ -227,9 +266,31 @@ def test_pool_index_tiers(
         ("Back, Baby [Demo]", None),
         ("Back, Baby（Instrumental）", None),
         ("Back, Baby (Live) (ft. Someone)", None),
-        # ...but a bracket that names no recording is still dropped.
+        # Words split as the key splits them, so an underscore separates too.
+        ("Back, Baby (Live_Session)", None),
+        ("Back, Baby (Live_Version)", None),
+        # Plural and past forms are qualifiers.
+        *(
+            (f"Back, Baby ({word})", None)
+            for word in "Remixes, Remixed, Demos, Peel Sessions, Versions, Edits, Mixes".split(", ")
+        ),
+        # A version clause opening with a cruft word is a version clause, not cruft.
+        ("Back, Baby (Bonus Live Track)", None),
+        ("Back, Baby (Bonus Track - Demo)", None),
+        ("Back, Baby (Remastered Live Version)", None),
+        # ...but a bracket that names no recording is still dropped...
         ("Back, Baby (Feathers)", "title"),
         ("Back, Baby（ザ・ワーム）", "title"),
+        ("Back, Baby (Remastered 2011)", "title"),
+        # ...and so is one that names the same recording.
+        *(
+            (f"Back, Baby ({phrase})", "title")
+            for phrase in (
+                "Radio Edit, Single Edit, FCC Edit, Clean_Edit, Album Version, Single Version, "
+                "Original Mix, 2011 Remaster, 2011 Remastered Version, Mono Version, "
+                "Stereo Version, Mono"
+            ).split(", ")
+        ),
     ],
 )
 def test_version_qualified_plays_do_not_join_the_studio_title(
@@ -238,30 +299,54 @@ def test_version_qualified_plays_do_not_join_the_studio_title(
     assert corpus.PoolIndex.load(pool_db).tier("Jessica Pratt", "Other", title) == tier
 
 
+def jessica_pratt_pool(tmp_path: Path, files: list[tuple[str, str, str]]) -> Path:
+    """A pool.db of Jessica Pratt files, ``(key, album, title)``, format from the key."""
+    path = tmp_path / "pool.db"
+    db = sqlite3.connect(path)
+    db.execute(SCHEMA)
+    for i, (key, album, title) in enumerate(files):
+        db.execute(
+            "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
+            " VALUES (?, ?, 'p/', ?, 1, 'Jessica Pratt', ?, ?, 'indexed')",
+            (key, f"{i:040x}", key.rsplit(".", 1)[1], album, title),
+        )
+    db.commit()
+    db.close()
+    return path
+
+
 @pytest.mark.parametrize(
     ("pool_title", "play_title", "tier"),
     [
-        ("Back, Baby (Live)", "Back, Baby (Live)", "title"),
+        # The play's exact title key differs (no comma), so only the fuzzy key can join it.
+        ("Back, Baby (Live)", "Back Baby (LIVE)", "title"),
         ("Back, Baby (Live)", "back baby [live]", "title"),
         ("Back, Baby [Demo]", "Back, Baby（Demo）", "title"),
+        ("Back, Baby (Live_Session)", "Back, Baby [Live Session]", "title"),
         ("Back, Baby (Live)", "Back, Baby (Demo)", None),
         ("Back, Baby (Live)", "Back, Baby", None),
+        # A pool file naming the same recording still joins the bare title.
+        ("Back, Baby (Radio Edit)", "Back, Baby", "title"),
+        ("Back, Baby (2011 Remastered Version)", "Back, Baby", "title"),
     ],
 )
 def test_the_same_qualifier_on_both_sides_joins(
     tmp_path: Path, pool_title: str, play_title: str, tier: str | None
 ) -> None:
-    path = tmp_path / "pool.db"
-    db = sqlite3.connect(path)
-    db.execute(SCHEMA)
-    db.execute(
-        "INSERT INTO files (key, stage_id, prefix, format, size, artist, album, title, status)"
-        " VALUES ('k.mp3', ?, 'p/', 'mp3', 1, 'Jessica Pratt', 'Bootleg', ?, 'indexed')",
-        (f"{0:040x}", pool_title),
-    )
-    db.commit()
-    db.close()
+    path = jessica_pratt_pool(tmp_path, [("k.mp3", "Bootleg", pool_title)])
     assert corpus.PoolIndex.load(path).tier("Jessica Pratt", "Other", play_title) == tier
+
+
+@pytest.mark.parametrize(
+    ("play_title", "match"),
+    [("Back, Baby (Live)", ("exact", "flac")), ("Back, Baby", ("exact", "mp3"))],
+)
+def test_an_album_tier_play_joins_the_first_file_naming_its_version(
+    tmp_path: Path, play_title: str, match: tuple[str, str]
+) -> None:
+    files = [("a.mp3", "Bootleg", "Back, Baby"), ("b.flac", "Bootleg", "Back, Baby (Live)")]
+    path = jessica_pratt_pool(tmp_path, files)
+    assert corpus.PoolIndex.load(path).match("Jessica Pratt", "Bootleg", play_title) == match
 
 
 def test_pool_format_is_the_first_matching_file_by_key(tmp_path: Path) -> None:
