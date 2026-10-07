@@ -25,11 +25,11 @@ dev = [
     # answers at `before-call.*.*` first and would make them pass without it.
     "moto[s3]>=5.0.0",
 ]
-# The research harness under evaluation/. Never needed by the live recognizer.
 # The optional local recognizer (stream_sleuth/recognizers/olaf.py) is not a pip
 # dependency: build Olaf from JorenSix/Olaf at a98d8c03cfd447011d402718ca2d10b2bb467eb0
 # with Zig 0.16.0 (`zig build -Doptimize=ReleaseFast`) and point
 # STREAM_SLEUTH_OLAF_BIN at zig-out/bin/olaf. README, "Local recognizer".
+# The research harness under evaluation/. Never needed by the live recognizer.
 eval = [
     "boto3>=1.34.0",
     # Per-format tag and stream-info readers for the reference pool (evaluation/pool.py).

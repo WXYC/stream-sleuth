@@ -11,8 +11,11 @@ import json
 import stat
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
+
+CHECKOUT = Path(__file__).resolve().parents[2]
 
 # The record the plan quotes from Olaf's README (plan §6): with query_offset 0.000
 # and query_start 1.936, the match begins 1.936 s into the clip.
@@ -88,6 +91,16 @@ def fake_olaf(tmp_path):
     return script, set_output, calls
 
 
+@pytest.fixture
+def snap(tmp_path):
+    """A snapshot as ``store`` leaves it: its config and the LMDB file Olaf writes."""
+    home = tmp_path / "snap"
+    (home / ".olaf" / "db").mkdir(parents=True)
+    (home / ".olaf" / "olaf_config.json").write_text("{}")
+    (home / ".olaf" / "db" / "data.mdb").write_bytes(b"")
+    return home
+
+
 def test_the_readme_record_maps_to_the_evaluation_fields(olaf):
     [m] = olaf.parse_matches(json.dumps(README_RECORD, indent=2))
     assert m["query_offset_s"] == pytest.approx(1.936)
@@ -128,11 +141,11 @@ def test_output_without_a_query_object_is_an_error(olaf, out):
     ],
 )
 def test_recognize_keeps_the_strongest_match_at_or_above_the_floor(
-    olaf, fake_olaf, tmp_path, counts, floor, expected
+    olaf, fake_olaf, snap, counts, floor, expected
 ):
     script, set_output, _ = fake_olaf
     set_output(json.dumps(query_object(0.0, *(match(p, c) for p, c in counts))))
-    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script), min_match_count=floor)
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script), min_match_count=floor)
     result = recognizer.recognize("clip.wav")
     assert (result or {}).get("ref_key") == expected
 
@@ -142,13 +155,12 @@ def test_the_default_floor_is_twelve(olaf, tmp_path):
     assert olaf.OlafRecognizer(tmp_path / "snap").min_match_count == 12
 
 
-def test_recognize_runs_query_under_the_snapshot_home(olaf, fake_olaf, tmp_path):
+def test_recognize_runs_query_under_the_snapshot_home(olaf, fake_olaf, snap):
     script, set_output, calls = fake_olaf
     set_output(json.dumps(README_RECORD))
-    home = tmp_path / "snap"
-    result = olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("/clips/clip.wav")
+    result = olaf.OlafRecognizer(snap, olaf_bin=str(script)).recognize("/clips/clip.wav")
     assert calls() == [
-        {"argv": ["query", "--format", "json", "/clips/clip.wav"], "home": str(home)}
+        {"argv": ["query", "--format", "json", "/clips/clip.wav"], "home": str(snap)}
     ]
     assert result == {
         "artist": "",
@@ -163,7 +175,7 @@ def test_recognize_runs_query_under_the_snapshot_home(olaf, fake_olaf, tmp_path)
     }
 
 
-def test_a_lookup_names_the_reference(olaf, fake_olaf, tmp_path):
+def test_a_lookup_names_the_reference(olaf, fake_olaf, snap):
     script, set_output, _ = fake_olaf
     set_output(json.dumps(README_RECORD))
     tags = {
@@ -174,9 +186,7 @@ def test_a_lookup_names_the_reference(olaf, fake_olaf, tmp_path):
             "label": "self-released",
         }
     }
-    result = olaf.OlafRecognizer(
-        tmp_path / "snap", olaf_bin=str(script), lookup=tags.get
-    ).recognize("clip.wav")
+    result = olaf.OlafRecognizer(snap, olaf_bin=str(script), lookup=tags.get).recognize("clip.wav")
     assert (result["artist"], result["song"], result["album"], result["label"]) == (
         "Chuquimamani-Condori",
         "Call Your Name",
@@ -185,25 +195,23 @@ def test_a_lookup_names_the_reference(olaf, fake_olaf, tmp_path):
     )
 
 
-def test_the_snapshot_home_gets_its_own_olaf_config(olaf, fake_olaf, tmp_path):
+def test_store_gives_the_snapshot_home_its_own_olaf_config(olaf, fake_olaf, tmp_path):
     # Without ~/.olaf/olaf_config.json, Olaf falls back to a config beside the binary,
     # which could point db_folder anywhere; the adapter's own config prevents that.
-    script, set_output, _ = fake_olaf
-    set_output(json.dumps(query_object(0.0)))
+    script, _, _ = fake_olaf
     home = tmp_path / "snap"
-    olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("clip.wav")
+    olaf.OlafRecognizer(home, olaf_bin=str(script)).store([("/a.mp3", "id-a")])
     config = json.loads((home / ".olaf" / "olaf_config.json").read_text())
     assert config["db_folder"] == "~/.olaf/db/"
     assert config["cache_folder"] == "~/.olaf/cache/"
 
 
-def test_an_existing_snapshot_config_is_left_alone(olaf, fake_olaf, tmp_path):
-    script, set_output, _ = fake_olaf
-    set_output(json.dumps(query_object(0.0)))
+def test_store_leaves_an_existing_snapshot_config_alone(olaf, fake_olaf, tmp_path):
+    script, _, _ = fake_olaf
     config = tmp_path / "snap" / ".olaf" / "olaf_config.json"
     config.parent.mkdir(parents=True)
     config.write_text('{"db_folder": "~/.olaf/db/", "verbose": true}')
-    olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).recognize("clip.wav")
+    olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).store([("/a.mp3", "id-a")])
     assert config.read_text() == '{"db_folder": "~/.olaf/db/", "verbose": true}'
 
 
@@ -223,10 +231,10 @@ def test_store_with_nothing_to_store_runs_nothing(olaf, fake_olaf, tmp_path):
 
 
 @pytest.mark.parametrize("action", ["query", "store"])
-def test_a_failing_olaf_raises_with_its_stderr(olaf, fake_olaf, tmp_path, action):
+def test_a_failing_olaf_raises_with_its_stderr(olaf, fake_olaf, snap, action):
     script, set_output, _ = fake_olaf
     set_output(code=1, stderr="error: FileNotFound")
-    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script))
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script))
     with pytest.raises(olaf.OlafError, match="FileNotFound"):
         if action == "query":
             recognizer.recognize("missing.wav")
@@ -290,12 +298,81 @@ def test_a_match_missing_a_field_is_an_olaf_error(olaf):
         olaf.parse_matches(json.dumps({"query_offset": 0.0, "matches": [{"match_count": 30}]}))
 
 
-def test_a_hung_query_times_out_instead_of_stalling_the_loop(olaf, fake_olaf, tmp_path):
+def test_a_hung_query_times_out_instead_of_stalling_the_loop(olaf, fake_olaf, snap):
     script, set_output, _ = fake_olaf
     script.write_text(
         script.read_text().replace("sys.exit(reply", "import time; time.sleep(5); sys.exit(reply")
     )
     set_output(json.dumps(query_object(0.0)))
-    recognizer = olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script), query_timeout_s=0.5)
+    recognizer = olaf.OlafRecognizer(snap, olaf_bin=str(script), query_timeout_s=0.5)
     with pytest.raises(olaf.OlafError, match="timed out"):
         recognizer.recognize("clip.wav")
+
+
+def test_a_failure_reported_only_on_stdout_still_names_its_reason(olaf, fake_olaf, tmp_path):
+    # Olaf prints its argument-parsing errors to stdout, leaving stderr empty.
+    script, set_output, _ = fake_olaf
+    set_output(code=2, stdout="Unknown option '-x.wav' for 'olaf store'")
+    with pytest.raises(olaf.OlafError, match="Unknown option"):
+        olaf.OlafRecognizer(tmp_path / "snap", olaf_bin=str(script)).store([("-x.wav", "id")])
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["absent", "empty", "failed store"],
+)
+def test_querying_a_snapshot_without_an_index_is_an_error_and_creates_nothing(
+    olaf, fake_olaf, tmp_path, state
+):
+    # A mistyped snapshot path must fail, not score as an empty index's 0% recall.
+    script, set_output, calls = fake_olaf
+    set_output(json.dumps(query_object(0.0)))
+    home = tmp_path / "snap"
+    if state == "empty":
+        home.mkdir()
+    elif state == "failed store":  # Olaf leaves its db folder but no data.mdb
+        (home / ".olaf" / "db").mkdir(parents=True)
+        (home / ".olaf" / "olaf_config.json").write_text("{}")
+    before = sorted(tmp_path.rglob("*"))
+    with pytest.raises(olaf.OlafError, match="no Olaf index"):
+        olaf.OlafRecognizer(home, olaf_bin=str(script)).recognize("clip.wav")
+    assert calls() == []
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+REFUSED_HOMES = [
+    pytest.param("snap", "absolute", id="relative"),
+    pytest.param(".", "absolute", id="dot"),
+    pytest.param("~/snap", "absolute", id="literal-tilde"),
+    pytest.param(str(Path.home()), "home directory", id="real-home"),
+    pytest.param(str(CHECKOUT), "inside the checkout", id="checkout"),
+    pytest.param(str(CHECKOUT / "snap"), "inside the checkout", id="in-checkout"),
+    pytest.param(str(CHECKOUT / "tests" / ".." / "snap"), "inside the checkout", id="dotdot"),
+]
+
+
+@pytest.mark.parametrize(("home", "reason"), REFUSED_HOMES)
+def test_a_snapshot_outside_the_data_area_is_refused(olaf, home, reason):
+    with pytest.raises(olaf.OlafError, match=reason):
+        olaf.OlafRecognizer(home)
+
+
+@pytest.mark.parametrize(("home", "reason"), REFUSED_HOMES)
+def test_index_build_refuses_the_snapshot_and_creates_nothing(
+    fresh_recognizer, fake_olaf, tmp_path, monkeypatch, capsys, home, reason
+):
+    fresh_recognizer(WXDU_SHAZAM_SECRET="not-a-real-secret")
+    cli = importlib.import_module("stream_sleuth.cli")
+    # Even if the refusal regresses, nothing may be written into the checkout or ~.
+    monkeypatch.setattr(cli.OlafRecognizer, "store", lambda *_: pytest.fail("stored"))
+    script, _, calls = fake_olaf
+    monkeypatch.chdir(tmp_path)
+    before = sorted(tmp_path.rglob("*"))
+    argv = ["index", "build", "--home", home, "--olaf-bin", str(script), "/a.mp3", "id-a"]
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(argv)
+    assert exit_info.value.code == 2
+    assert reason in capsys.readouterr().err
+    assert calls() == []
+    assert sorted(tmp_path.rglob("*")) == before
+    assert not (CHECKOUT / "snap").exists()
