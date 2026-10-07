@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from ..config import OLAF_BIN
-from ..paths import CHECKOUT, inside_checkout
+from ..paths import DataPathError, require_outside_checkout
 from .base import EvalIdentification, Identification, Recognizer
 
 # Phase 1 of the viability study (2026-10-06): over 2,400 12 s clips, Olaf's own
@@ -164,14 +164,14 @@ class OlafRecognizer(Recognizer):
 
 def _snapshot_home(home: str | Path) -> Path:
     path = Path(home)
-    if not path.is_absolute():
-        raise OlafError(f"the snapshot directory must be an absolute path, not {str(home)!r}")
-    if path.resolve() == Path.home().resolve():
+    try:
+        resolved = require_outside_checkout(path)
+    except DataPathError as exc:
+        raise OlafError(f"the snapshot directory: {exc}") from exc
+    if resolved == Path.home().resolve():
         raise OlafError(
             f"the snapshot directory {path} is the home directory, whose ~/.olaf is never touched"
         )
-    if inside_checkout(path):
-        raise OlafError(f"the snapshot directory {path} is inside the checkout {CHECKOUT}")
     return path
 
 

@@ -19,6 +19,7 @@ import pytest
 from evaluation import corpus
 from evaluation.pool import SCHEMA
 from stream_sleuth import paths
+from stream_sleuth.paths import CHECKOUT, DataPathError
 
 UTC = timezone.utc
 COLUMNS = [
@@ -752,6 +753,35 @@ def test_write_plays_never_overwrites(tmp_path: Path, pool_db: Path) -> None:
             corpus.PoolIndex.load(pool_db),
         )
     assert out.read_text() == "kept\n"
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        pytest.param(Path("plays.jsonl"), id="relative"),
+        pytest.param(CHECKOUT, id="checkout"),
+        # Under a directory that does not exist, so a regressed guard fails on open
+        # rather than leaving a file in the working tree.
+        pytest.param(CHECKOUT / "no-such-dir" / "plays.jsonl", id="in-checkout"),
+        pytest.param(CHECKOUT / "tests" / ".." / "no-such-dir" / "p.jsonl", id="dotdot"),
+    ],
+)
+def test_write_plays_refuses_a_path_in_the_checkout_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pool_db: Path, out: Path
+) -> None:
+    export = write_export(tmp_path, [row(1, ts(20, 10))], "2026-08-09 05:00:43+00")
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    with pytest.raises(DataPathError):
+        corpus.write_plays(
+            out,
+            ["2026/08/12/202608121600.mp3"],
+            corpus.Flowsheet.load(export),
+            corpus.PoolIndex.load(pool_db),
+        )
+    assert list(work.iterdir()) == []
+    assert not (CHECKOUT / "no-such-dir").exists()
 
 
 def test_export_sql_is_read_only() -> None:
