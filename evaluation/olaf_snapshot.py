@@ -50,6 +50,9 @@ log = logging.getLogger(__name__)
 RESULTS = "results.jsonl"
 # The completion marker a finished build (or ``--mark-built``) leaves in the snapshot.
 MARKER = "built.json"
+# Present from before a build stores anything until its marker is written: an interrupted
+# build leaves it, so that build is never mistaken for one that predates markers.
+BUILDING = "building"
 
 
 class SnapshotError(RuntimeError):
@@ -110,12 +113,13 @@ def build_snapshot(
             raise SnapshotError(
                 f"{snapshot!r} already has results ({home / RESULTS}); not building"
             )
-        (home / MARKER).unlink(missing_ok=True)  # an unfinished rerun must not stay "built"
+        _replace(home / BUILDING, "")  # a stale marker is ignored while this is present
         with closing(open_pool_db(home / "pool.db")) as db:
             counts = stream(
                 objects, consumer, db=db, staging_dir=home / "staging", client=client, bucket=bucket
             )
             _write_marker(home, db, "build")
+            (home / BUILDING).unlink()
             return counts
 
 
@@ -128,10 +132,15 @@ def _write_marker(home: Path, db: sqlite3.Connection, source: str) -> dict[str, 
         "failed": by_status.get("failed", 0),
         "source": source,
     }
-    temp = home / (MARKER + ".tmp")
-    temp.write_text(json.dumps(marker) + "\n")
-    os.replace(temp, home / MARKER)
+    _replace(home / MARKER, json.dumps(marker) + "\n")
     return marker
+
+
+def _replace(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically: a complete temp file, then ``os.replace``."""
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(text)
+    os.replace(temp, path)
 
 
 def require_built(home: Path) -> dict[str, Any]:
@@ -141,10 +150,12 @@ def require_built(home: Path) -> dict[str, Any]:
     one that names another Olaf commit (its index is not this commit's).
     """
     path = home / MARKER
+    if (home / BUILDING).exists():
+        raise SnapshotError(f"{home}: its build was interrupted; rerun the build to finish it")
     if not path.is_file():
         raise SnapshotError(
-            f"{home}: no completion marker ({MARKER}); finish the build, or for a snapshot "
-            "built before markers run: python -m evaluation.olaf_snapshot --mark-built NAME"
+            f"{home}: no completion marker ({MARKER}); for a snapshot built before markers "
+            "existed, run: python -m evaluation.olaf_snapshot --mark-built NAME"
         )
     try:
         marker = json.loads(path.read_text())
@@ -160,7 +171,9 @@ def require_built(home: Path) -> dict[str, Any]:
 def mark_built(snapshot: str) -> dict[str, Any]:
     """Mark a snapshot built before markers existed as complete; touch nothing else of it.
 
-    Under the snapshot's lock, and only if there is no marker yet, its Olaf index exists, and
+    Under the snapshot's lock, and only if no build was left unfinished (the ``building``
+    sentinel, which every build since markers existed writes first, so only a snapshot that
+    predates them is markable), there is no marker yet, its Olaf index exists, and
     its ``pool.db`` (opened read-only) holds no row that is neither ``indexed`` nor
     ``failed`` (a ``staged`` one). ``pool.db`` records only finished files, so it cannot
     prove the build ran to the end: the operator vouches for that by running this.
@@ -169,6 +182,8 @@ def mark_built(snapshot: str) -> dict[str, Any]:
     if not (home / "pool.db").is_file():
         raise SnapshotError(f"{home}: no snapshot here")
     with snapshot_lock(home):
+        if (home / BUILDING).exists():
+            raise SnapshotError(f"{home}: its build was interrupted; rerun the build, not this")
         if (home / MARKER).exists():
             raise SnapshotError(f"{home}: already has a completion marker; not marking")
         if not (home / SNAPSHOT_INDEX).is_file():

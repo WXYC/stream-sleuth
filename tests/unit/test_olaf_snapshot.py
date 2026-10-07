@@ -15,6 +15,7 @@ from moto import mock_aws
 
 from evaluation import olaf_snapshot, pool
 from evaluation.olaf_snapshot import (
+    BUILDING,
     MARKER,
     RESULTS,
     SnapshotError,
@@ -183,7 +184,7 @@ def test_a_marker_is_replaced_atomically_and_leaves_no_temp_file(stored):
     ]
 
 
-def test_an_interrupted_rerun_drops_the_old_marker(monkeypatch, stored):
+def test_an_interrupted_rerun_is_refused_even_with_a_stale_marker(monkeypatch, stored):
     objects = pool.inventory(["rotation/"])
     build_snapshot("rotation", objects)
     monkeypatch.setattr(olaf_snapshot, "stream", lambda *a, **k: 1 / 0)
@@ -191,7 +192,79 @@ def test_an_interrupted_rerun_drops_the_old_marker(monkeypatch, stored):
     with pytest.raises(ZeroDivisionError):
         build_snapshot("rotation", objects)
 
-    assert not (snapshot_dir("rotation") / MARKER).exists()
+    assert (snapshot_dir("rotation") / MARKER).exists()  # the stale one
+    with pytest.raises(SnapshotError, match="interrupted"):
+        require_built(snapshot_dir("rotation"))
+
+
+def interrupt_after_one_file(monkeypatch):
+    """``OlafRecognizer.store`` that indexes one file, then is interrupted on the second."""
+    state = {"calls": 0, "armed": True}
+
+    def store(self, items):
+        state["calls"] += 1
+        if state["armed"] and state["calls"] > 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(OlafRecognizer, "store", store)
+    return state
+
+
+def test_an_interrupted_build_is_refused_by_a_run_and_by_mark_built_and_a_rerun_heals_it(
+    monkeypatch, stored
+):
+    objects = pool.inventory(["rotation/"])
+    home = snapshot_dir("rotation")
+    interruption = interrupt_after_one_file(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        build_snapshot("rotation", objects)
+    # one of two files is indexed, the Olaf index exists, and there is no marker
+    (home / SNAPSHOT_INDEX).parent.mkdir(parents=True)
+    (home / SNAPSHOT_INDEX).write_bytes(b"lmdb")
+
+    for refuse in (lambda: require_built(home), lambda: mark_built("rotation")):
+        with pytest.raises(SnapshotError, match="interrupted") as error:
+            refuse()
+        assert "rerun the build" in str(error.value)
+        assert "--mark-built" not in str(error.value)
+        assert "\n" not in str(error.value)
+    assert not (home / MARKER).exists()
+
+    interruption["armed"] = False
+    build_snapshot("rotation", objects)
+    assert not (home / BUILDING).exists()
+    assert require_built(home)["indexed"] == 2
+
+
+def test_the_in_progress_sentinel_is_in_place_before_the_first_store(stored, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        OlafRecognizer,
+        "store",
+        lambda self, items: seen.append((self.home / BUILDING).exists()),
+    )
+
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert seen == [True, True]
+    assert not (snapshot_dir("rotation") / BUILDING).exists()  # removed once marked
+
+
+def test_the_marker_is_written_by_atomic_replace_of_a_complete_temp_file(monkeypatch, stored):
+    replaced = []
+    real = olaf_snapshot.os.replace
+
+    def spy(src, dst):
+        if Path(dst).name == MARKER:
+            assert not Path(dst).exists()  # the target is not written in place first
+            replaced.append((Path(src).name, json.loads(Path(src).read_text())))
+        real(src, dst)
+
+    monkeypatch.setattr(olaf_snapshot.os, "replace", spy)
+
+    build_snapshot("rotation", pool.inventory(["rotation/"]))
+
+    assert [(src, marker["indexed"]) for src, marker in replaced] == [(MARKER + ".tmp", 2)]
 
 
 def test_a_marker_is_replaced_not_appended_to(stored):
@@ -293,6 +366,22 @@ def test_mark_built_refuses_an_unfinished_snapshot(kwargs, refusal):
         mark_built("rotation")
 
     assert not (home / MARKER).exists()
+
+
+def test_mark_built_opens_pool_db_read_only_and_never_read_write(monkeypatch):
+    home = pre_marker_snapshot()
+    opened = []
+
+    def read_write(path):
+        raise AssertionError("pool.db opened read-write")
+
+    real = olaf_snapshot.open_read_only
+    monkeypatch.setattr(olaf_snapshot, "open_pool_db", read_write)
+    monkeypatch.setattr(olaf_snapshot, "open_read_only", lambda p: opened.append(p) or real(p))
+
+    mark_built("rotation")
+
+    assert opened == [home / "pool.db"]
 
 
 def test_mark_built_refuses_an_existing_marker_and_leaves_it_alone(stored):
