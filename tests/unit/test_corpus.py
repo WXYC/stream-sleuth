@@ -18,6 +18,7 @@ import pytest
 
 from evaluation import corpus
 from evaluation.pool import SCHEMA
+from stream_sleuth import paths
 
 UTC = timezone.utc
 COLUMNS = [
@@ -561,7 +562,7 @@ def test_plays_windows_pads_and_carryover(tmp_path: Path, pool_db: Path) -> None
     assert set(first) == {
         "hour_key", "play_id", "t_offset_s", "window_start_s", "window_end_s", "artist", "title", "album",
         "era", "pad_s", "in_pool", "pool_match_tier", "pool_format", "rotation", "reorder_flag",
-        "play_order_status", "carryover", "track_rows", "talk_rows",
+        "play_order_status", "carryover", "track_rows", "talk_rows"
     }  # fmt: skip
 
 
@@ -1243,3 +1244,153 @@ def test_select_corpus_is_twenty_hours_with_no_shortfall() -> None:
     assert len(sel.hours) == 20 and sel.shortfalls == {}
     assert len(contrast(sel)) == 4
     assert len(set().union(*(stats[k].shows for k in contrast(sel)))) == 4
+
+
+def hour_in(day: int, hour: int, **kw: Any) -> corpus.HourStats:
+    return stat(keys_in(day, range(hour, hour + 1))[0], **kw)
+
+
+def subset_of(stats: dict[str, corpus.HourStats]) -> tuple[list[str], dict[str, int]]:
+    sel = corpus.select_corpus(stats)
+    subset = corpus.choose_subset(sel, stats)
+    return subset, {k: v for k, v in sel.shortfalls.items() if k.startswith("subset/")}
+
+
+def test_subset_is_the_top_high_hour_of_two_bands_the_top_low_and_the_top_contrast() -> None:
+    stats = plenty()
+    etl = {
+        k: stat(k, era="etl", in_pool=n, shows={k})
+        for k, n in zip(keys_in(5, range(10, 12), year=2023), (3, 7), strict=True)
+    }
+    stats |= etl
+    subset, shortfalls = subset_of(stats)
+    overnight_top = keys_in(1, range(5, 6))[0]  # share 0.6, the best of the corpus
+    daytime_top = keys_in(1, range(6, 7))[0]  # the best of the other bands, ties by key
+    low_top = keys_in(15, range(0, 1))[0]  # most track rows
+    contrast_top = keys_in(5, range(11, 12), year=2023)[0]  # share 0.7
+    assert subset == [overnight_top, daytime_top, low_top, contrast_top]
+    assert shortfalls == {}
+
+
+def test_subset_high_hours_come_from_two_different_bands() -> None:
+    day = keys_in(1, range(8, 11))
+    evening = keys_in(1, range(19, 21))
+    stats = {k: stat(k, in_pool=9) for k in day} | {k: stat(k, in_pool=5) for k in evening}
+    subset, _ = subset_of(stats)
+    assert subset[:2] == [day[0], evening[0]]
+
+
+def test_subset_ranks_a_reorder_flagged_hour_after_an_unflagged_one() -> None:
+    flagged, plain, other = hour_in(1, 8, in_pool=9, flagged=True), hour_in(1, 9), hour_in(1, 20)
+    subset, _ = subset_of({h.key: h for h in (flagged, plain, other)})
+    assert subset[:2] == [plain.key, other.key]
+
+
+@pytest.mark.parametrize(
+    ("stats", "subset_size", "shortfalls"),
+    [
+        pytest.param({}, 0, {"subset/canonical-high": 2, "subset/canonical-low": 1,
+                             "subset/contrast": 1}, id="nothing"),
+        pytest.param({k: stat(k) for k in keys_in(1, range(8, 12))}, 1,
+                     {"subset/canonical-high": 1, "subset/canonical-low": 1,
+                      "subset/contrast": 1}, id="one-band-of-high"),
+        pytest.param(plenty(), 3, {"subset/contrast": 1}, id="no-contrast"),
+    ],
+)  # fmt: skip
+def test_a_missing_subset_slot_is_a_shortfall_never_filled_from_another_group(
+    stats: dict[str, corpus.HourStats], subset_size: int, shortfalls: dict[str, int]
+) -> None:
+    subset, got = subset_of(stats)
+    assert len(subset) == subset_size and got == shortfalls
+
+
+def select_export(tmp_path: Path) -> Path:
+    """Three DJ hours (two daytime, one evening), each a show of eight in-pool tracks."""
+    rows = [
+        row(100 * show + i, ts(hour, 5 * i), show_id=show, artist="Juana Molina", album="DOGA",
+            title="la paradoja")
+        for show, hour in ((1, 18), (2, 19), (3, 23))
+        for i in range(8)
+    ]  # fmt: skip
+    return write_export(tmp_path, rows, "2026-08-09 05:00:43+00")
+
+
+HOURS = [
+    "2026/08/12/202608121400.mp3",
+    "2026/08/12/202608121500.mp3",
+    "2026/08/12/202608121900.mp3",
+]
+
+
+def run_select(tmp_path: Path, pool_db: Path, out_dir: Path) -> int:
+    export = tmp_path / "export"
+    if not export.exists():
+        select_export(tmp_path)
+    return corpus.main(
+        ["select", "--export", str(export), "--pool-db", str(pool_db), "--out-dir", str(out_dir)]
+    )
+
+
+def test_select_writes_the_frozen_hours_and_the_subset(tmp_path: Path, pool_db: Path) -> None:
+    out = tmp_path / "frozen"
+    assert run_select(tmp_path, pool_db, out) == 0
+    assert (out / "hours.txt").read_text() == "".join(f"{k}\n" for k in HOURS)
+    assert (out / "subset.txt").read_text() == f"{HOURS[0]}\n{HOURS[2]}\n"
+    record = json.loads((out / "selection.json").read_text())
+    assert record["export"] == "export" and record["pool_db"] == str(pool_db)
+    assert record["hours"] == {
+        HOURS[0]: {"group": "canonical-high", "band": "daytime", "subset": True},
+        HOURS[1]: {"group": "canonical-high", "band": "daytime", "subset": False},
+        HOURS[2]: {"group": "canonical-high", "band": "evening", "subset": True},
+    }
+    assert record["shortfalls"]["subset/canonical-low"] == 1
+    assert record["shortfalls"]["canonical-high/overnight"] == 3
+
+
+def test_select_refuses_to_overwrite_and_leaves_every_file_untouched(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    out = tmp_path / "frozen"
+    run_select(tmp_path, pool_db, out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    with pytest.raises(FileExistsError):
+        run_select(tmp_path, pool_db, out)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+
+
+def test_select_with_one_existing_file_creates_none_of_the_others(
+    tmp_path: Path, pool_db: Path
+) -> None:
+    out = tmp_path / "frozen"
+    out.mkdir()
+    (out / "subset.txt").write_text("kept\n")
+    with pytest.raises(FileExistsError):
+        run_select(tmp_path, pool_db, out)
+    assert [p.name for p in out.iterdir()] == ["subset.txt"]
+    assert (out / "subset.txt").read_text() == "kept\n"
+
+
+@pytest.mark.parametrize("where", ["checkout", "inside", "relative"])
+def test_select_refuses_an_out_dir_that_is_not_outside_the_checkout(
+    tmp_path: Path, pool_db: Path, where: str
+) -> None:
+    out = {
+        "checkout": paths.CHECKOUT,
+        "inside": paths.CHECKOUT / "frozen-selection",
+        "relative": Path("frozen-selection"),
+    }[where]
+    with pytest.raises(paths.DataPathError):
+        run_select(tmp_path, pool_db, out)
+    assert not (paths.CHECKOUT / "frozen-selection").exists()
+    assert not (paths.CHECKOUT / "hours.txt").exists()
+
+
+def test_select_writes_into_the_data_dir_by_default(
+    tmp_path: Path, pool_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("STREAM_SLEUTH_DATA_DIR", str(data))
+    export = select_export(tmp_path)
+    corpus.main(["select", "--export", str(export), "--pool-db", str(pool_db)])
+    assert sorted(p.name for p in data.iterdir()) == ["hours.txt", "selection.json", "subset.txt"]

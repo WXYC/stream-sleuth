@@ -31,8 +31,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from evaluation.archive import EASTERN, hour_key, hour_start
+from stream_sleuth.paths import data_dir, require_outside_checkout
 
 log = logging.getLogger(__name__)
 
@@ -443,6 +445,10 @@ def _by_share(h: HourStats) -> tuple[bool, float, int, str]:
     return (h.reorder_flagged, -_share(h), -h.in_pool, h.key)
 
 
+def _by_tracks(h: HourStats) -> tuple[bool, int, str]:
+    return (h.reorder_flagged, -h.track_rows, h.key)
+
+
 def _fill(sel: Selection, candidates: list[HourStats], quotas: dict[str, int], group: str) -> None:
     """Fill each band's quota in rank order, then relax shortfalls from the other bands."""
     for name, quota in quotas.items():
@@ -495,8 +501,7 @@ def select_corpus(stats: dict[str, HourStats]) -> Selection:
     sel = Selection()
     canonical = [h for h in stats.values() if h.era == "canonical" and _dj(h)]
     high = sorted((h for h in canonical if _share(h) > LOW_SHARE_MAX), key=_by_share)
-    low = sorted((h for h in canonical if _share(h) <= LOW_SHARE_MAX),
-                 key=lambda h: (h.reorder_flagged, -h.track_rows, h.key))  # fmt: skip
+    low = sorted((h for h in canonical if _share(h) <= LOW_SHARE_MAX), key=_by_tracks)
     _fill(sel, high, HIGH_QUOTAS, "canonical-high")
     _fill(sel, low, LOW_QUOTAS, "canonical-low")
     old = sorted((h for h in stats.values() if h.era == "etl" and _dj(h)
@@ -506,6 +511,68 @@ def select_corpus(stats: dict[str, HourStats]) -> Selection:
         log.warning("selection shortfall %s: %d", name, missing)
     log.info("selected %d hours", len(sel.hours))
     return sel
+
+
+def choose_subset(sel: Selection, stats: dict[str, HourStats]) -> list[str]:
+    """The plan §5.2 four-hour subset, drawn only from ``sel``: high, high, low, contrast.
+
+    The two high hours are the top-ranked ``canonical-high`` hour and the top-ranked one
+    from a different band, in the corpus's own ranking (reorder-flagged hours last); the
+    low hour is the top-ranked ``canonical-low`` hour and the contrast hour the top-ranked
+    ``contrast`` hour. A slot with no candidate is a ``subset/<group>`` shortfall in
+    ``sel`` and is never filled from another group.
+    """
+
+    def chosen(group: str, rank: Any, *, skip_band: str = "") -> list[HourStats]:
+        pool = [stats[k] for k, (g, b) in sel.hours.items() if g == group and b != skip_band]
+        return sorted(pool, key=rank)[:1]
+
+    high = chosen("canonical-high", _by_share)
+    high += chosen("canonical-high", _by_share, skip_band=sel.hours[high[0].key][1]) if high else []
+    low = chosen("canonical-low", _by_tracks)
+    contrast = chosen("contrast", _by_share)
+    sel.short("subset/canonical-high", 2 - len(high))
+    sel.short("subset/canonical-low", 1 - len(low))
+    sel.short("subset/contrast", 1 - len(contrast))
+    return [h.key for h in (*high, *low, *contrast)]
+
+
+def write_selection(
+    out_dir: Path, sel: Selection, subset: list[str], export: str, pool_db: Path
+) -> None:
+    """Write ``hours.txt``, ``subset.txt`` and ``selection.json`` into ``out_dir``; never overwrite.
+
+    ``out_dir`` is checked with :func:`stream_sleuth.paths.require_outside_checkout`
+    before anything is created. A file that already exists raises ``FileExistsError``
+    and removes the files this call created, so a frozen selection is never half replaced.
+    ``selection.json`` is a record for people and for the report's shortfall line, not a
+    boundary artifact: ``hours`` maps each key to its ``group``, ``band`` and ``subset``.
+    """
+    out_dir = require_outside_checkout(out_dir)
+    record = {
+        "export": export,
+        "pool_db": str(pool_db),
+        "hours": {
+            k: {"group": g, "band": b, "subset": k in subset} for k, (g, b) in sel.hours.items()
+        },
+        "shortfalls": dict(sorted(sel.shortfalls.items())),
+    }
+    files = {
+        "hours.txt": "".join(f"{k}\n" for k in sel.hours),
+        "subset.txt": "".join(f"{k}\n" for k in subset),
+        "selection.json": json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    try:
+        for name, text in files.items():
+            with open(out_dir / name, "x", encoding="utf-8") as f:
+                created.append(out_dir / name)
+                f.write(text)
+    except BaseException:
+        for path in created:
+            path.unlink()  # only what this call created
+        raise
 
 
 def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolIndex) -> None:
@@ -566,9 +633,33 @@ def write_plays(out: Path, hours: Iterable[str], sheet: Flowsheet, pool: PoolInd
         raise
 
 
+def _select(argv: list[str]) -> int:
+    """``select``: freeze the corpus selection and its four-hour subset; see the README."""
+    parser = argparse.ArgumentParser(
+        prog="python -m evaluation.corpus select",
+        description="Write hours.txt, subset.txt and selection.json; never overwrites them.",
+    )
+    parser.add_argument("--export", type=Path, required=True, help="dated export directory")
+    parser.add_argument("--pool-db", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, help="default: the data directory")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    out_dir = args.out_dir if args.out_dir else data_dir()
+    stats = hour_stats(Flowsheet.load(args.export), PoolIndex.load(args.pool_db))
+    sel = select_corpus(stats)
+    subset = choose_subset(sel, stats)
+    write_selection(out_dir, sel, subset, args.export.name, args.pool_db)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """The CLI: ``--export``, ``--pool-db``, ``--hours`` and ``--out``; see the README."""
-    parser = argparse.ArgumentParser(description="Write plays.jsonl from a flowsheet export.")
+    """The CLI: ``select ...`` freezes a selection; otherwise ``--hours`` writes plays."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["select"]:
+        return _select(argv[1:])
+    parser = argparse.ArgumentParser(
+        description="Write plays.jsonl from a flowsheet export. Run `select` first to freeze the hours."
+    )
     parser.add_argument("--export", type=Path, required=True, help="dated export directory")
     parser.add_argument("--pool-db", type=Path, required=True)
     parser.add_argument("--hours", type=Path, required=True, help="file of hour keys, one per line")
