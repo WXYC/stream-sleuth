@@ -443,7 +443,8 @@ def test_the_same_qualifier_on_both_sides_joins(
         # The Carré case (WXYC/stream-sleuth#115): the tag's inline credit, the log's bracketed.
         ("Hibiscus Feat. Bbyafricka", "Hibiscus (feat Bbyafricka)", "title"),
         ("Hibiscus (feat Bbyafricka)", "Hibiscus Feat. Bbyafricka", "title"),
-        ("Hibiscus ft. Bbyafricka", "Hibiscus", "title"),
+        ("Hibiscus ft. Bbyafricka", "Hibiscus", None),
+        ("Hibiscus feat. Bbyafricka", "Hibiscus", "title"),
         ("Hibiscus", "Hibiscus featuring Bbyafricka", "title"),
         # "with" and a leading word are no credit.
         ("Dancing", "Dancing with Myself", None),

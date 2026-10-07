@@ -186,11 +186,9 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
     ("s", "album_key", "fuzzy"),
     [
         # An unbracketed featuring credit goes as the bracketed one does: the word "feat.",
-        # "ft." or "featuring" (any case) and the words after it.
+        # or "featuring" (any case) and the words after it. "ft." is deliberately not handled inline.
         ("Hibiscus Feat. Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus (feat Bbyafricka)", "hibiscus", "hibiscus"),
-        ("Hibiscus ft. Bbyafricka", "hibiscus", "hibiscus"),
-        ("Hibiscus FT. Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus Featuring Bbyafricka", "hibiscus", "hibiscus"),
         ("Hibiscus  feat.  Bbyafricka  &  Juana Molina", "hibiscus", "hibiscus"),
         ("Hibiscus\tfeat.\nBbyafricka", "hibiscus", "hibiscus"),
@@ -199,8 +197,10 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
         ("Song 2 feat. Jessica Pratt", "song 2", "song 2"),
         ("Hibiscus feat. Jay-Z", "hibiscus", "hibiscus"),
         ("Hibiscus feat. Bbyafricka -Live", "hibiscus", "hibiscus"),
-        # A credit needs a period ("feat", "ft" alone are words), a word after it, and text
-        # before it; "ft." directly after a number is feet.
+        # A credit needs a period ("feat" alone is a word), a word after it, and text before
+        # it. "ft." is no inline credit at all: it is feet and Fort as often as featuring.
+        ("Hibiscus ft. Bbyafricka", "hibiscus ft. bbyafricka", "hibiscus ft bbyafricka"),
+        ("Hibiscus FT. Bbyafricka", "hibiscus ft. bbyafricka", "hibiscus ft bbyafricka"),
         ("Hibiscus feat Bbyafricka", "hibiscus feat bbyafricka", "hibiscus feat bbyafricka"),
         ("Hibiscus FT Bbyafricka", "hibiscus ft bbyafricka", "hibiscus ft bbyafricka"),
         ("Hibiscus feat", "hibiscus feat", "hibiscus feat"),
@@ -213,6 +213,7 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
         ("Six Ft. Under", "six ft. under", "six ft under"),
         ("50 Ft. Queenie", "50 ft. queenie", "50 ft queenie"),
         ("10 Ft. Ganja Plant", "10 ft. ganja plant", "10 ft ganja plant"),
+        ("Live at Ft. Worth", "live at ft. worth", "live at ft worth"),
         ("Dancing with Myself", "dancing with myself", "dancing with myself"),
         ("Waltz with Bashir", "waltz with bashir", "waltz with bashir"),
         ("Featuring Ourselves", "featuring ourselves", "featuring ourselves"),
@@ -246,7 +247,11 @@ DASHES = ["-", *(chr(c) for c in range(0x2010, 0x2016))]
         # is still one: main keys these the same on the fuzzy key.
         ("Hibiscus (Radio Edit feat. Bbyafricka)", "hibiscus (radio edit)", "hibiscus"),
         ("Hibiscus (Live feat. Bbyafricka)", "hibiscus (live)", "hibiscus live"),
-        ("Hibiscus [Live ft. Bbyafricka]", "hibiscus [live]", "hibiscus live"),
+        (
+            "Hibiscus [Live ft. Bbyafricka]",
+            "hibiscus [live ft. bbyafricka]",
+            "hibiscus live ft bbyafricka",
+        ),
         ("Hibiscus {Live featuring Bbyafricka}", "hibiscus {live}", "hibiscus live"),
         # The edition rule judges a clause before the credit is cut from it: the clause is kept
         # whole (its "Live Skull" a version word) and then loses the credit, on the exact key.
@@ -272,7 +277,7 @@ def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
         # The Carré case: the flowsheet's bracketed credit meets the tag's inline one.
         ("Hibiscus (feat Bbyafricka)", "Hibiscus Feat. Bbyafricka", "exact"),
         ("Hibiscus Feat. Bbyafricka", "Hibiscus (feat Bbyafricka)", "exact"),
-        ("Hibiscus", "Hibiscus ft. Bbyafricka", "exact"),
+        ("Hibiscus", "Hibiscus ft. Bbyafricka", None),
         ("Hibiscus featuring Bbyafricka", "Hibiscus", "exact"),
         ("Hibiscus Feat. Bbyafricka!", "Hibiscus", "exact"),
         ("Dancing with Myself", "Dancing", None),
@@ -282,7 +287,7 @@ def test_an_unbracketed_featuring_credit_is_dropped_as_the_bracketed_one_is(
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus (Live)", "exact"),
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus", None),
         ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus feat. Bbyafricka", None),
-        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus ft. Someone Else (Live)", "exact"),
+        ("Hibiscus feat. Bbyafricka (Live)", "Hibiscus featuring Someone Else (Live)", "exact"),
         ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka (Live)", "exact"),
         ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka", None),
         ("Hibiscus (Live)", "Hibiscus feat. Bbyafricka - Live", "fuzzy"),
