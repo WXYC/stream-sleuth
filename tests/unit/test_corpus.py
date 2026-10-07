@@ -7,6 +7,7 @@ is UTC-4, so 20:00 UTC is the archive hour ``…1600.mp3``.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,9 @@ POOL: list[tuple[str, str | None, str | None, str]] = [
     ("Hermanos Gutiérrez", None, None, "wav"),
     # Japanese script: its fuzzy keys are real, never empty.
     ("ジェシカ・プラット", "ザ・ワーム", "ザ・ワーム", "aac"),
+    ("Хуана Молина", "Дога", "Парадоха", "ogg"),
+    # A Latin name tagged with a full-width native-script clause, as Phase 1's pool has.
+    ("Stereolab（ステレオラブ）", "Dots and Loops（ドッツ・アンド・ループス）", "Brakhage", "m4a"),
 ]
 
 
@@ -133,17 +137,23 @@ def test_etl_stop(tmp_path: Path, last_run: str, expected: datetime) -> None:
             "call your name",
         ),
         ("Back, Baby", "back, baby", "back, baby", "back baby"),
-        # Cruft words match whole words only: "(Feathers)" is part of the name.
-        ("Ghost (Feathers)", "ghost (feathers)", "ghost (feathers)", "ghost feathers"),
+        # Cruft words match whole words only: the exact key keeps "(Feathers)", and
+        # only the fuzzy key, which drops every bracketed clause, loses it.
+        ("Ghost (Feathers)", "ghost (feathers)", "ghost (feathers)", "ghost"),
         ("Halo (ft. Someone)", "halo (ft. someone)", "halo", "halo"),
         (None, "", "", ""),
-        # Letters and digits of any script survive the fuzzy key; diacritics still fold.
+        # The fuzzy key drops bracketed clauses after NFKD, full-width ones included.
+        ("The Worm（ザ・ワーム）", "the worm(サ・ワーム)", "the worm（ザ・ワーム）", "the worm"),
         (
-            "The Worm（ザ・ワーム）",
-            "the worm(サ・ワーム)",
-            "the worm（ザ・ワーム）",
-            "the worm サ ワーム",
+            "Edits {Live} [Tape] (Demo)",
+            "edits {live} [tape] (demo)",
+            "edits {live} [tape] (demo)",
+            "edits",
         ),
+        # An entirely bracketed name has no fuzzy key, so it never joins on that tier.
+        ("（ザ・ワーム）", "(サ・ワーム)", "（ザ・ワーム）", ""),
+        # Letters and digits of any script survive the fuzzy key; diacritics still fold.
+        ("ザ・ワーム", "サ・ワーム", "ザ・ワーム", "サ ワーム"),
         ("Хуана Молина", "хуана молина", "хуана молина", "хуана молина"),
         ("Csillagrablók_2", "csillagrablok_2", "csillagrablók_2", "csillagrablok 2"),
     ],
@@ -172,6 +182,12 @@ def test_normalizers(s: str | None, folded: str, album_key: str, fuzzy: str) -> 
         ("Хуана Молина", "Сон", "Сон", None, None),
         ("ジェシカ・プラット", "ザ・ワーム!", "x", "fuzzy", "aac"),
         ("ジェシカ・プラット", "Other", "ザ・ワーム", "title", "aac"),
+        ("Хуана Молина", "Дога!", "x", "fuzzy", "ogg"),
+        # A Latin play joins a pool tag that adds a bracketed native-script clause...
+        ("Stereolab", "Dots and Loops", "x", "fuzzy", "m4a"),
+        ("Stereolab", "Other", "Brakhage", "title", "m4a"),
+        # ...but an unrelated name in the same script still does not.
+        ("Stereolab", "Dots and Dashes", "x", None, None),
     ],
 )
 def test_pool_index_tiers(
@@ -357,29 +373,28 @@ def test_an_hour_with_no_rows_is_logged_as_a_warning(
     )
 
 
+class FullDisk(io.FileIO):
+    """A real file whose every write lands ten bytes and then fails, as a full disk does."""
+
+    def write(self, b: Any) -> int:
+        super().write(bytes(b)[:10])
+        raise OSError(28, "No space left on device")
+
+
+# write_through sends each write to the disk at once, so writelines fails; without
+# it the text sits in the buffer and the failure comes at the final flush in close.
+@pytest.mark.parametrize("write_through", [True, False], ids=["in-writelines", "at-close"])
 def test_a_failed_write_leaves_no_partial_file(
-    tmp_path: Path, pool_db: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, pool_db: Path, monkeypatch: pytest.MonkeyPatch, write_through: bool
 ) -> None:
     sheet = corpus.Flowsheet.load(
         write_export(tmp_path, [row(1, ts(20, 10))], "2026-08-09 05:00:43+00")
     )
-    real_open = open
 
-    class FullDisk:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.f = real_open(*args, **kwargs)
+    def full_disk_open(path: Path, mode: str, **kwargs: Any) -> io.TextIOWrapper:
+        return io.TextIOWrapper(FullDisk(path, mode), write_through=write_through, **kwargs)
 
-        def __enter__(self) -> FullDisk:
-            return self
-
-        def __exit__(self, *exc: object) -> None:
-            self.f.close()
-
-        def writelines(self, lines: list[str]) -> None:
-            self.f.write(lines[0][:10])
-            raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(corpus, "open", FullDisk, raising=False)
+    monkeypatch.setattr(corpus, "open", full_disk_open, raising=False)
     out = tmp_path / "plays.jsonl"
     with pytest.raises(OSError, match="No space"):
         corpus.write_plays(
