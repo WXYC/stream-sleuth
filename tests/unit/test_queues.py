@@ -6,46 +6,26 @@ and read the queue files through ``python -m evaluation.score`` are in ``test_sc
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
-from evaluation import queues, score
+from evaluation import queues
 from evaluation.clips import ClipAddress
 from evaluation.results import Emission
-from evaluation.score import attribute, plays_from
-from tests.unit.test_score import (
+from evaluation.score import plays_from
+from tests.emissions import OLAF, SHAZAM, emission, leg_scores
+from tests.plays import (
     COCREDIT,
     HOUR,
     MOLINA,
-    OLAF,
     OTHER,
     PRATT,
     RECORDS,
-    SHAZAM,
     STAGE,
     UNLOGGED,
-    _found,
-    _hit,
-    _hour,
-    _local,
+    hour_records,
 )
-
-
-def legs_of_plays(
-    plays: list[score.Play],
-    emissions: list[Emission],
-    references: dict[str, tuple[str, ...]] | None = None,
-) -> dict[str, score.LegScore]:
-    """One leg, ``12s/shazam``, holding the verdicts of ``emissions`` against ``plays``."""
-    verdicts = attribute(plays, emissions, references)
-    return {"12s/shazam": score.LegScore(cast(Any, None), verdicts, [])}
-
-
-def legs_of(
-    emissions: list[Emission], references: dict[str, tuple[str, ...]] | None = None
-) -> dict[str, score.LegScore]:
-    return legs_of_plays(plays_from(RECORDS), emissions, references)
 
 
 def near_misses(
@@ -54,7 +34,7 @@ def near_misses(
     references: dict[str, tuple[str, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     plays = plays_from(records)
-    legs = legs_of_plays(plays, emissions, references)
+    legs = leg_scores(plays, {"12s/shazam": emissions}, references)
     return [row for row, _ in queues.near_miss_runs(plays, legs, references)]
 
 
@@ -62,7 +42,7 @@ def one_play(artist: str, title: str, *more: tuple[int, float, str, str]) -> lis
     """Play 1 at 120 s, and any ``more`` as (play id, offset, artist, title)."""
     rows: list[Any] = [(1, 120.0, (artist, title, ""), {})]
     rows += [(i, t, (a, ti, ""), {}) for i, t, a, ti in more]
-    return _hour(HOUR, "canonical", *rows)
+    return hour_records(HOUR, "canonical", *rows)
 
 
 NEAR_MISSES = [
@@ -87,7 +67,7 @@ NEAR_MISSES = [
 def test_near_misses_are_wrong_emissions_one_field_from_a_play_in_their_window(
     track: tuple[str, str, str], at: float, matched_on: str | None
 ) -> None:
-    rows = near_misses([_hit(track, at)])
+    rows = near_misses([emission(track, at)])
 
     assert [r["matched_on"] for r in rows] == ([matched_on] if matched_on else [])
 
@@ -97,20 +77,20 @@ def test_a_similar_token_set_is_a_near_miss_when_neither_field_matches() -> None
     near = ("Chuquimamani Condori Jr", "Call Your Name Tonight Now Forever Again", "Edits")
     far = ("Chuquimamani Condori Jr", "Call Your Name Tonight Now Forever Again Please", "Edits")
 
-    [hit] = near_misses([_hit(near, 195.0)], records)
+    [hit] = near_misses([emission(near, 195.0)], records)
     assert hit["matched_on"] == "similarity"
-    assert not near_misses([_hit(far, 195.0)], records)
+    assert not near_misses([emission(far, 195.0)], records)
 
 
 def test_two_empty_artists_do_not_match() -> None:
-    assert not near_misses([_hit(("", "Otra Cancion", ""), 195.0)], one_play("", "la paradoja"))
+    assert not near_misses([emission(("", "Otra Cancion", ""), 195.0)], one_play("", "la paradoja"))
 
 
 def test_a_run_is_judged_by_every_emission_and_the_nearest_play_wins() -> None:
     """The run starts outside every window of its song's play and enters one later."""
     chuqui = ("Chuquimamani-Condori", "Otra Cancion", "Edits")
 
-    [row] = near_misses([_hit(chuqui, 1200.0), _hit(chuqui, 1335.0)])
+    [row] = near_misses([emission(chuqui, 1200.0), emission(chuqui, 1335.0)])
 
     assert (row["address"], row["last_address"], row["play_id"]) == (
         f"{HOUR}#1200+12@128k",
@@ -126,7 +106,7 @@ def test_among_near_plays_the_most_similar_is_chosen() -> None:
         (2, 200.0, "Jessica Pratt", "Back, Baby (Live)"),
     )
 
-    [row] = near_misses([_hit(("Jessica Pratt", "Back, Baby", ""), 195.0)], records)
+    [row] = near_misses([emission(("Jessica Pratt", "Back, Baby", ""), 195.0)], records)
 
     assert (row["play_id"], row["matched_on"]) == (2, "artist")
 
@@ -139,7 +119,7 @@ def test_an_artist_credit_does_not_swallow_the_title_in_the_similarity() -> None
         (2, 200.0, "Carré", "Hibiscus Pt. 2 (Edit)"),
     )
 
-    [row] = near_misses([_hit(("Carré feat. Bbyafricka", "Hibiscus Pt 2", ""), 195.0)], records)
+    [row] = near_misses([emission(("Carré feat. Bbyafricka", "Hibiscus Pt 2", ""), 195.0)], records)
 
     assert (row["play_id"], row["matched_on"]) == (2, "artist")
 
@@ -153,22 +133,12 @@ def test_a_co_credit_in_another_order_is_the_same_artist_in_the_near_miss_label(
 
 
 def test_a_near_miss_under_olaf_references_names_every_artist_tag_of_its_file() -> None:
-    address = ClipAddress(HOUR, 195, 12)
-    found = _found(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
-    found |= {"source": "local", "confidence": 40.0, "ref_key": STAGE}
-    emission = Emission((address.key, OLAF), address, found)
+    olaf = emission(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0, source="local")
 
-    [row] = near_misses([emission], references={STAGE: ("Juana Molina",)})
+    [row] = near_misses([olaf], references={STAGE: ("Juana Molina",)})
 
     assert (row["play_id"], row["matched_on"]) == (1, "artist")
-    assert not near_misses([emission])
-
-
-def local_emission(track: tuple[str, str, str], at: float) -> Emission:
-    """An Olaf emission of ``track`` whose reference file is ``STAGE``."""
-    address = ClipAddress(HOUR, int(at), 12)
-    found = _found(track, at) | {"source": "local", "confidence": 40.0, "ref_key": STAGE}
-    return Emission((address.key, OLAF), address, found)
+    assert not near_misses([olaf])
 
 
 ARTISTS = "Chuquimamani Condori Jessica Pratt Hermanos Gutierrez Duo"  # seven tokens
@@ -178,44 +148,44 @@ def test_the_similarity_counts_the_artist_tokens_and_not_the_title_alone() -> No
     """Titles alone overlap at 2/3; with the artists the token sets overlap at 9/11."""
     records = one_play(ARTISTS, "Call Name")
 
-    [row] = near_misses([_hit((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
+    [row] = near_misses([emission((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
 
     assert row["matched_on"] == "similarity"
 
 
 def test_the_similarity_of_an_olaf_match_is_taken_over_every_artist_tag_of_its_file() -> None:
     records = one_play(ARTISTS, "Call Name")
-    emission = local_emission(("Mislabeled Tag", "Call Name Again", ""), 195.0)
+    olaf = emission(("Mislabeled Tag", "Call Name Again", ""), 195.0, source="local")
 
-    [row] = near_misses([emission], records, {STAGE: (f"{ARTISTS} Jr",)})
+    [row] = near_misses([olaf], records, {STAGE: (f"{ARTISTS} Jr",)})
 
     assert (row["matched_on"], row["reference_artists"]) == ("similarity", f"{ARTISTS} Jr")
-    assert not near_misses([emission], records)
+    assert not near_misses([olaf], records)
 
 
 def test_more_shared_fields_win_over_more_similar_tokens() -> None:
     """The first play shares no field but is the more similar; the second shares the artist."""
     records = one_play(ARTISTS, "Call Name", (2, 200.0, f"{ARTISTS} Jr", "Something Else"))
 
-    [row] = near_misses([_hit((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
+    [row] = near_misses([emission((f"{ARTISTS} Jr", "Call Name Again", ""), 195.0)], records)
 
     assert (row["play_id"], row["matched_on"]) == (2, "artist")
 
 
 def test_a_play_that_shares_both_fields_but_not_its_album_version_names_both() -> None:
-    records = _hour(
+    records = hour_records(
         HOUR, "canonical", (1, 120.0, ("Juana Molina", "la paradoja", "DOGA (Live)"), {})
     )
 
-    [row] = near_misses([_hit(MOLINA, 195.0)], records)
+    [row] = near_misses([emission(MOLINA, 195.0)], records)
 
     assert row["matched_on"] == "artist+title"
 
 
 def test_a_row_names_the_run_the_play_and_what_an_olaf_match_was_made_on() -> None:
-    emission = local_emission(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0)
+    olaf = emission(("Mislabeled Tag", "Otra Cancion", "DOGA"), 195.0, source="local")
 
-    [row] = near_misses([emission], references={STAGE: ("Juana Molina", "Duo Tag")})
+    [row] = near_misses([olaf], references={STAGE: ("Juana Molina", "Duo Tag")})
 
     assert (row["recognizer"], row["reference_artists"], row["play_carryover"]) == (
         OLAF,
@@ -225,7 +195,7 @@ def test_a_row_names_the_run_the_play_and_what_an_olaf_match_was_made_on() -> No
 
 
 def test_a_shazam_row_has_no_reference_artists_and_a_carryover_play_says_so() -> None:
-    [row] = near_misses([_hit(("Hermanos Gutiérrez", "Otra Cancion", ""), 30.0)])
+    [row] = near_misses([emission(("Hermanos Gutiérrez", "Otra Cancion", ""), 30.0)])
 
     assert (row["recognizer"], row["play_id"], row["play_carryover"], row["reference_artists"]) == (
         SHAZAM,
@@ -237,8 +207,8 @@ def test_a_shazam_row_has_no_reference_artists_and_a_carryover_play_says_so() ->
 
 def test_consecutive_wrong_emissions_of_one_song_are_one_row_with_archive_times() -> None:
     other = ("Juana Molina", "Otra Cancion", "DOGA")
-    hits = [_hit(other, at) for at in (195.0, 210.0, 225.0)]
-    hits += [_hit(MOLINA, 240.0), _hit(other, 255.0)]
+    hits = [emission(other, at) for at in (195.0, 210.0, 225.0)]
+    hits += [emission(MOLINA, 240.0), emission(other, 255.0)]
 
     rows = near_misses(hits)
 
@@ -260,21 +230,22 @@ def false_positives(
 ) -> list[dict[str, Any]]:
     """The false-positive queue for one 12 s leg, Shazam and (when given) Olaf, against RECORDS."""
     plays = plays_from(RECORDS)
-    legs = {"12s/shazam": score.LegScore(cast(Any, None), attribute(plays, shazam), [])}
-    if olaf is not None:
-        verdicts = attribute(plays, olaf, references)
-        legs["12s/olaf"] = score.LegScore(cast(Any, None), verdicts, [])
+    answers = {"12s/shazam": shazam} | ({} if olaf is None else {"12s/olaf": olaf})
+    legs = leg_scores(plays, answers, references)
     return [row for row, _ in queues.false_positive_runs(plays, legs, references)]
 
 
 def unlogged(at: float, ref_start_s: float | None = None, hour: str = HOUR) -> Emission:
     """A Shazam answer for a song no play names; ``ref_start_s`` is its match offset, if any."""
-    extra = {} if ref_start_s is None else {"query_offset_s": 0.0, "ref_start_s": ref_start_s}
-    return _hit(UNLOGGED, at, hour, **extra)
+    query_offset_s = None if ref_start_s is None else 0.0
+    return emission(UNLOGGED, at, hour=hour, query_offset_s=query_offset_s, ref_start_s=ref_start_s)
 
 
 def test_a_run_of_wrong_emissions_is_one_row_with_its_first_and_last_position() -> None:
-    hits = [unlogged(at) for at in (750.0, 765.0, 780.0)] + [_hit(PRATT, 795.0), unlogged(810.0)]
+    hits = [unlogged(at) for at in (750.0, 765.0, 780.0)] + [
+        emission(PRATT, 795.0),
+        unlogged(810.0),
+    ]
 
     rows = false_positives(hits)
 
@@ -294,7 +265,7 @@ def test_a_run_of_wrong_emissions_is_one_row_with_its_first_and_last_position() 
 def test_a_run_the_near_miss_queue_holds_is_not_repeated() -> None:
     near = ("Juana Molina", "Otra Cancion", "DOGA")  # shares the artist with a play in its window
 
-    rows = false_positives([_hit(near, 195.0), unlogged(750.0)])
+    rows = false_positives([emission(near, 195.0), unlogged(750.0)])
 
     assert [r["song"] for r in rows] == [UNLOGGED[1]]
 
@@ -338,14 +309,6 @@ def test_fewer_than_two_emissions_with_offsets_cannot_be_steady(run: list[Emissi
     assert false_positives(run)[0]["preflag"] == ""
 
 
-def other(track: tuple[str, str, str], at: float, hour: str = HOUR, **offsets: float) -> Emission:
-    """An Olaf answer at ``at`` that names its reference by ``STAGE``."""
-    emission = _local(track[0], at, STAGE, **offsets)
-    found = {**emission.found, "song": track[1], "album": track[2]}
-    address = ClipAddress(hour, int(at), 12)
-    return Emission((address.key, OLAF), address, cast(Any, found))
-
-
 UNLOGGED_REMASTER = (UNLOGGED[0], f"{UNLOGGED[1]} (Remastered)", UNLOGGED[2])
 AGREEMENT = [
     pytest.param(UNLOGGED, 765.0, HOUR, LIKELY, id="the same song inside the run's span"),
@@ -362,7 +325,9 @@ AGREEMENT = [
 def test_the_other_recognizer_naming_the_same_song_in_the_runs_span_is_preflagged(
     track: tuple[str, str, str], at: float, hour: str, preflag: str
 ) -> None:
-    rows = false_positives([unlogged(750.0), unlogged(765.0)], [other(track, at, hour)])
+    rows = false_positives(
+        [unlogged(750.0), unlogged(765.0)], [emission(track, at, hour=hour, source="local")]
+    )
 
     assert [r["preflag"] for r in rows if r["recognizer"] == SHAZAM] == [preflag]
 
@@ -380,7 +345,7 @@ def test_a_co_credit_in_another_order_agrees_across_recognizers() -> None:
 
 
 def test_each_recognizers_run_is_flagged_by_the_other() -> None:
-    rows = false_positives([unlogged(750.0)], [other(UNLOGGED, 750.0)])
+    rows = false_positives([unlogged(750.0)], [emission(UNLOGGED, 750.0, source="local")])
 
     assert {r["leg"]: r["preflag"] for r in rows} == {"12s/shazam": LIKELY, "12s/olaf": LIKELY}
 
@@ -389,8 +354,10 @@ def test_a_shazam_answer_naming_the_album_artist_agrees_with_an_olaf_reference_t
     credited = ("Stereolab & Duo Tag", UNLOGGED[1], UNLOGGED[2])
     references: dict[str, tuple[str, ...]] = {STAGE: ("Stereolab & Duo Tag", "Stereolab")}
 
-    flagged = false_positives([unlogged(750.0)], [other(credited, 750.0)], references)
-    bare = false_positives([unlogged(750.0)], [other(credited, 750.0)])
+    flagged = false_positives(
+        [unlogged(750.0)], [emission(credited, 750.0, source="local")], references
+    )
+    bare = false_positives([unlogged(750.0)], [emission(credited, 750.0, source="local")])
 
     assert [r["preflag"] for r in flagged if r["recognizer"] == SHAZAM] == [LIKELY]
     assert [r["preflag"] for r in bare if r["recognizer"] == SHAZAM] == [""]
@@ -401,13 +368,11 @@ def test_a_shazam_answer_naming_the_album_artist_agrees_with_an_olaf_reference_t
 
 def test_a_run_is_not_flagged_by_a_different_capture_length() -> None:
     plays = plays_from(RECORDS)
-    verdicts = attribute(plays, [unlogged(750.0)])
-    short = ClipAddress(HOUR, 750, 6)
-    answer = Emission((short.key, OLAF), short, cast(Any, _found(UNLOGGED, 750.0, source="local")))
-    legs = {
-        "12s/shazam": score.LegScore(cast(Any, None), verdicts, []),
-        "6s/olaf": score.LegScore(cast(Any, None), attribute(plays, [answer]), []),
+    answers = {
+        "12s/shazam": [unlogged(750.0)],
+        "6s/olaf": [emission(UNLOGGED, 750.0, source="local", length_s=6)],
     }
+    legs = leg_scores(plays, answers)
 
     rows = [row for row, _ in queues.false_positive_runs(plays, legs, None)]
 
@@ -416,7 +381,10 @@ def test_a_run_is_not_flagged_by_a_different_capture_length() -> None:
 
 def olaf_run(*clips: tuple[float, float, float]) -> list[Emission]:
     """Olaf answers for one song at (grid offset, query_offset_s, ref_start_s) each."""
-    return [other(UNLOGGED, at, query_offset_s=q, ref_start_s=r) for at, q, r in clips]
+    return [
+        emission(UNLOGGED, at, source="local", query_offset_s=q, ref_start_s=r)
+        for at, q, r in clips
+    ]
 
 
 # As ``run_olaf`` stores them for consecutive grid clips of one playback that started at 650 s: a
@@ -453,7 +421,9 @@ def test_an_olaf_run_is_flagged_through_its_reference_tags_by_a_shazam_album_art
     credited = ("Stereolab & Duo Tag", UNLOGGED[1], UNLOGGED[2])
     references: dict[str, tuple[str, ...]] = {STAGE: ("Stereolab & Duo Tag", "Stereolab")}
 
-    flagged = false_positives([unlogged(750.0)], [other(credited, 750.0)], references)
+    flagged = false_positives(
+        [unlogged(750.0)], [emission(credited, 750.0, source="local")], references
+    )
 
     assert {r["recognizer"]: r["preflag"] for r in flagged} == {SHAZAM: LIKELY, OLAF: LIKELY}
 
@@ -466,7 +436,7 @@ def test_the_span_follows_the_capture_length_of_the_runs_last_emission() -> None
     def flagged(length_s: int) -> str:
         address = ClipAddress(HOUR, 750, length_s)
         answer = Emission((address.key, SHAZAM), address, unlogged(750.0).found)
-        rows = false_positives([answer], [other(UNLOGGED, 765.0)])
+        rows = false_positives([answer], [emission(UNLOGGED, 765.0, source="local")])
         return next(r["preflag"] for r in rows if r["recognizer"] == SHAZAM)
 
     assert (flagged(20), flagged(12)) == (LIKELY, "")
